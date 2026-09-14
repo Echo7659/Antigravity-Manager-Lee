@@ -37,7 +37,7 @@ jobs:
           key: compat-${{ runner.os }}-${{ hashFiles('tests/compat/Cargo.lock') }}
       - name: Test request normalization
         run: cargo test --locked --manifest-path "$RUNNER_TEMP/compat-tests/Cargo.toml" --lib request_compat
-      - name: Test usage and stream handling
+      - name: Test usage, streams and account failover
         run: cargo test --locked --manifest-path "$RUNNER_TEMP/compat-tests/Cargo.toml" --lib compat_
 
   publish:

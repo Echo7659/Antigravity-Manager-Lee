@@ -160,7 +160,8 @@ fn apply_thinking_hints(
     }
 }
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
+use super::account_attempts::{AccountAttempts, MAX_ACCOUNT_ATTEMPTS};
+use super::common::account_retry_strategy;
 
 // ===== Model Constants for Background Tasks =====
 // These can be adjusted for performance/cost optimization or overridden by custom_mapping
@@ -237,9 +238,7 @@ The structure MUST be as follows:
 
 // ===== 统一退避策略模块 =====
 // 移除本地重复定义，使用 common 中的统一实现
-use super::common::{
-    apply_retry_strategy, determine_retry_strategy, should_rotate_account, RetryStrategy,
-};
+use super::common::{apply_retry_strategy, RetryStrategy};
 
 // ===== 退避策略模块结束 =====
 
@@ -790,16 +789,15 @@ pub async fn handle_messages(
     let token_manager = state.token_manager;
 
     let pool_size = token_manager.len();
-    // [FIX] Ensure max_attempts is at least 2 to allow for internal retries (e.g. stripping signatures)
-    // even if the user has only 1 account.
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size.saturating_add(1)).max(2);
+    let max_attempts = MAX_ACCOUNT_ATTEMPTS.min(pool_size).max(1);
 
     let mut last_error = String::new();
     let mut retried_without_thinking = false;
     let mut last_email: Option<String> = None;
     let mut last_mapped_model: Option<String> = None;
     let mut last_status = StatusCode::SERVICE_UNAVAILABLE; // Default to 503 if no response reached
-    let mut force_rotate = false;
+
+    let mut account_attempts = AccountAttempts::default();
 
     for attempt in 0..max_attempts {
         // 2. 模型路由解析
@@ -833,16 +831,20 @@ pub async fn handle_messages(
         let session_id = Some(session_id_str.as_str());
 
         let (access_token, project_id, email, account_id, _wait_ms) = match token_manager
-            .get_token(
+            .get_token_filtered(
                 &config.request_type,
-                force_rotate,
+                !account_attempts.is_empty(),
                 session_id,
                 &config.final_model,
+                account_attempts.excluded(),
             )
             .await
         {
             Ok(t) => t,
             Err(e) => {
+                if !account_attempts.is_empty() {
+                    break;
+                }
                 let safe_message = if e.contains("invalid_grant") {
                     "OAuth refresh failed (invalid_grant): refresh_token likely revoked/expired; reauthorize account(s) to restore service.".to_string()
                 } else {
@@ -868,6 +870,7 @@ pub async fn handle_messages(
             }
         };
 
+        account_attempts.record(&account_id);
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
@@ -1212,6 +1215,7 @@ pub async fn handle_messages(
             Ok(r) => r,
             Err(e) => {
                 last_error = e.clone();
+                last_status = StatusCode::BAD_GATEWAY;
                 debug!(
                     "Request failed on attempt {}/{}: {}",
                     attempt + 1,
@@ -1352,6 +1356,7 @@ pub async fn handle_messages(
                                 e
                             );
                             last_error = format!("Stream error during peek: {}", e);
+                            last_status = StatusCode::BAD_GATEWAY;
                             retry_this_account = true;
                             break;
                         }
@@ -1361,6 +1366,7 @@ pub async fn handle_messages(
                                 trace_id
                             );
                             last_error = "Empty response stream during peek".to_string();
+                            last_status = StatusCode::BAD_GATEWAY;
                             retry_this_account = true;
                             break;
                         }
@@ -1370,6 +1376,7 @@ pub async fn handle_messages(
                                 trace_id
                             );
                             last_error = "Timeout waiting for first data".to_string();
+                            last_status = StatusCode::BAD_GATEWAY;
                             retry_this_account = true;
                             break;
                         }
@@ -1470,6 +1477,7 @@ pub async fn handle_messages(
                             trace_id
                         );
                         last_error = "Empty response stream (None)".to_string();
+                        last_status = StatusCode::BAD_GATEWAY;
                         continue;
                     }
                 }
@@ -1803,8 +1811,7 @@ pub async fn handle_messages(
         }
 
         // 确定重试策略
-        let retry_strategy =
-            determine_retry_strategy(status_code, &error_text, retried_without_thinking);
+        let retry_strategy = account_retry_strategy(status_code);
 
         // 执行退避
         if apply_retry_strategy(
@@ -1816,39 +1823,8 @@ pub async fn handle_messages(
         )
         .await
         {
-            // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&retry_strategy)) {
-                debug!(
-                    "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
-                    trace_id, status_code
-                );
-                force_rotate = false;
-            } else {
-                force_rotate = true;
-            }
             continue;
         } else {
-            // 5. 增强的 400 错误处理: Prompt Too Long 友好提示
-            if status_code == 400
-                && (error_text.contains("too long")
-                    || error_text.contains("exceeds")
-                    || error_text.contains("limit"))
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [("X-Account-Email", email.as_str())],
-                    Json(json!({
-                        "id": "err_prompt_too_long",
-                        "type": "error",
-                        "error": {
-                            "type": "invalid_request_error",
-                            "message": "Prompt is too long (server-side context limit reached).",
-                            "suggestion": "Please: 1) Executive '/compact' in Claude Code 2) Reduce conversation history 3) Switch to gemini-1.5-pro (2M context limit)"
-                        }
-                    }))
-                ).into_response();
-            }
-
             // 不可重试的错误，直接返回
             error!(
                 "[{}] Non-retryable error {}: {}",
@@ -1888,12 +1864,7 @@ pub async fn handle_messages(
             _ => "api_error",
         };
 
-        // [FIX] 403 时返回 503，避免 Claude Code 客户端退出到登录页
-        let response_status = if last_status.as_u16() == 403 {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            last_status
-        };
+        let response_status = last_status;
 
         if let Some(sec) = crate::proxy::handlers::common::extract_retry_after_seconds(&last_error) {
             if let Ok(val) = header::HeaderValue::from_str(&sec.to_string()) {
@@ -1906,7 +1877,7 @@ pub async fn handle_messages(
             "error": {
                 "id": "err_retry_exhausted",
                 "type": error_type,
-                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
+                "message": format!("All {} accounts failed. Last status: {}. Error: {}", account_attempts.len(), last_status, last_error)
             }
         }))).into_response()
     } else {
@@ -1932,19 +1903,14 @@ pub async fn handle_messages(
             _ => "api_error",
         };
 
-        // [FIX] 403 时返回 503，避免 Claude Code 客户端退出到登录页
-        let response_status = if last_status.as_u16() == 403 {
-            StatusCode::SERVICE_UNAVAILABLE
-        } else {
-            last_status
-        };
+        let response_status = last_status;
 
         (response_status, headers, Json(json!({
             "type": "error",
             "error": {
                 "id": "err_retry_exhausted",
                 "type": error_type,
-                "message": format!("All {} attempts failed. Last status: {}. Error: {}", max_attempts, last_status, last_error)
+                "message": format!("All {} accounts failed. Last status: {}. Error: {}", account_attempts.len(), last_status, last_error)
             }
         }))).into_response()
     }

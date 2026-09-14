@@ -11,8 +11,7 @@ use tracing::{debug, error, info};
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS;
 use crate::proxy::debug_logger;
 use crate::proxy::handlers::common::{
-    apply_retry_strategy, build_token_error_headers, next_rotation_attempt, should_rotate_account,
-    FailureStatusTracker, RequestRetryState, RetryStrategy,
+    apply_retry_strategy, build_token_error_headers, FailureStatusTracker,
 };
 use crate::proxy::mappers::gemini::{unwrap_response, wrap_request, wrap_request_v2};
 use crate::proxy::server::AppState;
@@ -20,7 +19,8 @@ use crate::proxy::session_manager::SessionManager;
 use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
+use super::account_attempts::{AccountAttempts, MAX_ACCOUNT_ATTEMPTS};
+use super::common::account_retry_strategy;
 
 fn response_has_inline_image_data(value: &Value) -> bool {
     let response = value.get("response").unwrap_or(value);
@@ -139,27 +139,22 @@ pub async fn handle_generate(
     let request_timeout = state.request_timeout;
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let max_attempts = MAX_ACCOUNT_ATTEMPTS.min(pool_size).max(1);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
-    let mut force_rotate = false;
-    let mut retry_state = RequestRetryState::default();
-    let mut retry_credentials: Option<(String, String, String, String, u64)> = None;
+
+    let mut account_attempts = AccountAttempts::default();
+
     let mut image_permit = None;
     let mut failure_statuses = FailureStatusTracker::default();
-    let mut used_attempts = 0;
 
     let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
         &model_name,
         &*state.custom_mapping.read().await,
     );
 
-    while let Some(attempt) = next_rotation_attempt(
-        &mut used_attempts,
-        max_attempts,
-        retry_credentials.is_some(),
-    ) {
+    for attempt in 0..max_attempts {
         // 3. 模型路由解析
         let mapped_model = initial_mapped_model.clone();
         // 提取 tools 列表以进行联网探测 (Gemini 风格可能是嵌套的)
@@ -193,19 +188,17 @@ pub async fn handle_generate(
         // 提取 SessionId (粘性指纹)
         let session_id = SessionManager::extract_gemini_session_id(&body, &model_name);
 
-        // 关键：根据 force_rotate 标志决定是否轮换账号（支持 Grace Retry 原地重试）
         let (access_token, project_id, email, account_id, _wait_ms) =
-            if let Some(credentials) = retry_credentials.take() {
-                credentials
-            } else if config.request_type == "image_gen" {
+            if config.request_type == "image_gen" {
                 drop(image_permit.take());
                 match token_manager
-                    .get_image_token(
-                        force_rotate,
+                    .get_image_token_filtered(
+                        !account_attempts.is_empty(),
                         Some(&session_id),
                         &config.final_model,
                         &image_scheduler,
                         request_timeout,
+                        account_attempts.excluded(),
                     )
                     .await
                 {
@@ -214,6 +207,9 @@ pub async fn handle_generate(
                         (access_token, project_id, email, account_id, wait_ms)
                     }
                     Err((status, message)) => {
+                        if !account_attempts.is_empty() {
+                            break;
+                        }
                         failure_statuses.record(status);
                         last_error = message;
                         break;
@@ -221,16 +217,20 @@ pub async fn handle_generate(
                 }
             } else {
                 match token_manager
-                    .get_token(
+                    .get_token_filtered(
                         &config.request_type,
-                        force_rotate,
+                        !account_attempts.is_empty(),
                         Some(&session_id),
                         &config.final_model,
+                        account_attempts.excluded(),
                     )
                     .await
                 {
                     Ok(t) => t,
                     Err(e) => {
+                        if !account_attempts.is_empty() {
+                            break;
+                        }
                         let headers = build_token_error_headers(
                             Some(mapped_model.as_str()),
                             last_email.as_deref(),
@@ -250,6 +250,7 @@ pub async fn handle_generate(
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
             .await;
 
+        account_attempts.record(&account_id);
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
@@ -634,7 +635,7 @@ pub async fn handle_generate(
                             error!("Stream collection error: {}", e);
                             last_error = format!("Stream collection error: {}", e);
                             failure_statuses.record(StatusCode::BAD_GATEWAY);
-                            force_rotate = true;
+
                             continue;
                         }
                     }
@@ -769,14 +770,8 @@ pub async fn handle_generate(
         }
 
         // 确定重试策略
-        let strategy = retry_state.determine_strategy(
-            &account_id,
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-            false,
-        );
-        let needs_quota_refresh = if config.request_type == "image_gen" && status_code == 429 {
+        let strategy = account_retry_strategy(status_code);
+        let needs_quota_refresh = if status_code == 429 {
             token_manager
                 .mark_rate_limited_fast(
                     &email,
@@ -789,9 +784,7 @@ pub async fn handle_generate(
         } else {
             false
         };
-        if !matches!(&strategy, RetryStrategy::GraceRetry(_)) {
-            drop(image_permit.take());
-        }
+        drop(image_permit.take());
         if needs_quota_refresh {
             token_manager
                 .refresh_quota_lock_after_fast_mark(&email, Some(&mapped_model))
@@ -809,37 +802,6 @@ pub async fn handle_generate(
         )
         .await
         {
-            if matches!(strategy, RetryStrategy::GraceRetry(_)) {
-                retry_credentials = Some((
-                    access_token.clone(),
-                    project_id.clone(),
-                    email.clone(),
-                    account_id.clone(),
-                    0,
-                ));
-            }
-            // [NEW] Apply Client Adapter "let_it_crash" strategy
-            if let Some(adapter) = &client_adapter {
-                if adapter.let_it_crash() && attempt > 0 {
-                    tracing::warn!(
-                        "[Gemini] let_it_crash active: Aborting retries after attempt {}",
-                        attempt
-                    );
-                    break;
-                }
-            }
-
-            // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&strategy)) {
-                debug!(
-                "[{}] Keeping same account for status {} (Gemini server-side issue or Grace Retry)",
-                trace_id, status_code
-            );
-                force_rotate = false;
-            } else {
-                force_rotate = true;
-            }
-
             continue;
         }
 
@@ -872,7 +834,6 @@ pub async fn handle_generate(
             continue; // 重试
         }
 
-        // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换
         error!(
             "Gemini Upstream non-retryable error {}: {}",
             status_code, error_text
@@ -895,20 +856,15 @@ pub async fn handle_generate(
             .into_response());
     }
 
-    // 所有尝试均失败：仅当全部结构化失败状态均为 429 时返回 429
-    let final_status = failure_statuses.final_status();
+    // 账号耗尽时返回最近一次实际失败。
+    let final_status = failure_statuses.latest_status();
     let headers = build_token_error_headers(
         Some(initial_mapped_model.as_str()),
         last_email.as_deref(),
         &last_error,
     );
 
-    Ok((
-        final_status,
-        headers,
-        format!("All accounts exhausted. Last error: {}", last_error),
-    )
-        .into_response())
+    Ok((final_status, headers, last_error).into_response())
 }
 
 pub async fn handle_list_models(
@@ -962,11 +918,7 @@ pub async fn handle_count_tokens(
 ///
 /// 获取有效 OAuth Token，将标准 Gemini 请求体包装为 v1internal 格式后转发，
 /// 返回真实的 token 计数，而不是硬编码的 0
-pub async fn execute_count_tokens(
-    state: AppState,
-    model_name: String,
-    body: Value,
-) -> Response {
+pub async fn execute_count_tokens(state: AppState, model_name: String, body: Value) -> Response {
     // 1. 模型路由解析
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
         &model_name,
@@ -998,11 +950,7 @@ pub async fn execute_count_tokens(
     {
         Ok(t) => t,
         Err(e) => {
-            let headers = build_token_error_headers(
-                Some(mapped_model.as_str()),
-                None,
-                &e,
-            );
+            let headers = build_token_error_headers(Some(mapped_model.as_str()), None, &e);
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 headers,

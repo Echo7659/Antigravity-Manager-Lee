@@ -1,6 +1,7 @@
 // Handlers 模块 - API 端点处理器
 // 核心端点处理器模块
 
+pub mod account_attempts;
 pub mod audio; // 音频转录处理器
 pub mod claude;
 pub mod common;

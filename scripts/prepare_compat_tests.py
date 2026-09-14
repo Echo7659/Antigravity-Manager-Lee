@@ -27,6 +27,12 @@ assert 'fn extract_apply_patch_input' in response
 (destination / 'response_excerpt.rs').write_text(response.split('fn extract_apply_patch_input', 1)[0])
 
 
+common = (source / 'handlers/common.rs').read_text()
+common = common.split('/// Detects model capabilities and configuration', 1)[0]
+common = common.replace('use crate::proxy::server::AppState;\n', '')
+(destination / 'retry_common.rs').write_text(common)
+
+
 def module(path):
     return json.dumps(str(path))
 
@@ -35,7 +41,14 @@ def module(path):
 (destination / 'lib.rs').write_text(f'''#![allow(dead_code, unused_imports)]
 #[path = {module(source / 'mappers/gemini/request_compat.rs')}]
 mod request_compat;
+#[path = {module(source / 'handlers/account_attempts.rs')}]
+mod account_attempts;
+#[path = {module(destination / 'retry_common.rs')}]
+mod retry_common;
 pub mod proxy {{
+    pub mod upstream {{
+        #[path = {module(source / 'upstream/retry.rs')}] pub mod retry;
+    }}
     pub struct SignatureCache;
     impl SignatureCache {{
         pub fn global() -> &'static Self {{ &Self }}
@@ -67,7 +80,7 @@ path = "lib.rs"
 [dependencies]
 '''
 features = {'serde': ['derive'], 'serde_json': ['preserve_order'], 'uuid': ['v4'], 'tokio': ['macros', 'rt', 'time']}
-for name in ['serde', 'serde_json', 'bytes', 'futures', 'chrono', 'rand', 'uuid', 'tracing', 'async-stream', 'tokio']:
+for name in ['serde', 'serde_json', 'bytes', 'futures', 'chrono', 'rand', 'uuid', 'tracing', 'async-stream', 'tokio', 'axum', 'once_cell', 'regex']:
     prefix = '0.8.' if name == 'rand' else '1.' if name in ['uuid', 'bytes'] else ''
     dependency = '=' + version(name, prefix)
     if name in features:

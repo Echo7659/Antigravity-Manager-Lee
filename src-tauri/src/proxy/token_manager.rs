@@ -1409,13 +1409,33 @@ impl TokenManager {
         scheduler: &Arc<ImageScheduler>,
         request_timeout: u64,
     ) -> Result<(String, String, String, String, u64, ImagePermit), (StatusCode, String)> {
+        self.get_image_token_filtered(
+            force_rotate,
+            session_id,
+            target_model,
+            scheduler,
+            request_timeout,
+            &HashSet::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn get_image_token_filtered(
+        &self,
+        force_rotate: bool,
+        session_id: Option<&str>,
+        target_model: &str,
+        scheduler: &Arc<ImageScheduler>,
+        request_timeout: u64,
+        excluded_accounts: &HashSet<String>,
+    ) -> Result<(String, String, String, String, u64, ImagePermit), (StatusCode, String)> {
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(request_timeout);
         let mut scheduler_changes = scheduler.subscribe_changes();
 
         loop {
             scheduler_changes.borrow_and_update();
-            let mut busy_accounts = HashSet::new();
+            let mut busy_accounts = excluded_accounts.clone();
 
             loop {
                 let selection = wait_for_image_token_selection(
@@ -1450,7 +1470,7 @@ impl TokenManager {
                         busy_accounts.insert(account_id);
                     }
                     Some(Err(selection_error)) => {
-                        if busy_accounts.is_empty() {
+                        if busy_accounts.len() == excluded_accounts.len() {
                             return Err((
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 format!("Token error: {}", selection_error),
@@ -1471,7 +1491,7 @@ impl TokenManager {
         }
     }
 
-    async fn get_token_filtered(
+    pub(crate) async fn get_token_filtered(
         &self,
         quota_group: &str,
         force_rotate: bool,
@@ -1884,7 +1904,7 @@ impl TokenManager {
             None
         };
 
-        let mut attempted: HashSet<String> = HashSet::new();
+        let mut attempted = excluded_accounts.clone();
         let mut last_error: Option<String> = None;
         let mut need_update_last_used: Option<(String, std::time::Instant)> = None;
 

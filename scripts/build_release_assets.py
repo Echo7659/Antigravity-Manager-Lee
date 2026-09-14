@@ -47,6 +47,8 @@ with tarfile.open(archive, 'w:gz') as bundle:
 
 Includes Gemini request compatibility, cumulative/reasoning token accounting and explicit empty-stream error handling. See `docs/GEMINI_COMPAT_DEPLOYMENT.md` for behavior and deployment details.
 
+Account failover now tries the initial account plus up to five different accounts for upstream HTTP errors, including 400 and 429. Successful attempts return immediately; exhaustion preserves the last actual failure. Native Gemini 429 responses now update account/model cooldowns. See `docs/ACCOUNT_FAILOVER.md` for stream and eligibility boundaries.
+
 The attached deployment bundle pins the tested image digest and contains no credentials. Existing deployments must retain their data mounts and secrets.
 ''')
 print(archive)

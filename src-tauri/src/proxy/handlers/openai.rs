@@ -16,15 +16,13 @@ use crate::proxy::debug_logger;
 use crate::proxy::server::AppState;
 use crate::proxy::upstream::client::mask_email;
 
-const MAX_RETRY_ATTEMPTS: usize = 3;
+use super::account_attempts::{AccountAttempts, MAX_ACCOUNT_ATTEMPTS};
+use super::common::account_retry_strategy;
 const MAX_INPUT_IMAGES: usize = 16;
 const MAX_INPUT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_TOTAL_INPUT_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX: &str = "msg_thought_";
-use super::common::{
-    apply_retry_strategy, next_rotation_attempt, should_rotate_account, FailureStatusTracker,
-    RequestRetryState, RetryStrategy,
-};
+use super::common::{apply_retry_strategy, FailureStatusTracker};
 use crate::modules::account;
 use crate::proxy::common::client_adapter::CLIENT_ADAPTERS; // [NEW] Adapter Registry
 use crate::proxy::session_manager::SessionManager;
@@ -1855,7 +1853,8 @@ pub async fn handle_chat_completions(
         openai_req.messages.len(),
         openai_req.stream
     );
-    let mut force_rotate = false;
+
+    let mut account_attempts = AccountAttempts::default();
 
     if debug_logger::is_enabled(&debug_cfg) {
         if let Some(ledger) = normalized_interaction_ledger {
@@ -1949,15 +1948,13 @@ pub async fn handle_chat_completions(
     let request_timeout = state.request_timeout;
     let token_manager = state.token_manager;
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let max_attempts = MAX_ACCOUNT_ATTEMPTS.min(pool_size).max(1);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
-    let mut retry_state = RequestRetryState::default();
-    let mut retry_credentials: Option<(String, String, String, String, u64)> = None;
+
     let mut image_permit = None;
     let mut failure_statuses = FailureStatusTracker::default();
-    let mut used_attempts = 0;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
@@ -1965,11 +1962,7 @@ pub async fn handle_chat_completions(
         &*state.custom_mapping.read().await,
     );
 
-    while let Some(attempt) = next_rotation_attempt(
-        &mut used_attempts,
-        max_attempts,
-        retry_credentials.is_some(),
-    ) {
+    for attempt in 0..max_attempts {
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
             .tools
@@ -1989,19 +1982,18 @@ pub async fn handle_chat_completions(
         let session_id = SessionManager::extract_openai_session_id(&openai_req);
 
         // 4. 获取 Token (使用准确的 request_type)
-        // 关键：在重试尝试时根据 force_rotate 决定是否轮换账号
+
         let (access_token, project_id, email, account_id, _wait_ms) =
-            if let Some(credentials) = retry_credentials.take() {
-                credentials
-            } else if config.request_type == "image_gen" {
+            if config.request_type == "image_gen" {
                 drop(image_permit.take());
                 match token_manager
-                    .get_image_token(
-                        force_rotate,
+                    .get_image_token_filtered(
+                        !account_attempts.is_empty(),
                         Some(&session_id),
                         &mapped_model,
                         &image_scheduler,
                         request_timeout,
+                        account_attempts.excluded(),
                     )
                     .await
                 {
@@ -2010,6 +2002,9 @@ pub async fn handle_chat_completions(
                         (access_token, project_id, email, account_id, wait_ms)
                     }
                     Err((status, message)) => {
+                        if !account_attempts.is_empty() {
+                            break;
+                        }
                         failure_statuses.record(status);
                         last_error = message;
                         break;
@@ -2017,16 +2012,20 @@ pub async fn handle_chat_completions(
                 }
             } else {
                 match token_manager
-                    .get_token(
+                    .get_token_filtered(
                         &config.request_type,
-                        force_rotate,
+                        !account_attempts.is_empty(),
                         Some(&session_id),
                         &mapped_model,
+                        account_attempts.excluded(),
                     )
                     .await
                 {
                     Ok(t) => t,
                     Err(e) => {
+                        if !account_attempts.is_empty() {
+                            break;
+                        }
                         // [Issue #3414] Attach headers with Retry-After if temporary cooldown exists
                         let headers = crate::proxy::handlers::common::build_token_error_headers(
                             Some(mapped_model.as_str()),
@@ -2049,6 +2048,7 @@ pub async fn handle_chat_completions(
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
             .await;
 
+        account_attempts.record(&account_id);
         last_email = Some(email.clone());
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
@@ -2563,13 +2563,7 @@ pub async fn handle_chat_completions(
         }
 
         // 确定重试策略
-        let strategy = retry_state.determine_strategy(
-            &account_id,
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-            false,
-        );
+        let strategy = account_retry_strategy(status_code);
         let should_mark_limited =
             status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500;
         let needs_quota_refresh = if config.request_type == "image_gen" && should_mark_limited {
@@ -2585,9 +2579,7 @@ pub async fn handle_chat_completions(
         } else {
             false
         };
-        if !matches!(&strategy, RetryStrategy::GraceRetry(_)) {
-            drop(image_permit.take());
-        }
+        drop(image_permit.take());
         if needs_quota_refresh {
             token_manager
                 .refresh_quota_lock_after_fast_mark(&email, Some(&mapped_model))
@@ -2648,37 +2640,6 @@ pub async fn handle_chat_completions(
         )
         .await
         {
-            if matches!(strategy, RetryStrategy::GraceRetry(_)) {
-                retry_credentials = Some((
-                    access_token.clone(),
-                    project_id.clone(),
-                    email.clone(),
-                    account_id.clone(),
-                    0,
-                ));
-            }
-            // [NEW] Apply Client Adapter "let_it_crash" strategy
-            if let Some(adapter) = &client_adapter {
-                if adapter.let_it_crash() && attempt > 0 {
-                    tracing::warn!(
-                        "[OpenAI] let_it_crash active: Aborting retries after attempt {}",
-                        attempt
-                    );
-                    break;
-                }
-            }
-
-            // 判断是否需要轮换账号
-            if !should_rotate_account(status_code, Some(&strategy)) {
-                debug!(
-                    "[{}] Keeping same account for status {} (Grace Retry or Server Issue)",
-                    trace_id, status_code
-                );
-                force_rotate = false;
-            } else {
-                force_rotate = true;
-            }
-
             tracing::warn!(
                 "OpenAI Upstream {} on {} attempt {}/{}, rotating account",
                 status_code,
@@ -2745,7 +2706,6 @@ pub async fn handle_chat_completions(
             continue; // 重试:下一轮 transform 时读取新代数,派生全新 sessionId
         }
 
-        // 404 等由于模型配置或路径错误的 HTTP 异常，直接报错，不进行无效轮换
         error!(
             "OpenAI Upstream non-retryable error {} on account {}: {}",
             status_code, email, error_text
@@ -2768,20 +2728,15 @@ pub async fn handle_chat_completions(
             .into_response());
     }
 
-    // 所有尝试均失败：仅当全部结构化失败状态均为 429 时返回 429
-    let final_status = failure_statuses.final_status();
+    // 账号耗尽时返回最近一次实际失败。
+    let final_status = failure_statuses.latest_status();
     let headers = crate::proxy::handlers::common::build_token_error_headers(
         Some(mapped_model.as_str()),
         last_email.as_deref(),
         &last_error,
     );
 
-    Ok((
-        final_status,
-        headers,
-        format!("All accounts exhausted. Last error: {}", last_error),
-    )
-        .into_response())
+    Ok((final_status, headers, last_error).into_response())
 }
 
 // --- Codex GUIDANCE PROMPTS ---
@@ -3749,14 +3704,12 @@ pub async fn handle_completions(
 
     let upstream = state.upstream.clone();
     let pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(pool_size).max(1);
+    let max_attempts = MAX_ACCOUNT_ATTEMPTS.min(pool_size).max(1);
 
     let mut last_error = String::new();
     let mut last_email: Option<String> = None;
-    let mut retry_state = RequestRetryState::default();
-    let mut retry_credentials: Option<(String, String, String, String, u64)> = None;
+
     let mut failure_statuses = FailureStatusTracker::default();
-    let mut used_attempts = 0;
 
     if debug_logger::is_enabled(&debug_cfg) {
         let payload = json!({
@@ -3775,13 +3728,9 @@ pub async fn handle_completions(
         .await;
     }
 
-    let mut force_rotate = false;
+    let mut account_attempts = AccountAttempts::default();
 
-    while let Some(attempt) = next_rotation_attempt(
-        &mut used_attempts,
-        max_attempts,
-        retry_credentials.is_some(),
-    ) {
+    for attempt in 0..max_attempts {
         // 3. 模型配置解析
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
@@ -3803,40 +3752,42 @@ pub async fn handle_completions(
         let session_id_str = session_id_str.clone();
         let session_id = Some(session_id_str.as_str());
 
-        let (access_token, project_id, email, account_id, _wait_ms) =
-            if let Some(credentials) = retry_credentials.take() {
-                credentials
-            } else {
-                match token_manager
-                    .get_token(
-                        &config.request_type,
-                        force_rotate,
-                        session_id,
-                        &mapped_model,
-                    )
-                    .await
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let headers = crate::proxy::handlers::common::build_token_error_headers(
-                            Some(mapped_model.as_str()),
-                            None,
-                            &e,
-                        );
-                        return (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            headers,
-                            format!("Token error: {}", e),
-                        )
-                            .into_response()
+        let (access_token, project_id, email, account_id, _wait_ms) = {
+            match token_manager
+                .get_token_filtered(
+                    &config.request_type,
+                    !account_attempts.is_empty(),
+                    session_id,
+                    &mapped_model,
+                    account_attempts.excluded(),
+                )
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    if !account_attempts.is_empty() {
+                        break;
                     }
+                    let headers = crate::proxy::handlers::common::build_token_error_headers(
+                        Some(mapped_model.as_str()),
+                        None,
+                        &e,
+                    );
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        headers,
+                        format!("Token error: {}", e),
+                    )
+                        .into_response();
                 }
-            };
+            }
+        };
 
         let mapped_model = token_manager
             .resolve_dynamic_model_for_account(&account_id, &mapped_model)
             .await;
 
+        account_attempts.record(&account_id);
         last_email = Some(email.clone());
 
         info!("✓ Using account: {} (type: {})", email, config.request_type);
@@ -4500,13 +4451,7 @@ pub async fn handle_completions(
                 .await;
         }
 
-        let strategy = retry_state.determine_strategy(
-            &account_id,
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-            false,
-        );
+        let strategy = account_retry_strategy(status_code);
 
         // 执行退备
         if apply_retry_strategy(
@@ -4518,16 +4463,6 @@ pub async fn handle_completions(
         )
         .await
         {
-            if matches!(strategy, RetryStrategy::GraceRetry(_)) {
-                retry_credentials = Some((
-                    access_token.clone(),
-                    project_id.clone(),
-                    email.clone(),
-                    account_id.clone(),
-                    0,
-                ));
-            }
-            force_rotate = should_rotate_account(status_code, Some(&strategy));
             continue;
         } else {
             // 不可重试
@@ -4544,18 +4479,13 @@ pub async fn handle_completions(
     }
 
     // 所有尝试均失败
-    let final_status = failure_statuses.final_status();
+    let final_status = failure_statuses.latest_status();
     let headers = crate::proxy::handlers::common::build_token_error_headers(
         Some(mapped_model.as_str()),
         last_email.as_deref(),
         &last_error,
     );
-    (
-        final_status,
-        headers,
-        format!("All accounts exhausted. Last error: {}", last_error),
-    )
-        .into_response()
+    (final_status, headers, last_error).into_response()
 }
 
 pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoResponse {
@@ -4822,7 +4752,7 @@ pub async fn handle_images_generations_internal(
     let image_scheduler = state.image_scheduler.clone();
     let request_timeout = state.request_timeout;
     let max_pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(max_pool_size).max(1);
+    let max_attempts = MAX_ACCOUNT_ATTEMPTS.min(max_pool_size).max(1);
 
     let mut tasks = JoinSet::new();
 
@@ -4844,57 +4774,47 @@ pub async fn handle_images_generations_internal(
         tasks.spawn(async move {
             let mut image_permit = None;
             let mut last_error = String::new();
-            let mut force_rotate = false;
-            let mut retry_state = RequestRetryState::default();
-            let mut retry_credentials: Option<(String, String, String, String, u64)> = None;
-            let mut failure_statuses = FailureStatusTracker::default();
-            let mut used_attempts = 0;
 
-            while let Some(attempt) = next_rotation_attempt(
-                &mut used_attempts,
-                max_attempts,
-                retry_credentials.is_some(),
-            ) {
-                let (access_token, project_id, email, account_id, _wait_ms) =
-                    if let Some(credentials) = retry_credentials.take() {
-                        credentials
-                    } else {
-                        drop(image_permit.take());
-                        match token_manager
-                            .get_image_token(
-                                force_rotate,
-                                None,
-                                &model_to_use,
-                                &image_scheduler,
-                                request_timeout,
-                            )
-                            .await
-                        {
-                            Ok((
-                                access_token,
-                                project_id,
-                                email,
-                                account_id,
-                                wait_ms,
-                                permit,
-                            )) => {
-                                image_permit = Some(permit);
-                                (access_token, project_id, email, account_id, wait_ms)
-                            }
-                            Err((status, e)) => {
-                                last_error = format!("Token error: {}", e);
-                                failure_statuses.record(status);
-                                if status == StatusCode::TOO_MANY_REQUESTS {
-                                    return Err((status, e));
-                                }
-                                if attempt < max_attempts - 1 {
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    continue;
-                                }
+            let mut account_attempts = AccountAttempts::default();
+
+            let mut failure_statuses = FailureStatusTracker::default();
+
+            for attempt in 0..max_attempts {
+                let (access_token, project_id, email, account_id, _wait_ms) = {
+                    drop(image_permit.take());
+                    match token_manager
+                        .get_image_token_filtered(
+                            !account_attempts.is_empty(),
+                            None,
+                            &model_to_use,
+                            &image_scheduler,
+                            request_timeout,
+                            account_attempts.excluded(),
+                        )
+                        .await
+                    {
+                        Ok((access_token, project_id, email, account_id, wait_ms, permit)) => {
+                            image_permit = Some(permit);
+                            (access_token, project_id, email, account_id, wait_ms)
+                        }
+                        Err((status, e)) => {
+                            if !account_attempts.is_empty() {
                                 break;
                             }
+                            last_error = format!("Token error: {}", e);
+                            failure_statuses.record(status);
+                            if status == StatusCode::TOO_MANY_REQUESTS {
+                                return Err((status, e));
+                            }
+                            if attempt < max_attempts - 1 {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
+                            break;
                         }
-                    };
+                    }
+                };
+                account_attempts.record(&account_id);
                 if let Ok(mut g) = attempted_account.lock() {
                     *g = Some(email.clone());
                 }
@@ -4954,15 +4874,7 @@ pub async fn handle_images_generations_internal(
                             let err_text = response.text().await.unwrap_or_default();
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
-                            let strategy = (status_code == 429).then(|| {
-                                retry_state.determine_strategy(
-                                    &account_id,
-                                    status_code,
-                                    &err_text,
-                                    retry_after.as_deref(),
-                                    false,
-                                )
-                            });
+                            let strategy = account_retry_strategy(status_code);
                             // 429/500/503: mark limited before retry/rotation
                             let should_mark_limited =
                                 status_code == 429 || status_code == 503 || status_code == 500;
@@ -4984,84 +4896,55 @@ pub async fn handle_images_generations_internal(
                             } else {
                                 false
                             };
-                            if !matches!(strategy.as_ref(), Some(RetryStrategy::GraceRetry(_))) {
-                                drop(image_permit.take());
-                            }
+                            drop(image_permit.take());
                             if needs_quota_refresh {
                                 token_manager
-                                    .refresh_quota_lock_after_fast_mark(
-                                        &email,
-                                        Some(&resolved_model),
-                                    )
+                                    .refresh_quota_lock_after_fast_mark(&email, Some(&resolved_model))
                                     .await;
                             }
 
-                            if let Some(strategy) = strategy {
-                                if apply_retry_strategy(
-                                    strategy.clone(),
-                                    attempt,
-                                    max_attempts,
-                                    status_code,
-                                    "image_generation",
-                                )
-                                .await
-                                {
-                                    if matches!(strategy, RetryStrategy::GraceRetry(_)) {
-                                        retry_credentials = Some((
-                                            access_token.clone(),
-                                            project_id.clone(),
-                                            email.clone(),
-                                            account_id.clone(),
-                                            0,
-                                        ));
-                                    }
-                                    force_rotate =
-                                        should_rotate_account(status_code, Some(&strategy));
-                                    continue;
-                                }
+                            if apply_retry_strategy(
+                                strategy.clone(),
+                                attempt,
+                                max_attempts,
+                                status_code,
+                                "image_generation",
+                            )
+                            .await
+                            {
+                                continue;
                             }
 
                             if status_code == 503 || status_code == 500 {
-                                force_rotate = true;
                                 continue; // Retry loop
                             }
 
                             // [FIX] 403/404 usually mean THIS account lacks the image model or
                             // project access. Rotate to another account instead of failing the
                             // whole request, so an image-capable account can serve it.
-                            if (status_code == 403 || status_code == 404)
-                                && attempt < max_attempts - 1
-                            {
+                            if (status_code == 403 || status_code == 404) && attempt < max_attempts - 1 {
                                 tracing::warn!(
-                                    "[Images] Account {} returned {} for image gen, rotating to another account",
-                                    email,
-                                    status_code
-                                );
-                                force_rotate = true;
+                                            "[Images] Account {} returned {} for image gen, rotating to another account",
+                                            email,
+                                            status_code
+                                        );
+
                                 continue;
                             }
 
                             // Other errors: return
-                            return Err((failure_statuses.final_status(), last_error));
+                            return Err((failure_statuses.latest_status(), last_error));
                         }
                         match response.json::<Value>().await {
                             Ok(json) => {
                                 if response_has_inline_image_data(&json) {
                                     token_manager.mark_account_success(&account_id);
                                     token_manager
-                                        .clear_persisted_live_limit(
-                                            &account_id,
-                                            Some(&model_to_use),
-                                        );
+                                        .clear_persisted_live_limit(&account_id, Some(&model_to_use));
                                 }
                                 return Ok((json, email));
                             }
-                            Err(e) => {
-                                return Err((
-                                    StatusCode::BAD_GATEWAY,
-                                    format!("Parse error: {}", e),
-                                ))
-                            }
+                            Err(e) => return Err((StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))),
                         }
                     }
                     Err(e) => {
@@ -5074,10 +4957,7 @@ pub async fn handle_images_generations_internal(
             }
 
             // All attempts failed
-            Err((
-                failure_statuses.final_status(),
-                format!("Max retries exhausted. Last error: {}", last_error),
-            ))
+            Err((failure_statuses.latest_status(), last_error))
         });
     }
 
@@ -5149,7 +5029,7 @@ pub async fn handle_images_generations_internal(
         };
         tracing::error!("[Images] All {} requests failed. Errors: {}", n, error_msg);
 
-        let status = failure_statuses.final_status();
+        let status = failure_statuses.latest_status();
 
         let attempted = used_email
             .clone()
@@ -5343,7 +5223,7 @@ pub async fn handle_images_edits(
     let image_scheduler = state.image_scheduler.clone();
     let request_timeout = state.request_timeout;
     let max_pool_size = token_manager.len();
-    let max_attempts = MAX_RETRY_ATTEMPTS.min(max_pool_size).max(1);
+    let max_attempts = MAX_ACCOUNT_ATTEMPTS.min(max_pool_size).max(1);
 
     let mut tasks = JoinSet::new();
     for _ in 0..n {
@@ -5358,51 +5238,48 @@ pub async fn handle_images_edits(
         tasks.spawn(async move {
             let mut image_permit = None;
             let mut last_error = String::new();
-            let mut force_rotate = false;
-            let mut retry_state = RequestRetryState::default();
-            let mut retry_credentials: Option<(String, String, String, String, u64)> = None;
-            let mut failure_statuses = FailureStatusTracker::default();
-            let mut used_attempts = 0;
 
-            while let Some(attempt) = next_rotation_attempt(
-                &mut used_attempts,
-                max_attempts,
-                retry_credentials.is_some(),
-            ) {
+            let mut account_attempts = AccountAttempts::default();
+
+            let mut failure_statuses = FailureStatusTracker::default();
+
+            for attempt in 0..max_attempts {
                 // 4.1 获取 Token
-                let (access_token, project_id, email, account_id, _wait_ms) =
-                    if let Some(credentials) = retry_credentials.take() {
-                        credentials
-                    } else {
-                        drop(image_permit.take());
-                        match token_manager
-                            .get_image_token(
-                                force_rotate,
-                                None,
-                                image_account_selection_target(&model_to_use),
-                                &image_scheduler,
-                                request_timeout,
-                            )
-                            .await
-                        {
-                            Ok((access_token, project_id, email, account_id, wait_ms, permit)) => {
-                                image_permit = Some(permit);
-                                (access_token, project_id, email, account_id, wait_ms)
-                            }
-                            Err((status, e)) => {
-                                last_error = format!("Token error: {}", e);
-                                failure_statuses.record(status);
-                                if status == StatusCode::TOO_MANY_REQUESTS {
-                                    return Err((status, e));
-                                }
-                                if attempt < max_attempts - 1 {
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-                                    continue;
-                                }
+                let (access_token, project_id, email, account_id, _wait_ms) = {
+                    drop(image_permit.take());
+                    match token_manager
+                        .get_image_token_filtered(
+                            !account_attempts.is_empty(),
+                            None,
+                            image_account_selection_target(&model_to_use),
+                            &image_scheduler,
+                            request_timeout,
+                            account_attempts.excluded(),
+                        )
+                        .await
+                    {
+                        Ok((access_token, project_id, email, account_id, wait_ms, permit)) => {
+                            image_permit = Some(permit);
+                            (access_token, project_id, email, account_id, wait_ms)
+                        }
+                        Err((status, e)) => {
+                            if !account_attempts.is_empty() {
                                 break;
                             }
+                            last_error = format!("Token error: {}", e);
+                            failure_statuses.record(status);
+                            if status == StatusCode::TOO_MANY_REQUESTS {
+                                return Err((status, e));
+                            }
+                            if attempt < max_attempts - 1 {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                continue;
+                            }
+                            break;
                         }
-                    };
+                    }
+                };
+                account_attempts.record(&account_id);
 
                 let resolved_model = token_manager
                     .resolve_dynamic_model_for_account(&account_id, &model_to_use)
@@ -5439,15 +5316,7 @@ pub async fn handle_images_edits(
                             let err_text = response.text().await.unwrap_or_default();
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
-                            let strategy = (status_code == 429).then(|| {
-                                retry_state.determine_strategy(
-                                    &account_id,
-                                    status_code,
-                                    &err_text,
-                                    retry_after.as_deref(),
-                                    false,
-                                )
-                            });
+                            let strategy = account_retry_strategy(status_code);
                             // 429/500/503 等错误进行标记和重试
                             let should_mark_limited =
                                 status_code == 429 || status_code == 503 || status_code == 500;
@@ -5469,65 +5338,40 @@ pub async fn handle_images_edits(
                             } else {
                                 false
                             };
-                            if !matches!(strategy.as_ref(), Some(RetryStrategy::GraceRetry(_))) {
-                                drop(image_permit.take());
-                            }
+                            drop(image_permit.take());
                             if needs_quota_refresh {
                                 token_manager
-                                    .refresh_quota_lock_after_fast_mark(
-                                        &email,
-                                        Some(&resolved_model),
-                                    )
+                                    .refresh_quota_lock_after_fast_mark(&email, Some(&resolved_model))
                                     .await;
                             }
 
-                            if let Some(strategy) = strategy {
-                                if apply_retry_strategy(
-                                    strategy.clone(),
-                                    attempt,
-                                    max_attempts,
-                                    status_code,
-                                    "image_edit",
-                                )
-                                .await
-                                {
-                                    if matches!(strategy, RetryStrategy::GraceRetry(_)) {
-                                        retry_credentials = Some((
-                                            access_token.clone(),
-                                            project_id.clone(),
-                                            email.clone(),
-                                            account_id.clone(),
-                                            0,
-                                        ));
-                                    }
-                                    force_rotate =
-                                        should_rotate_account(status_code, Some(&strategy));
-                                    continue;
-                                }
+                            if apply_retry_strategy(
+                                strategy.clone(),
+                                attempt,
+                                max_attempts,
+                                status_code,
+                                "image_edit",
+                            )
+                            .await
+                            {
+                                continue;
                             }
 
                             if status_code == 503 || status_code == 500 {
                                 continue; // Retry loop
                             }
-                            return Err((failure_statuses.final_status(), last_error));
+                            return Err((failure_statuses.latest_status(), last_error));
                         }
                         match response.json::<Value>().await {
                             Ok(json) => {
                                 if response_has_inline_image_data(&json) {
                                     token_manager.mark_account_success(&account_id);
-                                    token_manager.clear_persisted_live_limit(
-                                        &account_id,
-                                        Some(&model_to_use),
-                                    );
+                                    token_manager
+                                        .clear_persisted_live_limit(&account_id, Some(&model_to_use));
                                 }
                                 return Ok((json, response_format.clone(), email));
                             }
-                            Err(e) => {
-                                return Err((
-                                    StatusCode::BAD_GATEWAY,
-                                    format!("Parse error: {}", e),
-                                ))
-                            }
+                            Err(e) => return Err((StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))),
                         }
                     }
                     Err(e) => {
@@ -5538,10 +5382,7 @@ pub async fn handle_images_edits(
                     }
                 }
             }
-            Err((
-                failure_statuses.final_status(),
-                format!("Max retries exhausted. Last error: {}", last_error),
-            ))
+            Err((failure_statuses.latest_status(), last_error))
         });
     }
 
@@ -5615,7 +5456,7 @@ pub async fn handle_images_edits(
             n,
             error_msg
         );
-        let status = failure_statuses.final_status();
+        let status = failure_statuses.latest_status();
 
         return Err((status, error_msg));
     }

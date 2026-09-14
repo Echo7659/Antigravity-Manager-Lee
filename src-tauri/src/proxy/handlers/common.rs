@@ -76,15 +76,22 @@ pub fn next_rotation_attempt(
 #[derive(Debug, Default)]
 pub struct FailureStatusTracker {
     saw_failure: bool,
+    latest_status: Option<StatusCode>,
     last_non_rate_limit: Option<StatusCode>,
 }
 
 impl FailureStatusTracker {
     pub fn record(&mut self, status: StatusCode) {
         self.saw_failure = true;
+        self.latest_status = Some(status);
         if status != StatusCode::TOO_MANY_REQUESTS {
             self.last_non_rate_limit = Some(status);
         }
+    }
+
+    /// 返回最近一次实际失败的状态码，与最终错误正文保持一致。
+    pub fn latest_status(&self) -> StatusCode {
+        self.latest_status.unwrap_or(StatusCode::BAD_GATEWAY)
     }
 
     pub fn final_status(&self) -> StatusCode {
@@ -237,6 +244,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compat_failover_retries_upstream_errors_and_preserves_last_status() {
+        for code in [400, 401, 403, 404, 408, 422, 429, 500, 502, 503, 504, 529] {
+            assert!(matches!(
+                account_retry_strategy(code),
+                RetryStrategy::ExponentialBackoff { .. }
+            ));
+        }
+        assert!(matches!(
+            account_retry_strategy(200),
+            RetryStrategy::NoRetry
+        ));
+        let mut failures = FailureStatusTracker::default();
+        failures.record(StatusCode::BAD_REQUEST);
+        failures.record(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(failures.latest_status(), StatusCode::TOO_MANY_REQUESTS);
+        failures.record(StatusCode::FORBIDDEN);
+        assert_eq!(failures.latest_status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn compat_failover_does_not_sleep_after_last_account() {
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            apply_retry_strategy(account_retry_strategy(503), 5, 6, 503, "test"),
+        )
+        .await
+        .expect("last failure must return without backoff");
+        assert!(!result);
+    }
+
+    #[test]
     fn task_short_429_preserves_rotation_budget_and_structured_status() {
         let body = r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#;
 
@@ -246,11 +284,9 @@ mod tests {
             let mut retry_same_account = false;
             let mut sends = Vec::new();
 
-            while let Some(attempt) = next_rotation_attempt(
-                &mut used_attempts,
-                account_count,
-                retry_same_account,
-            ) {
+            while let Some(attempt) =
+                next_rotation_attempt(&mut used_attempts, account_count, retry_same_account)
+            {
                 retry_same_account = false;
                 sends.push(attempt);
                 let account_id = format!("account-{}", attempt);
@@ -287,6 +323,18 @@ mod tests {
     }
 }
 
+/// 上游 HTTP 错误使用不同账号重试；限流账号的等待时间由冷却记录约束。
+pub fn account_retry_strategy(status_code: u16) -> RetryStrategy {
+    if (400..600).contains(&status_code) {
+        RetryStrategy::ExponentialBackoff {
+            base_ms: 200,
+            max_ms: 2000,
+        }
+    } else {
+        RetryStrategy::NoRetry
+    }
+}
+
 /// 执行退避策略并返回是否应该继续重试
 pub async fn apply_retry_strategy(
     strategy: RetryStrategy,
@@ -295,6 +343,9 @@ pub async fn apply_retry_strategy(
     status_code: u16,
     trace_id: &str,
 ) -> bool {
+    if attempt + 1 >= max_attempts && !matches!(strategy, RetryStrategy::GraceRetry(_)) {
+        return false;
+    }
     match strategy {
         RetryStrategy::NoRetry => {
             debug!(
@@ -521,4 +572,3 @@ mod retry_after_tests {
         );
     }
 }
-
