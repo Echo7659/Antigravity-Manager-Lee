@@ -457,6 +457,8 @@ pub async fn handle_generate(
                     let mut meta_sent = false;
                     let mut saw_image_data = false;
                     let mut stream_failed = false;
+                    let mut saw_visible_output = false;
+                    let mut saw_refusal = false;
 
                     loop {
                         // [NEW] 阶段 6.2: 补全 __cloudCodeMeta 响应元数据透传
@@ -482,6 +484,8 @@ pub async fn handle_generate(
                                 Err(_) => {
                                     error!("[Gemini-SSE] Idle timeout after 300s, terminating stream");
                                     stream_failed = true;
+                                    let failure = json!({"error": {"code": 504, "status": "DEADLINE_EXCEEDED", "message": "Upstream stream timed out"}});
+                                    yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", failure)));
                                     None
                                 }
                             }
@@ -493,23 +497,13 @@ pub async fn handle_generate(
                                 error!("[Gemini-SSE] Stream error: {}", e);
                                 stream_failed = true;
                                 let error_json = serde_json::json!({
-                                    "id": &s_id_for_stream,
-                                    "object": "chat.completion.chunk",
-                                    "model": &model_name_for_stream,
-                                    "choices": [
-                                        {
-                                            "index": 0,
-                                            "delta": {
-                                                "content": format!("\n[Stream Error] {}", e)
-                                            },
-                                            "finish_reason": "error"
-                                        }
-                                    ]
+                                    "error": {"code": 502, "status": "UNAVAILABLE", "message": format!("Upstream stream error: {}", e)}
                                 });
                                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", serde_json::to_string(&error_json).unwrap_or_default())));
                                 yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
                                 break;
                             }
+                            None if !stream_failed && !buffer.is_empty() => Bytes::from_static(b"\n"),
                             None => break,
                         };
 
@@ -541,6 +535,9 @@ pub async fn handle_generate(
                                             };
 
                                             if let Some(resp) = inner_val {
+                                                saw_visible_output |= crate::proxy::mappers::gemini::collector::response_has_visible_content(resp);
+                                                saw_refusal |= crate::proxy::mappers::gemini::collector::response_is_refusal(resp);
+                                                stream_failed |= resp.get("error").is_some_and(|error| !error.is_null());
                                                 if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
                                                     for cand in candidates {
                                                         if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
@@ -583,6 +580,12 @@ pub async fn handle_generate(
                                 yield Ok::<Bytes, String>(line_raw.freeze());
                             }
                         }
+                    }
+
+                    if !stream_failed && !saw_visible_output && !saw_refusal {
+                        stream_failed = true;
+                        let failure = json!({"error": {"code": 502, "status": "UNAVAILABLE", "message": "Upstream ended without an answer or tool call"}});
+                        yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", failure)));
                     }
 
                     if track_image_success && saw_image_data && !stream_failed {
@@ -629,11 +632,10 @@ pub async fn handle_generate(
                         }
                         Err(e) => {
                             error!("Stream collection error: {}", e);
-                            return Ok((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("Stream collection error: {}", e),
-                            )
-                                .into_response());
+                            last_error = format!("Stream collection error: {}", e);
+                            failure_statuses.record(StatusCode::BAD_GATEWAY);
+                            force_rotate = true;
+                            continue;
                         }
                     }
                 }

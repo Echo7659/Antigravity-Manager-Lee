@@ -463,18 +463,12 @@ pub fn transform_openai_response(
             .map(|v| v as u32);
         let input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
 
-        // New Interactions usage keeps thought/tool-use tokens separate from
-        // total_output_tokens. Legacy candidatesTokenCount already includes those.
-        let has_new_format = u.get("total_output_tokens").is_some();
-        let completion_tokens = if has_new_format {
-            raw_output_tokens + reasoning_tokens.unwrap_or(0) + tool_use_tokens.unwrap_or(0)
-        } else {
-            raw_output_tokens
-        };
+        // 输出计数统一包含思考，并兼容旧上游已合并思考计数的格式。
+        let completion_tokens = crate::proxy::mappers::usage::gemini_output_tokens(u).unwrap_or(0);
 
         // Keep prompt_tokens as Gemini's raw input token count. cached_tokens is a
         // subset of the prompt, not an amount to subtract from it.
-        let final_total_tokens = raw_total_tokens.unwrap_or(prompt_tokens + completion_tokens);
+        let final_total_tokens = prompt_tokens.saturating_add(completion_tokens);
 
         Some(super::models::OpenAIUsage {
             prompt_tokens,

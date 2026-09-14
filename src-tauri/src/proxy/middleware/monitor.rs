@@ -1,3 +1,6 @@
+use crate::proxy::mappers::usage::{
+    gemini_output_tokens, merge_counter, merge_usage_metadata, stream_error,
+};
 use crate::proxy::middleware::auth::UserTokenIdentity;
 use crate::proxy::monitor::ProxyRequestLog;
 use crate::proxy::server::AppState;
@@ -341,19 +344,7 @@ fn extract_output_tokens(usage: &Value) -> Option<u32> {
         return Some(tokens);
     }
 
-    let base = value_as_u32(
-        usage
-            .get("total_output_tokens")
-            .or_else(|| usage.get("candidatesTokenCount")),
-    )?;
-    let has_new_format = usage.get("total_output_tokens").is_some();
-    if has_new_format {
-        let reasoning = extract_reasoning_tokens(usage).unwrap_or(0);
-        let tool_use = value_as_u32(usage.get("total_tool_use_tokens")).unwrap_or(0);
-        Some(base + reasoning + tool_use)
-    } else {
-        Some(base)
-    }
+    gemini_output_tokens(usage)
 }
 
 pub async fn monitor_middleware(
@@ -567,6 +558,7 @@ pub async fn monitor_middleware(
                 let mut tool_calls: Vec<Value> = Vec::new();
                 let mut cached_tokens: Option<u32> = None;
                 let mut reasoning_tokens: Option<u32> = None;
+                let mut usage_snapshot = serde_json::json!({});
 
                 for line in full_response.lines() {
                     if !line.starts_with("data: ") {
@@ -578,6 +570,10 @@ pub async fn monitor_middleware(
                     }
 
                     if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                        if let Some((status, error)) = stream_error(&json) {
+                            log.status = status;
+                            log.error = Some(error);
+                        }
                         // OpenAI format: choices[0].delta.content / reasoning_content / tool_calls
                         if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                             for choice in choices {
@@ -789,12 +785,14 @@ pub async fn monitor_middleware(
                             .or(json.get("response").and_then(|r| r.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                         {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
-                            cached_tokens = cached_tokens.or_else(|| extract_cached_tokens(usage));
-                            log.cached_tokens = log.cached_tokens.or(cached_tokens);
+                            merge_usage_metadata(&mut usage_snapshot, usage);
+                            let usage = &usage_snapshot;
+                            log.input_tokens = merge_counter(log.input_tokens, extract_input_tokens(usage));
+                            log.output_tokens = merge_counter(log.output_tokens, extract_output_tokens(usage));
+                            cached_tokens = merge_counter(cached_tokens, extract_cached_tokens(usage));
+                            log.cached_tokens = merge_counter(log.cached_tokens, cached_tokens);
                             reasoning_tokens =
-                                reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
+                                merge_counter(reasoning_tokens, extract_reasoning_tokens(usage));
 
                             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                 log.output_tokens = usage
@@ -809,6 +807,9 @@ pub async fn monitor_middleware(
 
                 // Build consolidated response object
                 let mut consolidated = serde_json::Map::new();
+                if let Some(error) = &log.error {
+                    consolidated.insert("error".to_string(), Value::String(error.clone()));
+                }
                 let has_actual_content = !response_content.is_empty()
                     || !tool_calls.is_empty()
                     || !thinking_content.is_empty();
@@ -926,8 +927,8 @@ pub async fn monitor_middleware(
                                     .or(json.get("response").and_then(|r| r.get("usage")))
                                     .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                                 {
-                                    log.input_tokens = extract_input_tokens(usage);
-                                    log.output_tokens = extract_output_tokens(usage);
+                                    log.input_tokens = merge_counter(log.input_tokens, extract_input_tokens(usage));
+                                    log.output_tokens = merge_counter(log.output_tokens, extract_output_tokens(usage));
                                     log.cached_tokens =
                                         log.cached_tokens.or_else(|| extract_cached_tokens(usage));
                                     break;
@@ -938,7 +939,7 @@ pub async fn monitor_middleware(
                 }
             }
 
-            if log.status >= 400 {
+            if log.status >= 400 && log.error.is_none() {
                 log.error = Some("Stream Error or Failed".to_string());
             }
 
@@ -975,8 +976,8 @@ pub async fn monitor_middleware(
                             .or(json.get("response").and_then(|r| r.get("usage")))
                             .or(json.get("response").and_then(|r| r.get("usageMetadata")))
                         {
-                            log.input_tokens = extract_input_tokens(usage);
-                            log.output_tokens = extract_output_tokens(usage);
+                            log.input_tokens = merge_counter(log.input_tokens, extract_input_tokens(usage));
+                            log.output_tokens = merge_counter(log.output_tokens, extract_output_tokens(usage));
                             log.cached_tokens =
                                 log.cached_tokens.or_else(|| extract_cached_tokens(usage));
 

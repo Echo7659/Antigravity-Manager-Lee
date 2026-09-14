@@ -8,6 +8,8 @@ pub mod models;
 pub mod request;
 pub mod response;
 pub mod streaming;
+#[cfg(test)]
+mod streaming_compat_tests;
 pub mod thinking_recovery;
 
 pub use models::*;

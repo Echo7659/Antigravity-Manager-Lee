@@ -29,13 +29,7 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
     );
 }
 
-/// Extract and convert Gemini usageMetadata to OpenAI usage format
-/// Supports both legacy v1internal format and new Interactions API format.
-///
-/// Key semantic difference:
-/// - Old format: candidatesTokenCount = all output tokens (text + thinking + tool)
-/// - New format: total_output_tokens = text + tool output only; thought tokens are separate (total_thought_tokens)
-/// For Codex, we must sum them back together as `completion_tokens`.
+/// 将 Gemini 用量转换为 OpenAI 用量，兼容独立思考与合并思考计数。
 fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
     use super::models::{CompletionTokensDetails, OpenAIUsage, PromptTokensDetails};
 
@@ -73,17 +67,12 @@ fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
         .map(|v| v as u32);
     let input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
 
-    // 新格式下 output_tokens 不含 thought/tool-use, 需要加回来。旧格式 candidatesTokenCount 已经包含它们
-    let has_new_format = u.get("total_output_tokens").is_some();
-    let completion_tokens = if has_new_format {
-        raw_output_tokens + reasoning_tokens.unwrap_or(0) + tool_use_tokens.unwrap_or(0)
-    } else {
-        raw_output_tokens
-    };
+    // 输出计数统一包含思考，并保留上游原始字段供核对。
+    let completion_tokens = crate::proxy::mappers::usage::gemini_output_tokens(u).unwrap_or(0);
 
     // cached_tokens is a subset of prompt_tokens. Keep prompt_tokens in the same
     // raw-input-token unit as Gemini usageMetadata so downstream logs can reconcile it.
-    let final_total_tokens = raw_total_tokens.unwrap_or(prompt_tokens + completion_tokens);
+    let final_total_tokens = prompt_tokens.saturating_add(completion_tokens);
 
     Some(OpenAIUsage {
         prompt_tokens,
@@ -124,16 +113,23 @@ where
     let stream = async_stream::stream! {
         let mut emitted_tool_calls = std::collections::HashSet::new();
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
+        let mut usage_snapshot = json!({});
         let mut error_occurred = false;
         let mut has_emitted_content = false;
+        let mut received_refusal = false;
         let mut tool_call_index = 0;
 
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        loop {
+        'upstream: loop {
             tokio::select! {
                 item = gemini_stream.next() => {
+                    // EOF 时补终止换行，保留未带换行的最后一帧及用量信息。
+                    let item = match item {
+                        None if !buffer.is_empty() => Some(Ok(Bytes::from_static(b"\n"))),
+                        item => item,
+                    };
                     match item {
                         Some(Ok(bytes)) => {
                             buffer.extend_from_slice(&bytes);
@@ -147,8 +143,24 @@ where
                                         if json_part == "[DONE]" { continue; }
                                         if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
                                             let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
+                                            if let Some(error) = actual_data.get("error").filter(|error| !error.is_null()) {
+                                                let failure = json!({"id": &stream_id, "object": "chat.completion.chunk", "model": &model, "choices": [], "error": error});
+                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", failure)));
+                                                yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
+                                                error_occurred = true;
+                                                break 'upstream;
+                                            }
+                                            if actual_data.get("promptFeedback").and_then(|feedback| feedback.get("blockReason")).and_then(Value::as_str).is_some_and(|reason| reason != "BLOCK_REASON_UNSPECIFIED") {
+                                                received_refusal = true;
+                                                let refusal = json!({
+                                                    "id": &stream_id, "object": "chat.completion.chunk", "model": &model,
+                                                    "choices": [{"index": 0, "delta": {"role": "assistant", "refusal": "Upstream declined this request."}, "finish_reason": "content_filter"}]
+                                                });
+                                                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", refusal)));
+                                            }
                                             if let Some(u) = actual_data.get("usageMetadata") {
-                                                final_usage = extract_usage_metadata(u);
+                                                crate::proxy::mappers::usage::merge_usage_metadata(&mut usage_snapshot, u);
+                                                final_usage = extract_usage_metadata(&usage_snapshot);
                                             }
 
                                             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -280,6 +292,10 @@ where
                                                         content_out.push_str("很抱歉，当前模型在尝试调取实时信息时遇到了格式异常。若需要查询实时天气或最新资讯，请尝试使用联网模式（模型名带 -online 后缀）或配置天气/搜索插件。");
                                                     }
 
+                                                    if finish_reason == Some("content_filter") {
+                                                        received_refusal = true;
+                                                    }
+
                                                     if !thought_out.is_empty() {
                                                         let reasoning_chunk = json!({
                                                             "id": &stream_id,
@@ -296,7 +312,7 @@ where
                                                         yield Ok::<Bytes, String>(Bytes::from(sse_out));
                                                     }
 
-                                                    if !content_out.is_empty() || finish_reason.is_some() {
+                                                    if !content_out.is_empty() || (finish_reason.is_some() && (has_emitted_content || !emitted_tool_calls.is_empty() || received_refusal)) {
                                                         if !content_out.is_empty() {
                                                             has_emitted_content = true;
                                                         }
@@ -349,23 +365,24 @@ where
             }
         }
 
-        // [FIX #1732] Flush remaining buffer to prevent hang on network fragmentation
-        if !buffer.is_empty() {
-            if let Ok(line_str) = std::str::from_utf8(&buffer) {
-                let line = line_str.trim();
-                if !line.is_empty() && line.starts_with("data: ") {
-                    let json_part = line.trim_start_matches("data: ").trim();
-                    if json_part != "[DONE]" {
-                        // Re-use logic for processing the last line
-                        // (Note: In a more complex refactor we'd extract this to a function,
-                        // but for a targeted fix, processing the terminal data chunk is safer)
-                        tracing::debug!("[OpenAI-SSE] Flushing remaining {} bytes in buffer", buffer.len());
-                    }
-                }
-            }
-        }
-
         if !error_occurred {
+            if !has_emitted_content && emitted_tool_calls.is_empty() && !received_refusal {
+                let mut failure = json!({
+                    "id": &stream_id, "object": "chat.completion.chunk", "model": &model,
+                    "choices": [],
+                    "error": {"type": "upstream_error", "code": "empty_response", "message": "Upstream ended without an answer or tool call. Please retry the request."}
+                });
+                if let Some(ref usage) = final_usage {
+                    failure["usage"] = serde_json::to_value(usage).unwrap();
+                }
+                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", failure)));
+            } else if let Some(ref usage) = final_usage {
+                let usage_chunk = json!({
+                    "id": &stream_id, "object": "chat.completion.chunk", "created": created_ts,
+                    "model": &model, "choices": [], "usage": usage
+                });
+                yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", usage_chunk)));
+            }
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
     };
@@ -396,6 +413,7 @@ where
 
     let stream = async_stream::stream! {
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
+        let mut usage_snapshot = json!({});
         let mut error_occurred = false;
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -403,6 +421,11 @@ where
         loop {
             tokio::select! {
                 item = gemini_stream.next() => {
+                    // EOF 时补终止换行，保留未带换行的最后一帧及用量信息。
+                    let item = match item {
+                        None if !buffer.is_empty() => Some(Ok(Bytes::from_static(b"\n"))),
+                        item => item,
+                    };
                     match item {
                         Some(Ok(bytes)) => {
                             buffer.extend_from_slice(&bytes);
@@ -416,7 +439,10 @@ where
                                         if json_part == "[DONE]" { continue; }
                                         if let Ok(mut json) = serde_json::from_str::<Value>(json_part) {
                                             let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
-                                            if let Some(u) = actual_data.get("usageMetadata") { final_usage = extract_usage_metadata(u); }
+                                            if let Some(u) = actual_data.get("usageMetadata") {
+                                                crate::proxy::mappers::usage::merge_usage_metadata(&mut usage_snapshot, u);
+                                                final_usage = extract_usage_metadata(&usage_snapshot);
+                                            }
 
                                             let mut content_out = String::new();
                                             if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {
@@ -609,12 +635,18 @@ where
         let mut message_output_index: u32 = 0;
         let mut reasoning_output_index: u32 = 0;
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
+        let mut usage_snapshot = json!({});
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 item = gemini_stream.next() => {
+                    // EOF 时补终止换行，保留未带换行的最后一帧及用量信息。
+                    let item = match item {
+                        None if !buffer.is_empty() => Some(Ok(Bytes::from_static(b"\n"))),
+                        item => item,
+                    };
                     match item {
                         Some(Ok(bytes)) => {
                             buffer.extend_from_slice(&bytes);
@@ -630,7 +662,8 @@ where
                                         let actual_data = if let Some(inner) = json.get_mut("response").map(|v| v.take()) { inner } else { json };
 
                                         if let Some(u) = actual_data.get("usageMetadata") {
-                                            final_usage = extract_usage_metadata(u);
+                                            crate::proxy::mappers::usage::merge_usage_metadata(&mut usage_snapshot, u);
+                                            final_usage = extract_usage_metadata(&usage_snapshot);
                                         }
 
                                         if let Some(candidates) = actual_data.get("candidates").and_then(|c| c.as_array()) {

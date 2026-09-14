@@ -34,6 +34,7 @@ pub fn wrap_request_v2(
 
     // 复制 body 以便修改
     let mut inner_request = body.clone();
+    super::request_compat::normalize_request(&mut inner_request);
 
     // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
     crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);

@@ -3,6 +3,7 @@
 
 pub mod collector;
 pub mod models;
+mod request_compat;
 pub mod wrapper; // [NEW]
 
 // No public exports needed here if unused
