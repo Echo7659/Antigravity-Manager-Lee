@@ -1,6 +1,8 @@
 // proxy 模块 - API 反代服务
 
 // 现有模块 (保留)
+pub mod account_ranking;
+pub mod quota_policy;
 pub mod config;
 pub mod project_resolver;
 pub mod security;

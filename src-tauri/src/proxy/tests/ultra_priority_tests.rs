@@ -53,6 +53,7 @@ fn create_test_token(
         validation_blocked: false,
         validation_blocked_until: 0,
         validation_url: None,
+        exact_model_quotas: HashMap::new(),
         model_quotas,
         model_limits: std::collections::HashMap::new(),
     }

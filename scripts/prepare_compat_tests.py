@@ -43,9 +43,31 @@ def module(path):
 mod request_compat;
 #[path = {module(source / 'handlers/account_attempts.rs')}]
 mod account_attempts;
+#[path = {module(source / "account_ranking.rs")}]
+mod account_ranking;
+#[path = {module(source / "quota_policy.rs")}]
+mod quota_policy;
+pub mod models {{
+    #[path = {module(root / "src-tauri/src/models/quota.rs")}] pub mod quota;
+}}
 #[path = {module(destination / 'retry_common.rs')}]
 mod retry_common;
 pub mod proxy {{
+    pub mod token_manager {{
+        #[derive(Default)]
+        pub struct TokenManager {{ pub refreshes: std::sync::atomic::AtomicUsize }}
+        impl TokenManager {{
+            pub fn schedule_quota_refresh(self: &std::sync::Arc<Self>, _: &str) {{
+                self.refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }}
+        }}
+    }}
+    pub mod server {{
+        #[derive(Clone)]
+        pub struct AppState {{ pub token_manager: std::sync::Arc<super::token_manager::TokenManager> }}
+    }}
+    #[path = {module(source / 'middleware/quota_refresh.rs')}] pub mod quota_refresh;
+
     pub mod upstream {{
         #[path = {module(source / 'upstream/retry.rs')}] pub mod retry;
     }}
@@ -70,6 +92,42 @@ pub mod proxy {{
         }}
     }}
 }}
+''')
+with (destination / 'lib.rs').open('a') as tests:
+    tests.write('''
+#[cfg(test)]
+mod quota_refresh_tests {
+    use super::proxy::{quota_refresh::wrap_quota_refresh, token_manager::TokenManager};
+    use axum::body::Body;
+    use std::sync::{Arc, atomic::Ordering};
+    use futures::StreamExt;
+    #[tokio::test]
+    async fn compat_quota_refresh_runs_after_response_body_finishes() {
+        let manager = Arc::new(TokenManager::default());
+        let response = axum::response::Response::builder().header("x-account-email", "test@example.com").body(Body::from("OK")).unwrap();
+        let response = wrap_quota_refresh(response, manager.clone());
+        assert_eq!(manager.refreshes.load(Ordering::SeqCst), 0);
+        assert_eq!(axum::body::to_bytes(response.into_body(), 100).await.unwrap().as_ref(), b"OK");
+        assert_eq!(manager.refreshes.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn compat_quota_refresh_runs_on_client_disconnect() {
+        let manager = Arc::new(TokenManager::default());
+        let chunks = futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"chunk")) }).chain(futures::stream::pending());
+        let response = axum::response::Response::builder().header("x-account-email", "test@example.com").body(Body::from_stream(chunks)).unwrap();
+        let mut body = wrap_quota_refresh(response, manager.clone()).into_body().into_data_stream();
+        assert!(body.next().await.unwrap().is_ok());
+        assert_eq!(manager.refreshes.load(Ordering::SeqCst), 0);
+        drop(body);
+        assert_eq!(manager.refreshes.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn compat_quota_refresh_ignores_health_responses() {
+        let manager = Arc::new(TokenManager::default());
+        drop(wrap_quota_refresh(axum::response::Response::new(Body::empty()), manager.clone()));
+        assert_eq!(manager.refreshes.load(Ordering::SeqCst), 0);
+    }
+}
 ''')
 manifest = '''[package]
 name = "antigravity-compat-tests"

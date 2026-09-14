@@ -49,6 +49,8 @@ Includes Gemini request compatibility, cumulative/reasoning token accounting and
 
 Account failover now tries the initial account plus up to five different accounts for upstream HTTP errors, including 400 and 429. Successful attempts return immediately; exhaustion preserves the last actual failure. Native Gemini 429 responses now update account/model cooldowns. See `docs/ACCOUNT_FAILOVER.md` for stream and eligibility boundaries.
 
+Fixes account sorting panics that disconnected HTTP requests, restores advertised Gemini Flash variants from OpenAI reasoning_effort, and checks inclusive model quota thresholds before account selection. Used-account quotas refresh after responses, selection samples the full eligible subscription tier, and quota reloads preserve cooldowns. See `docs/QUOTA_AND_STABILITY.md` for limits and behavior.
+
 The attached deployment bundle pins the tested image digest and contains no credentials. Existing deployments must retain their data mounts and secrets.
 ''')
 print(archive)

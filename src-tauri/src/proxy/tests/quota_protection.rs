@@ -38,6 +38,7 @@ mod tests {
             validation_blocked: false,
             validation_blocked_until: 0,
             validation_url: None,
+            exact_model_quotas: std::collections::HashMap::new(),
             model_quotas: std::collections::HashMap::new(),
             model_limits: std::collections::HashMap::new(),
         }
@@ -1105,6 +1106,7 @@ mod tests {
             validation_blocked: false,
             validation_blocked_until: 0,
             validation_url: None,
+            exact_model_quotas: std::collections::HashMap::new(),
             model_quotas: std::collections::HashMap::new(),
             model_limits: std::collections::HashMap::new(),
         }

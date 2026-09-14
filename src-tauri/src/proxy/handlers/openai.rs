@@ -1823,6 +1823,7 @@ pub async fn handle_chat_completions(
         }
     }
 
+    let client_reasoning_effort = body.get("reasoning_effort").and_then(Value::as_str).map(str::to_owned);
     let normalized_interaction_ledger = body.get("_interaction_ledger").cloned();
     let mut openai_req: OpenAIRequest = serde_json::from_value(body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
@@ -1961,6 +1962,7 @@ pub async fn handle_chat_completions(
         &openai_req.model,
         &*state.custom_mapping.read().await,
     );
+    let mapped_model = token_manager.resolve_effort_model(&mapped_model, client_reasoning_effort.as_deref().or_else(|| openai_req.reasoning.as_ref().and_then(|r| r.effort.as_deref())));
 
     for attempt in 0..max_attempts {
         // 将 OpenAI 工具转为 Value 数组以便探测联网

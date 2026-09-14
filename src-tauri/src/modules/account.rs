@@ -1548,7 +1548,8 @@ pub fn set_current_account_id_with_target(
 }
 
 /// Update account quota
-pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), String> {
+pub fn update_account_quota(account_id: &str, mut quota: QuotaData) -> Result<(), String> {
+    crate::proxy::quota_policy::constrain_data(&mut quota);
     let _account_write = lock_account_file_updates()?;
     let mut account = load_account(account_id)?;
     account.update_quota(quota);
@@ -1577,10 +1578,10 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
                         .unwrap_or_else(|| std_id.clone());
                     let max_pct = group_max_percentage.get(&lookup_key).cloned().unwrap_or(100);
 
-                    if max_pct < threshold {
+                    if max_pct <= threshold {
                         if !account.protected_models.contains(&lookup_key) {
                             crate::modules::logger::log_info(&format!(
-                                "[Quota] Triggering model protection: {} (Group: {} Max: {}% < Thres: {}%)",
+                                "[Quota] Triggering model protection: {} (Group: {} Max: {}% <= Thres: {}%)",
                                 account.email, lookup_key, max_pct, threshold
                             ));
                             account.protected_models.insert(lookup_key.clone());
@@ -1588,7 +1589,7 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
                     } else {
                         if account.protected_models.contains(&lookup_key) {
                             crate::modules::logger::log_info(&format!(
-                                "[Quota] Model protection recovered: {} (Group: {} Max: {}% >= Thres: {}%)",
+                                "[Quota] Model protection recovered: {} (Group: {} Max: {}% > Thres: {}%)",
                                 account.email, lookup_key, max_pct, threshold
                             ));
                             account.protected_models.remove(&lookup_key);
