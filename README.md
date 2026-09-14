@@ -1,3 +1,15 @@
+# Antigravity Manager Lee
+
+基于上游 Antigravity Manager 4.7.1 的服务端定制版本，包含 Gemini 请求兼容、流式稳定性和 token 用量修复。
+
+- 镜像：`ghcr.io/echo7659/antigravity-manager-lee`
+- 发布与 CI：[Actions](https://github.com/Echo7659/Antigravity-Manager-Lee/actions) · [Releases](https://github.com/Echo7659/Antigravity-Manager-Lee/releases)
+- [补丁与部署说明](docs/GEMINI_COMPAT_DEPLOYMENT.md) · [镜像发布流程](docs/LEE_RELEASES.md)
+
+保留上游许可证、署名和以下原始说明。
+
+---
+
 # Antigravity Tools 🚀
 > 专业级 AI 账号管理与协议代理系统 (v4.7.1)
 <div align="center">

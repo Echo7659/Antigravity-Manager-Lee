@@ -1,135 +1,155 @@
-name: CI
+name: Test, Publish Image and Release
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
+    tags: ['v*']
   pull_request:
-    branches: [main, master]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
-  # 前端构建检查
-  build-frontend:
-    name: Build Frontend
-    runs-on: ubuntu-latest
+  tests:
+    name: Compatibility regression tests
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Node.js setup
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Prepare tests from current source
+        run: python3 scripts/prepare_compat_tests.py "$RUNNER_TEMP/compat-tests"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          node-version: 20
-          cache: "npm"
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/compat-tests/target
+          key: compat-${{ runner.os }}-${{ hashFiles('tests/compat/Cargo.lock') }}
+      - name: Test request normalization
+        run: cargo test --locked --manifest-path "$RUNNER_TEMP/compat-tests/Cargo.toml" --lib request_compat
+      - name: Test usage and stream handling
+        run: cargo test --locked --manifest-path "$RUNNER_TEMP/compat-tests/Cargo.toml" --lib compat_
 
-      - name: Install frontend dependencies
-        run: npm install --legacy-peer-deps
-
-      - name: TypeScript check
-        run: npx tsc --noEmit
-
-      - name: Build frontend
-        run: npm run build
-
-  # Rust 代码检查
-  check-rust:
-    name: Check Rust Code
-    runs-on: ${{ matrix.platform }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [ubuntu-latest, windows-2025, macos-latest]
+  publish:
+    name: Build, smoke-test and publish linux/amd64 image
+    if: github.event_name != 'pull_request'
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.release_meta.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install dependencies (Linux)
-        if: startsWith(matrix.platform, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libsoup-3.0-dev javascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev
-          sudo apt-get install -y --no-install-recommends libnm-dev xdg-utils
-
-      - name: Rust setup
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Validate release metadata
+        id: release_meta
+        run: python3 scripts/release_metadata.py
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          workspaces: "src-tauri"
-
-      - name: Check Rust formatting
-        run: |
-          cd src-tauri
-          cargo fmt -- --check
-
-      - name: Run Clippy
-        run: |
-          cd src-tauri
-          cargo clippy --all-targets --all-features
-
-      - name: Check Rust compilation
-        run: |
-          cd src-tauri
-          cargo check
-
-  # Tauri 构建测试（不打包）
-  build-tauri:
-    name: Build Tauri App
-    runs-on: ${{ matrix.platform }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [ubuntu-latest, windows-2025, macos-latest]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Install dependencies (Linux)
-        if: startsWith(matrix.platform, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libsoup-3.0-dev javascriptcoregtk-4.1 libjavascriptcoregtk-4.1-dev
-          sudo apt-get install -y --no-install-recommends libnm-dev xdg-utils
-
-      - name: Rust setup
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+          images: ${{ steps.release_meta.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=sha,format=long
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+      - name: Build and load image for validation
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          workspaces: "src-tauri"
-
-      - name: Node.js setup
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: "npm"
-
-      - name: Install frontend dependencies
-        run: npm install --legacy-peer-deps
-
-      - name: Disable updater artifacts in unsigned CI builds
-        shell: pwsh
-        run: |
-          $configPath = "src-tauri/tauri.conf.json"
-          $config = Get-Content -Raw $configPath | ConvertFrom-Json
-          $config.bundle.createUpdaterArtifacts = $false
-          $config | ConvertTo-Json -Depth 32 | Set-Content -Path $configPath -Encoding UTF8
-          Write-Host "Disabled updater artifacts for unsigned CI build."
-
-      - name: Build Tauri app (debug)
-        run: npm run tauri build -- --debug --no-bundle
+          context: .
+          file: docker/Dockerfile.compat
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          tags: ${{ steps.release_meta.outputs.local_image }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            USE_MIRROR=false
+            BUILD_JOBS=2
+            SOURCE_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=lee-amd64
+      - name: Validate container HTTP endpoints
         env:
-          # CI 环境不需要签名
-          TAURI_SIGNING_PRIVATE_KEY: ""
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          LOCAL_IMAGE: ${{ steps.release_meta.outputs.local_image }}
+          BASE_VERSION: ${{ steps.release_meta.outputs.base_version }}
+        run: |
+          docker run -d --name antigravity-ci-smoke -p 127.0.0.1:18045:8045 -e API_KEY=ci-smoke-only -e WEB_PASSWORD=ci-smoke-only -e ABV_BIND_LOCAL_ONLY=false "$LOCAL_IMAGE"
+          python3 scripts/ci_smoke.py --version "$BASE_VERSION"
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish validated image
+        id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.compat
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            USE_MIRROR=false
+            BUILD_JOBS=2
+            SOURCE_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=lee-amd64
+          cache-to: type=gha,scope=lee-amd64,mode=max
+      - name: Record image digest
+        env:
+          IMAGE_NAME: ${{ steps.release_meta.outputs.image }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "$IMAGE_NAME@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove smoke container
+        if: always()
+        run: docker rm -f antigravity-ci-smoke >/dev/null 2>&1 || true
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Create versioned deployment assets
+        env:
+          RELEASE_DIR: ${{ runner.temp }}/release
+          RELEASE_TAG: ${{ github.ref_name }}
+          IMAGE_NAME: ${{ needs.publish.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+        run: python3 scripts/build_release_assets.py
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_DIR: ${{ runner.temp }}/release
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR/image-manifest.json" "$RELEASE_DIR/SHA256SUMS" --clobber
+            gh release edit "$RELEASE_TAG" --notes-file "$RELEASE_DIR/RELEASE_NOTES.md"
+          else
+            gh release create "$RELEASE_TAG" "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR/image-manifest.json" "$RELEASE_DIR/SHA256SUMS" --title "Antigravity Manager Lee $RELEASE_TAG" --notes-file "$RELEASE_DIR/RELEASE_NOTES.md" --verify-tag --latest
+          fi

@@ -74,4 +74,4 @@ COPY --from=backend-builder /tmp/antigravity-tools /app/antigravity-tools
 LABEL org.opencontainers.image.version="4.7.1-compat-20260914"
 ARG SOURCE_REVISION=734e2bde-gemini-compat
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
-LABEL org.opencontainers.image.source="https://github.com/Echo7659/Antigravity-Manager"
+LABEL org.opencontainers.image.source="https://github.com/Echo7659/Antigravity-Manager-Lee"
