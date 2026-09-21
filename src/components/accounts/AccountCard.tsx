@@ -304,7 +304,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
                                 <QuotaItem
                                     key={model.id}
                                     label={model.label}
-                                    {...getModelQuotaDisplay(model.id, model.data, account.quota?.quota_groups)}
+                                    {...getModelQuotaDisplay(model.id, model.data, account.quota?.quota_groups, '5h')}
                                     isProtected={isModelProtected(model.protectedKey)}
                                     liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
                                     Icon={model.Icon}

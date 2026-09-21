@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import i18n from '../i18n';
 import { Account } from '../types/account';
 import * as accountService from '../services/accountService';
 
@@ -33,6 +34,8 @@ interface AccountState {
     updateAccountLabel: (accountId: string, label: string) => Promise<void>;
 }
 
+let currentRequestSequence = 0;
+
 export const useAccountStore = create<AccountState>((set, get) => ({
     accounts: [],
     currentAccount: null,
@@ -44,7 +47,11 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         try {
             console.log('[Store] Fetching accounts...');
             const accounts = await accountService.listAccounts();
-            set({ accounts, loading: false });
+            const current = get().currentAccount;
+            const latest = accounts.find(account => account.id === current?.id);
+            const currentAccount = current && latest && (latest.quota?.last_updated ?? 0) >= (current.quota?.last_updated ?? 0)
+                ? { ...latest, last_used: Math.max(current.last_used, latest.last_used) } : current;
+            set({ accounts, currentAccount, loading: false });
         } catch (error) {
             console.error('[Store] Fetch accounts failed:', error);
             set({ error: String(error), loading: false });
@@ -52,12 +59,13 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     },
 
     fetchCurrentAccount: async () => {
+        const sequence = ++currentRequestSequence;
         set({ loading: true, error: null });
         try {
             const account = await accountService.getCurrentAccount();
-            set({ currentAccount: account, loading: false });
+            if (sequence === currentRequestSequence) set({ currentAccount: account, loading: false });
         } catch (error) {
-            set({ error: String(error), loading: false });
+            if (sequence === currentRequestSequence) set({ error: String(error), loading: false });
         }
     },
 
@@ -104,11 +112,14 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     },
 
     switchAccount: async (accountId: string, targetIde?: string) => {
+        ++currentRequestSequence;
         set({ loading: true, error: null });
         try {
             await accountService.switchAccount(accountId, targetIde);
-            await get().fetchCurrentAccount();
-            set({ loading: false });
+            const account = await accountService.getCurrentAccount();
+            if (!account || account.id !== accountId) throw new Error(i18n.t('dashboard.switch_not_confirmed'));
+            ++currentRequestSequence;
+            set({ currentAccount: account, loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
             throw error;

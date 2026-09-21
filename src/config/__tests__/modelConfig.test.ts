@@ -258,7 +258,7 @@ test('resolveQuotaModels + ensurePinnedImageSelector: live pin gap resolves Gemi
     assertEqual(image?.model?.display_name, 'Gemini 3.1 Flash Image');
 });
 
-test('quota display: weekly exhaustion overrides raw 5h without changing protection quota', () => {
+test('quota display: window detail and effective quota remain consistent with protection', () => {
     const reset = new Date(Date.now() + 7200000).toISOString();
     const model = { name: 'gemini-3.1-pro-high', percentage: 1, reset_time: reset };
     const groups = [{ display_name: 'Gemini Models', buckets: [
@@ -266,8 +266,10 @@ test('quota display: weekly exhaustion overrides raw 5h without changing protect
         { bucket_id: 'gemini-5h', window: '5h', remaining_fraction: 1, reset_time: '2030-01-01T00:00:00Z' },
     ] }];
     const display = getModelQuotaDisplay(model.name, model, groups);
-    assertEqual(display.percentage, 100);
-    assertEqual(display.resetTime, groups[0].buckets[1].reset_time);
+    assertEqual(display.percentage, 1);
+    assertEqual(display.fiveHourPercentage, 100);
+    assertEqual(display.weeklyPercentage, 1);
+    assertEqual(display.resetTime, reset);
     assertEqual(display.isWeeklyConstrained, false);
     assertEqual(model.percentage < 2, true);
     for (const fraction of [0, 0.0005, 0.001]) {
@@ -282,11 +284,11 @@ test('quota display: weekly exhaustion overrides raw 5h without changing protect
         groups[0].buckets[0].remaining_fraction = fraction;
         const protectedDisplay = getModelQuotaDisplay(model.name, model, groups);
         assertEqual(protectedDisplay.isWeeklyConstrained, false);
-        assertEqual(protectedDisplay.percentage, 100);
+        assertEqual(protectedDisplay.percentage, Math.floor(Math.min(1, fraction * 100)));
     }
     groups[0].buckets[0].remaining_fraction = 0;
     groups[0].buckets[0].reset_time = new Date(Date.now() - 1000).toISOString();
-    assertEqual(getModelQuotaDisplay(model.name, model, groups).isWeeklyConstrained, false);
+    assertEqual(getModelQuotaDisplay(model.name, model, groups).isWeeklyConstrained, true);
     assertEqual(getModelQuotaDisplay('claude-sonnet-4-6', undefined, groups).isWeeklyConstrained, false);
     assertEqual(getModelQuotaDisplay(model.name, model).percentage, 1);
 });

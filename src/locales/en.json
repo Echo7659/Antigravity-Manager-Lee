@@ -146,8 +146,8 @@
     "abnormal_accounts": "Abnormal Accounts",
     "abnormal_accounts_has_risk": "⚠ Verification / Blocked risk",
     "abnormal_accounts_no_risk": "✓ No risk or blocked accounts",
-    "quota_matrix_active": "Active Accounts Quota Productivity Matrix",
-    "quota_matrix_all_normal": "All Normal Accounts Quota Matrix (incl. disabled)",
+    "quota_matrix_active": "Available account quotas",
+    "quota_matrix_all_normal": "Normal account quotas (including disabled)",
     "base_pool_count": "Base: {{count}} accounts",
     "btn_only_available": "Active Only ({{count}})",
     "btn_include_disabled": "Include Disabled ({{count}})",
@@ -156,12 +156,24 @@
     "gemini_available_quota": "Gemini Available Quota",
     "gemini_image_quota": "Gemini Image Quota",
     "claude_available_quota": "Claude Available Quota",
-    "weighted_available": "Weighted Available",
+    "weighted_available": "Account average · effective quota",
     "quota_sufficient_short": "Sufficient",
     "quota_tight_short": "Tight",
     "rolling_5h": "5h Rolling:",
     "weekly_7d": "7d Weekly:",
-    "zero_weekly_warning": "{{count}} active account(s) circuit-broken due to zero weekly quota (rated 0%)"
+    "zero_weekly_warning": "{{count}} active account(s) circuit-broken due to zero weekly quota (rated 0%)",
+    "switching_account": "Switching account…",
+    "switched_to": "Switched to {{account}}",
+    "switch_best_for": "Switch to best {{model}} account",
+    "already_best": "Current account is already best",
+    "no_eligible_recommendation": "No eligible account available",
+    "recommendation_basis": "Ranked by effective quota, excluding blocked, disabled and protected accounts.",
+    "quota_explanation": "Effective quota uses the lowest known model, five-hour and weekly percentage. Window values are shown separately; unknown values are excluded from averages.",
+    "current_quota_basis": "Bars show effective quota; five-hour and weekly values are listed separately.",
+    "current_account_scope": "The overview summarizes the account pool; changing the current account does not change the pool average.",
+    "switch_not_confirmed": "The selected account could not be confirmed. Refresh and retry.",
+    "window_5h_short": "5h",
+    "effective_quota_short": "Effective"
   },
   "accounts": {
     "account": "Account",
@@ -393,7 +405,8 @@
       "batch_warmup_title": "Batch Manual Warmup",
       "batch_warmup_msg": "Are you sure you want to trigger warmup for the selected {{count}} accounts immediately?"
     },
-    "switch_to_agy": "Switch to Antigravity CLI (agy)"
+    "switch_to_agy": "Switch to Antigravity CLI (agy)",
+    "weekly_exhausted_short": "Weekly exhausted"
   },
   "settings": {
     "save": "Save Settings",

@@ -144,8 +144,8 @@
     "abnormal_accounts": "异常账号数",
     "abnormal_accounts_has_risk": "⚠ 需处理风控验证 / 封禁",
     "abnormal_accounts_no_risk": "✓ 零风控异常账号",
-    "quota_matrix_active": "可用账号配额生产力矩阵",
-    "quota_matrix_all_normal": "全量正常账号配额矩阵 (包含已禁用)",
+    "quota_matrix_active": "可用账号配额概览",
+    "quota_matrix_all_normal": "正常账号配额概览（包含已禁用）",
     "base_pool_count": "底座: {{count}} 个账号",
     "btn_only_available": "仅看可用账号 ({{count}})",
     "btn_include_disabled": "包含禁用账号 ({{count}})",
@@ -154,12 +154,24 @@
     "gemini_available_quota": "Gemini 可用配额",
     "gemini_image_quota": "Gemini 绘图配额",
     "claude_available_quota": "Claude 可用配额",
-    "weighted_available": "综合加权可用",
+    "weighted_available": "已知账号平均 · 综合可用",
     "quota_sufficient_short": "充足",
     "quota_tight_short": "偏紧",
     "rolling_5h": "5小时滚动:",
     "weekly_7d": "7天周配额:",
-    "zero_weekly_warning": "{{count}} 个可用账号因周配额已耗尽触发熔断 (判定 0%)"
+    "zero_weekly_warning": "{{count}} 个可用账号因周配额已耗尽触发熔断 (判定 0%)",
+    "switching_account": "正在切换账号，请稍候…",
+    "switched_to": "已切换到 {{account}}",
+    "switch_best_for": "切换 {{model}} 最佳",
+    "already_best": "当前已是最佳账号",
+    "no_eligible_recommendation": "暂无符合条件的账号",
+    "recommendation_basis": "按综合可用额度推荐，排除异常、停用和受保护账号。",
+    "quota_explanation": "综合可用取模型、5 小时和周额度中较低的已知剩余比例；两个时间窗口分别显示，未知数据不计入平均值。",
+    "current_quota_basis": "进度条显示综合可用额度；5 小时与周额度分开列出。",
+    "current_account_scope": "上方统计整个账号池，切换当前账号不会改变账号池平均值。",
+    "switch_not_confirmed": "切换结果未确认，请刷新后重试。",
+    "window_5h_short": "5 小时",
+    "effective_quota_short": "综合"
   },
   "accounts": {
     "account": "账号",
@@ -391,7 +403,8 @@
       "batch_warmup_title": "批量手动预热",
       "batch_warmup_msg": "确定要为选中的 {{count}} 个账号立即触发预热吗？"
     },
-    "switch_to_agy": "Switch to Antigravity CLI (agy)"
+    "switch_to_agy": "Switch to Antigravity CLI (agy)",
+    "weekly_exhausted_short": "周已耗尽"
   },
   "settings": {
     "save": "保存设置",

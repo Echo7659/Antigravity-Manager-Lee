@@ -17,7 +17,8 @@ import { useNavigate } from 'react-router-dom';
 import AddAccountDialog from '../components/accounts/AddAccountDialog';
 import { showToast } from '../components/common/ToastContainer';
 import BestAccounts from '../components/dashboard/BestAccounts';
-import { findImageQuotaModel, findQuotaModel } from '../config/modelConfig';
+import { computeQuotaMetrics, isAccountAvailable } from '../utils/dashboardQuota';
+import { formatQuotaPercentage } from '../utils/quotaDisplay';
 import CurrentAccount from '../components/dashboard/CurrentAccount';
 import { exportAccounts } from '../services/accountService';
 import { useAccountStore } from '../stores/useAccountStore';
@@ -35,8 +36,7 @@ function Dashboard() {
         fetchCurrentAccount,
         switchAccount,
         addAccount,
-        refreshQuota,
-        loading
+        refreshQuota
     } = useAccountStore();
 
     useEffect(() => {
@@ -48,113 +48,14 @@ function Dashboard() {
 
     // 全维度账号健康与配额计算矩阵 (状态由风控定生死，底座池支持仅可用账号与全部正常账号无缝切换)
     const stats = useMemo(() => {
-        // 1. 账号生态健康状态分类（风控与启用状态定生死，不以额度定生死）
-        // 异常账号：触发 Google 验证码/风控阻断，或配额接口返回 403 Forbidden 封禁
-        const abnormalAccounts = accounts.filter(
-            a => a.validation_blocked || a.quota?.is_forbidden
-        );
-        // 禁用账号：非异常，但用户手动禁用反代或停用账号
-        const disabledAccounts = accounts.filter(
-            a => !a.validation_blocked && !a.quota?.is_forbidden && (a.disabled || a.proxy_disabled)
-        );
-        // 可用账号：开启且状态正常、风控正常的生产力账号
-        const availableAccounts = accounts.filter(
-            a => !a.disabled && !a.proxy_disabled && !a.validation_blocked && !a.quota?.is_forbidden
-        );
-        // 全部正常状态账号（包含禁用与非禁用，彻底剔除风控异常账号）
-        const normalAccounts = accounts.filter(
-            a => !a.validation_blocked && !a.quota?.is_forbidden
-        );
-
-        // 依据按钮状态选择底座统计池：默认仅看可用账号；关闭则看全部正常状态账号
-        const basePool = onlyAvailable
-            ? (availableAccounts.length > 0 ? availableAccounts : normalAccounts)
-            : normalAccounts;
-
-        // 2. 单账号配额提取辅助函数
-        const get5hQuota = (a: Account, modelKey: 'gemini-pro' | 'gemini-image' | 'claude'): number | null => {
-            if (modelKey === 'gemini-image') {
-                return findImageQuotaModel(a.quota?.models)?.percentage ?? null;
-            }
-            return findQuotaModel(a.quota?.models, modelKey)?.percentage ?? null;
-        };
-
-        const getWeeklyQuota = (a: Account, modelKey: 'gemini-pro' | 'gemini-image' | 'claude'): number | null => {
-            const isClaude = modelKey === 'claude';
-            if (a.quota?.quota_groups) {
-                for (const group of a.quota.quota_groups) {
-                    const gname = group.display_name.toLowerCase();
-                    const matches = isClaude
-                        ? (gname.includes('claude') || gname.includes('gpt') || gname.includes('3p'))
-                        : (gname.includes('gemini') || (!gname.includes('claude') && !gname.includes('gpt') && !gname.includes('3p')));
-                    if (matches) {
-                        const weekly = group.buckets?.find(b =>
-                            b.window?.toLowerCase().includes('week') ||
-                            b.bucket_id?.toLowerCase().includes('week') ||
-                            b.window?.toLowerCase().includes('7d')
-                        );
-                        if (weekly && typeof weekly.remaining_fraction === 'number') {
-                            return Math.round(weekly.remaining_fraction * 100);
-                        }
-                    }
-                }
-            }
-            return null;
-        };
-
-        // 计算目标底座池在指定模型下的综合指标（5H均值、周配额均值、周配额熔断加权，算法完全保持一致）
-        const computeMetrics = (modelKey: 'gemini-pro' | 'gemini-image' | 'claude') => {
-            const pool = basePool;
-            if (pool.length === 0) {
-                return { avg5h: 0, avgWeekly: 0, weightedEffective: 0, zeroWeeklyCount: 0 };
-            }
-
-            let sum5h = 0, count5h = 0;
-            let sumWeekly = 0, countWeekly = 0;
-            let sumWeighted = 0, totalWeight = 0;
-            let zeroWeeklyCount = 0;
-
-            for (const a of pool) {
-                const q5h = get5hQuota(a, modelKey);
-                const qWeekly = getWeeklyQuota(a, modelKey);
-
-                if (q5h !== null && q5h >= 0) {
-                    sum5h += q5h;
-                    count5h++;
-                }
-
-                if (qWeekly !== null && qWeekly >= 0) {
-                    sumWeekly += qWeekly;
-                    countWeekly++;
-                    if (qWeekly <= 0) {
-                        zeroWeeklyCount++;
-                    }
-                }
-
-                // 核心短板特殊处理：周配额见底(0%)时，上游必然拒绝，实际可用额度熔断归 0！
-                let effectiveVal = q5h ?? 0;
-                if (qWeekly !== null && qWeekly <= 0) {
-                    effectiveVal = 0;
-                }
-
-                // 套餐权重加权 (ULTRA 2.0, PRO 1.5, FREE 1.0)
-                const tier = (a.quota?.subscription_tier || '').toUpperCase();
-                const weight = tier.includes('ULTRA') ? 2.0 : tier.includes('PRO') ? 1.5 : 1.0;
-                sumWeighted += effectiveVal * weight;
-                totalWeight += weight;
-            }
-
-            return {
-                avg5h: count5h > 0 ? Math.round(sum5h / count5h) : 0,
-                avgWeekly: countWeekly > 0 ? Math.round(sumWeekly / countWeekly) : 0,
-                weightedEffective: totalWeight > 0 ? Math.round(sumWeighted / totalWeight) : 0,
-                zeroWeeklyCount,
-            };
-        };
-
-        const gemini = computeMetrics('gemini-pro');
-        const geminiImage = computeMetrics('gemini-image');
-        const claude = computeMetrics('claude');
+        const abnormalAccounts = accounts.filter(a => a.validation_blocked || a.quota?.is_forbidden);
+        const disabledAccounts = accounts.filter(a => !a.validation_blocked && !a.quota?.is_forbidden && (a.disabled || a.proxy_disabled));
+        const availableAccounts = accounts.filter(isAccountAvailable);
+        const normalAccounts = accounts.filter(a => !a.validation_blocked && !a.quota?.is_forbidden);
+        const basePool = onlyAvailable ? availableAccounts : normalAccounts;
+        const gemini = computeQuotaMetrics(basePool, 'gemini');
+        const geminiImage = computeQuotaMetrics(basePool, 'image');
+        const claude = computeQuotaMetrics(basePool, 'claude');
 
         return {
             total: accounts.length,
@@ -169,23 +70,35 @@ function Dashboard() {
         };
     }, [accounts, onlyAvailable]);
 
+    const quotaStatus = (value: number | null) => {
+        if (value === null) return t('common.unknown');
+        return value >= 50 ? t('dashboard.quota_sufficient_short', '充足') : t('dashboard.quota_tight_short', '偏紧');
+    };
+
     const isSwitchingRef = useRef(false);
+    const [isSwitching, setIsSwitching] = useState(false);
+    const [switchFeedback, setSwitchFeedback] = useState<{ message: string; failed?: boolean } | null>(null);
 
     const handleSwitch = async (accountId: string) => {
-        if (loading || isSwitchingRef.current) return;
+        if (isSwitchingRef.current) return;
 
         isSwitchingRef.current = true;
-        console.log('[Dashboard] handleSwitch called for', accountId);
+        setIsSwitching(true);
+        setSwitchFeedback({ message: t('dashboard.switching_account', '正在切换账号，请稍候…') });
         try {
             await switchAccount(accountId);
-            showToast(t('dashboard.toast.switch_success'), 'success');
+            const selected = useAccountStore.getState().currentAccount;
+            const message = t('dashboard.switched_to', { defaultValue: '已切换到 {{account}}', account: selected?.email || accountId });
+            setSwitchFeedback({ message });
+            showToast(message, 'success');
         } catch (error) {
             console.error('切换账号失败:', error);
-            showToast(`${t('dashboard.toast.switch_error')}: ${error}`, 'error');
+            const message = `${t('dashboard.toast.switch_error')}: ${error}`;
+            setSwitchFeedback({ message, failed: true });
+            showToast(message, 'error');
         } finally {
-            setTimeout(() => {
-                isSwitchingRef.current = false;
-            }, 1000);
+            isSwitchingRef.current = false;
+            setIsSwitching(false);
         }
     };
 
@@ -425,7 +338,7 @@ function Dashboard() {
                     </div>
                 </div>
 
-                {/* 3 大模型卡片：展示 5H均值、周配额均值及周额度熔断加权配额 */}
+                {/* 三类配额：综合、5 小时与周配额的已知账号均值 */}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                     {/* Gemini 文本模型配额 */}
                     <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 flex flex-col justify-between">
@@ -439,17 +352,14 @@ function Dashboard() {
                                         {t('dashboard.gemini_available_quota', 'Gemini 可用配额')}
                                     </span>
                                 </div>
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${stats.gemini.weightedEffective >= 50 ? 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
-                                    {stats.gemini.weightedEffective >= 50
-                                        ? t('dashboard.quota_sufficient_short', '充足')
-                                        : t('dashboard.quota_tight_short', '偏紧')
-                                    }
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${(stats.gemini.averageEffective ?? 0) >= 50 ? 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
+                                    {quotaStatus(stats.gemini.averageEffective)}
                                 </span>
                             </div>
 
                             <div className="flex items-baseline gap-2 mb-2">
                                 <span className="text-3xl font-extrabold text-gray-900 dark:text-base-content font-mono">
-                                    {stats.gemini.weightedEffective}%
+                                    {formatQuotaPercentage(stats.gemini.averageEffective)}
                                 </span>
                                 <span className="text-[11px] text-gray-400 dark:text-gray-500 font-medium">
                                     {t('dashboard.weighted_available', '综合加权可用')}
@@ -460,11 +370,11 @@ function Dashboard() {
                         <div className="pt-2 border-t border-gray-100 dark:border-base-300/60 flex items-center justify-between text-[11px]">
                             <div className="flex items-center gap-1.5">
                                 <span className="text-gray-400 dark:text-gray-500">{t('dashboard.rolling_5h', '5小时滚动:')}</span>
-                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{stats.gemini.avg5h}%</span>
+                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatQuotaPercentage(stats.gemini.avg5h)}</span>
                             </div>
                             <div className="flex items-center gap-1.5">
                                 <span className="text-gray-400 dark:text-gray-500">{t('dashboard.weekly_7d', '7天周配额:')}</span>
-                                <span className={`font-mono font-bold ${stats.gemini.avgWeekly <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{stats.gemini.avgWeekly}%</span>
+                                <span className={`font-mono font-bold ${(stats.gemini.avgWeekly ?? 100) <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{formatQuotaPercentage(stats.gemini.avgWeekly)}</span>
                             </div>
                         </div>
                         {stats.gemini.zeroWeeklyCount > 0 && (
@@ -487,17 +397,14 @@ function Dashboard() {
                                         {t('dashboard.gemini_image_quota', 'Gemini 绘图配额')}
                                     </span>
                                 </div>
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${stats.geminiImage.weightedEffective >= 50 ? 'bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
-                                    {stats.geminiImage.weightedEffective >= 50
-                                        ? t('dashboard.quota_sufficient_short', '充足')
-                                        : t('dashboard.quota_tight_short', '偏紧')
-                                    }
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${(stats.geminiImage.averageEffective ?? 0) >= 50 ? 'bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
+                                    {quotaStatus(stats.geminiImage.averageEffective)}
                                 </span>
                             </div>
 
                             <div className="flex items-baseline gap-2 mb-2">
                                 <span className="text-3xl font-extrabold text-gray-900 dark:text-base-content font-mono">
-                                    {stats.geminiImage.weightedEffective}%
+                                    {formatQuotaPercentage(stats.geminiImage.averageEffective)}
                                 </span>
                                 <span className="text-[11px] text-gray-400 dark:text-gray-500 font-medium">
                                     {t('dashboard.weighted_available', '综合加权可用')}
@@ -508,11 +415,11 @@ function Dashboard() {
                         <div className="pt-2 border-t border-gray-100 dark:border-base-300/60 flex items-center justify-between text-[11px]">
                             <div className="flex items-center gap-1.5">
                                 <span className="text-gray-400 dark:text-gray-500">{t('dashboard.rolling_5h', '5小时滚动:')}</span>
-                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{stats.geminiImage.avg5h}%</span>
+                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatQuotaPercentage(stats.geminiImage.avg5h)}</span>
                             </div>
                             <div className="flex items-center gap-1.5">
                                 <span className="text-gray-400 dark:text-gray-500">{t('dashboard.weekly_7d', '7天周配额:')}</span>
-                                <span className={`font-mono font-bold ${stats.geminiImage.avgWeekly <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{stats.geminiImage.avgWeekly}%</span>
+                                <span className={`font-mono font-bold ${(stats.geminiImage.avgWeekly ?? 100) <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{formatQuotaPercentage(stats.geminiImage.avgWeekly)}</span>
                             </div>
                         </div>
                         {stats.geminiImage.zeroWeeklyCount > 0 && (
@@ -535,17 +442,14 @@ function Dashboard() {
                                         {t('dashboard.claude_available_quota', 'Claude 可用配额')}
                                     </span>
                                 </div>
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${stats.claude.weightedEffective >= 50 ? 'bg-cyan-50 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
-                                    {stats.claude.weightedEffective >= 50
-                                        ? t('dashboard.quota_sufficient_short', '充足')
-                                        : t('dashboard.quota_tight_short', '偏紧')
-                                    }
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${(stats.claude.averageEffective ?? 0) >= 50 ? 'bg-cyan-50 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
+                                    {quotaStatus(stats.claude.averageEffective)}
                                 </span>
                             </div>
 
                             <div className="flex items-baseline gap-2 mb-2">
                                 <span className="text-3xl font-extrabold text-gray-900 dark:text-base-content font-mono">
-                                    {stats.claude.weightedEffective}%
+                                    {formatQuotaPercentage(stats.claude.averageEffective)}
                                 </span>
                                 <span className="text-[11px] text-gray-400 dark:text-gray-500 font-medium">
                                     {t('dashboard.weighted_available', '综合加权可用')}
@@ -556,11 +460,11 @@ function Dashboard() {
                         <div className="pt-2 border-t border-gray-100 dark:border-base-300/60 flex items-center justify-between text-[11px]">
                             <div className="flex items-center gap-1.5">
                                 <span className="text-gray-400 dark:text-gray-500">{t('dashboard.rolling_5h', '5小时滚动:')}</span>
-                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{stats.claude.avg5h}%</span>
+                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatQuotaPercentage(stats.claude.avg5h)}</span>
                             </div>
                             <div className="flex items-center gap-1.5">
                                 <span className="text-gray-400 dark:text-gray-500">{t('dashboard.weekly_7d', '7天周配额:')}</span>
-                                <span className={`font-mono font-bold ${stats.claude.avgWeekly <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{stats.claude.avgWeekly}%</span>
+                                <span className={`font-mono font-bold ${(stats.claude.avgWeekly ?? 100) <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{formatQuotaPercentage(stats.claude.avgWeekly)}</span>
                             </div>
                         </div>
                         {stats.claude.zeroWeeklyCount > 0 && (
@@ -572,6 +476,8 @@ function Dashboard() {
                     </div>
                 </div>
 
+                <p className="text-xs text-gray-500">{t('dashboard.quota_explanation', '综合可用取模型、5 小时和周额度中较低的已知剩余比例；下方分别列出两个时间窗口，未知数据不计入平均值。')}</p>
+                {switchFeedback && <div role={switchFeedback.failed ? 'alert' : 'status'} aria-live="polite" className={`rounded-lg p-3 text-sm ${switchFeedback.failed ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>{switchFeedback.message}</div>}
                 {/* 双栏布局 */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <CurrentAccount
@@ -579,6 +485,7 @@ function Dashboard() {
                         onSwitch={() => navigate('/accounts')}
                     />
                     <BestAccounts
+                        switching={isSwitching}
                         accounts={accounts}
                         currentAccountId={currentAccount?.id}
                         onSwitch={handleSwitch}

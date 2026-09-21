@@ -1,3 +1,4 @@
+import { QuotaWindowDetails } from './QuotaWindowDetails';
 
 import { AlertTriangle, Clock, Lock } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
@@ -15,16 +16,20 @@ interface QuotaItemProps {
     isWeeklyConstrained?: boolean;
     weeklyResetTime?: string;
     weeklyTokens?: number | null;
+    effectivePercentage?: number | null;
+    displayPercentage?: number | null;
+    fiveHourPercentage?: number | null;
+    weeklyPercentage?: number | null;
     className?: string;
     Icon?: React.ComponentType<{ size?: number; className?: string }>;
 }
 
-export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit, isWeeklyConstrained, weeklyResetTime, weeklyTokens, className, Icon }: QuotaItemProps) {
+export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit, isWeeklyConstrained, weeklyResetTime, weeklyTokens, effectivePercentage, displayPercentage, fiveHourPercentage, weeklyPercentage, className, Icon }: QuotaItemProps) {
     const { t } = useTranslation();
     const liveState = getLiveLimitState(liveLimit);
     const showLiveIssue = liveState.shouldShow || isWeeklyConstrained;
     const isUnavailable = liveState.isActive || isWeeklyConstrained;
-    const liveStatus = isWeeklyConstrained ? t('accounts.quota_window_weekly_short', 'Weekly') : liveLimit?.status || 'ERR';
+    const liveStatus = isWeeklyConstrained ? t('accounts.weekly_exhausted_short', '周已耗尽') : liveLimit?.status || 'ERR';
     const liveLimitTitle = isWeeklyConstrained
         ? `${label}: ${t('accounts.weekly_exhausted_tooltip', 'Weekly quota exhausted (0%); waiting for weekly reset')} (${weeklyResetTime ? formatTimeRemaining(weeklyResetTime) || weeklyResetTime : ''})`
         : liveLimit
@@ -33,7 +38,7 @@ export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit
                 ? `Live image endpoint is temporarily unavailable for ${formatCompactDuration(liveState.secondsRemaining)}.`
                 : `Image endpoint returned ${liveStatus} ${formatCompactDuration(liveState.secondsAgo)} ago.`,
             `Reason: ${liveLimit.reason}.`,
-            `Quota snapshot can still show ${percentage}%.`,
+            `Quota snapshot can still show ${displayPercentage === null ? t('common.unknown') : `${percentage}%`}.`,
             liveLimit.message ? `Message: ${liveLimit.message}` : null,
         ].filter(Boolean).join(' ')
         : label;
@@ -83,7 +88,7 @@ export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit
                     "absolute inset-y-0 left-0 transition-all duration-700 ease-out opacity-15 dark:opacity-20",
                     showLiveIssue ? (isUnavailable ? "bg-rose-500" : "bg-amber-500") : getBgColorClass(percentage)
                 )}
-                style={{ width: `${percentage}%` }}
+                style={{ width: `${displayPercentage === null ? t('common.unknown') : `${percentage}%`}` }}
             />
 
             {/* Content */}
@@ -140,7 +145,7 @@ export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit
                             {liveStatus}
                         </span>
                     )}
-                    {percentage}%
+                    {displayPercentage === null ? t('common.unknown') : `${percentage}%`}
                 </span>
             </div>
         </div>
@@ -151,6 +156,7 @@ export function QuotaItem({ label, percentage, resetTime, isProtected, liveLimit
                     ? weeklyTokens.toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 2 }) : 'N/A'}
             </div>
         )}
+        <QuotaWindowDetails fiveHourPercentage={fiveHourPercentage} weeklyPercentage={weeklyPercentage} effectivePercentage={effectivePercentage} showEffective />
         </div>
     );
 }

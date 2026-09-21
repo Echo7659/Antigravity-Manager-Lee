@@ -600,7 +600,7 @@ function AccountRowContent({
                         ) : (
                             displayModels.map((model) => {
                                 const modelData = model.data;
-                                const display = getModelQuotaDisplay(model.id, modelData, account.quota?.quota_groups);
+                                const display = getModelQuotaDisplay(model.id, modelData, account.quota?.quota_groups, '5h');
 
                                 return (
                                     <QuotaItem

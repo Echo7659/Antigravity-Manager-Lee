@@ -1,5 +1,8 @@
 import { CheckCircle, Mail, Diamond, Gem, Circle, Tag, Lock, Clock } from 'lucide-react';
 import { Account, getAccountTier } from '../../types/account';
+import { getModelQuotaDisplay } from '../../utils/quotaDisplay';
+import { QuotaWindowDetails } from '../accounts/QuotaWindowDetails';
+import type { ModelQuota } from '../../types/account';
 import { formatTimeRemaining } from '../../utils/format';
 import { findQuotaModel, getModelProtectionKey, getModelDisplayName, findImageQuotaModel } from '../../config/modelConfig';
 
@@ -26,10 +29,15 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
         );
     }
 
-    const geminiProModel = findQuotaModel(account.quota?.models, 'gemini-pro');
-    const geminiFlashModel = findQuotaModel(account.quota?.models, 'gemini-flash');
+    const withDisplay = (model: ModelQuota | undefined) => {
+        if (!model) return undefined;
+        const display = getModelQuotaDisplay(model.name, model, account.quota?.quota_groups);
+        return { ...model, ...display, reset_time: display.resetTime || '' };
+    };
+    const geminiProModel = withDisplay(findQuotaModel(account.quota?.models, 'gemini-pro'));
+    const geminiFlashModel = withDisplay(findQuotaModel(account.quota?.models, 'gemini-flash'));
 
-    const geminiImageModel = findImageQuotaModel(account.quota?.models);
+    const geminiImageModel = withDisplay(findImageQuotaModel(account.quota?.models));
     const nowSeconds = Math.floor(Date.now() / 1000);
     const imageProtectionKey = getModelProtectionKey(geminiImageModel?.name || '');
     const liveImageLimit = imageProtectionKey
@@ -37,15 +45,16 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
         : undefined;
     const isImageLiveLimited = Boolean(liveImageLimit && liveImageLimit.until > nowSeconds);
 
-    const claudeModel = findQuotaModel(account.quota?.models, 'claude');
+    const claudeModel = withDisplay(findQuotaModel(account.quota?.models, 'claude'));
 
     return (
-        <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col">
+        <div data-current-account-id={account.id} className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 h-full flex flex-col">
             <h2 className="text-base font-semibold text-gray-900 dark:text-base-content mb-3 flex items-center gap-2">
                 <CheckCircle className="w-4 h-4 text-green-500" />
                 {t('dashboard.current_account')}
             </h2>
 
+            <p className="text-[11px] text-gray-500 mb-3">{t('dashboard.current_quota_basis', '进度条显示综合可用额度；5 小时与周额度分开列出。')}</p>
             <div className="space-y-4 flex-1">
                 <div className="flex items-center gap-3 mb-1">
                     <div className="flex items-center gap-2 flex-1 min-w-0">
@@ -115,6 +124,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                                 style={{ width: `${geminiProModel.percentage}%` }}
                             ></div>
                         </div>
+                        <QuotaWindowDetails {...geminiProModel} />
                     </div>
                 )}
                 {/* Gemini 3 Pro Image 配额 */}
@@ -146,6 +156,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                                 style={{ width: `${geminiImageModel.percentage}%` }}
                             ></div>
                         </div>
+                        <QuotaWindowDetails {...geminiImageModel} />
                     </div>
                 )}
 
@@ -177,6 +188,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                                 style={{ width: `${geminiFlashModel.percentage}%` }}
                             ></div>
                         </div>
+                        <QuotaWindowDetails {...geminiFlashModel} />
                     </div>
                 )}
 
@@ -208,10 +220,12 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                                 style={{ width: `${claudeModel.percentage}%` }}
                             ></div>
                         </div>
+                        <QuotaWindowDetails {...claudeModel} />
                     </div>
                 )}
             </div>
 
+            <p className="text-[11px] text-gray-500 mt-3">{t('dashboard.current_account_scope', '上方统计整个账号池，切换当前账号不会改变账号池平均值。')}</p>
             {onSwitch && (
                 <div className="mt-auto pt-3">
                     <button

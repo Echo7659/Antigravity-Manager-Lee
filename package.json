@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "bump": "node scripts/bump-version.mjs",
     "tauri": "tauri",
-    "tauri:debug": "RUST_LOG=debug npm run tauri dev"
+    "tauri:debug": "RUST_LOG=debug npm run tauri dev",
+    "test:dashboard": "tsx tests/dashboard/dashboardQuota.test.ts && tsx src/config/__tests__/modelConfig.test.ts && tsx tests/dashboard/accountSwitch.test.ts"
   },
   "dependencies": {
     "@ant-design/icons": "^5.6.1",
@@ -58,6 +59,7 @@
     "autoprefixer": "^10.4.22",
     "postcss": "^8.5.28",
     "tailwindcss": "^3.4.19",
+    "tsx": "4.23.15",
     "typescript": "~5.8.3",
     "vite": "^7.3.6",
     "vitepress": "^1.6.4",

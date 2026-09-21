@@ -55,6 +55,8 @@ Fixes account sorting panics that disconnected HTTP requests, uses upstream mode
 
 Preserves existing unlimited log retention during upgrade. Automatic cleanup does not rewrite legacy log databases with full VACUUM; large deployments may defer secondary-index creation to a maintenance window.
 
+Dashboard quota values now distinguish five-hour, weekly and effective balances. Gemini and Claude recommendations switch independently, with pending, success and failure feedback. See `docs/DASHBOARD_QUOTA.md`.
+
 The attached deployment bundle pins the tested image digest and contains no credentials. Existing deployments must retain their data mounts and secrets.
 ''')
 print(archive)
