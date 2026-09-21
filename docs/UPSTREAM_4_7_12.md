@@ -24,3 +24,5 @@ Existing deployments must preserve their Compose ports, credential environment, 
 Thanks to the contributors of `lbjlaq/Antigravity-Manager`, including @jeikl, for the upstream pipeline and release improvements.
 
 Legacy configurations with `max_rows=0` and no disk-budget fields retain unlimited log storage after migration. Both capacity fields set to zero now mean unlimited; new installations still default to the official 1 GiB budget. Automatic retention never runs a full VACUUM on legacy databases.
+
+Configured aliases are resolved before upstream variant expansion. This prevents `gemini-3-flash` from bypassing an existing mapping to a supported model and reaching a retired 3.5 alias. Unconfigured models retain upstream variant behavior; z.ai dispatch retains its own request model.

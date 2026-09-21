@@ -264,10 +264,11 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 ///
 /// # 返回
 /// 映射后的目标模型名称
-pub fn resolve_model_route(
+/// 解析显式路由和供应商转发规则，未命中时保留原始模型供档位解析。
+pub fn resolve_configured_model_route(
     original_model: &str,
     custom_mapping: &std::collections::HashMap<String, String>,
-) -> String {
+) -> Option<String> {
     // 0. API 热更新废弃模型转发 (最高物理优先级，强制纠正)
     // 如果用户非要用已经被移除的模型，并且官方下发了 fallback path，我们在此拦截并纠正
     if let Some(forwarded) = DYNAMIC_MODEL_FORWARDING_RULES.get(original_model) {
@@ -276,7 +277,7 @@ pub fn resolve_model_route(
             original_model,
             forwarded.value()
         ));
-        return forwarded.value().clone();
+        return Some(forwarded.value().clone());
     }
 
     // 1. 精确匹配 (次高优先级)
@@ -285,7 +286,7 @@ pub fn resolve_model_route(
             "[Router] 精确映射: {} -> {}",
             original_model, target
         ));
-        return target.clone();
+        return Some(target.clone());
     }
 
     // 1.5 [NEW] 检查是否命中自定义映射中的通配符规则 `gemini-3.x-flash`（要求 x > 8）
@@ -298,7 +299,7 @@ pub fn resolve_model_route(
                 "[Router] 命中内置通配符规则 gemini-3.x-flash (x > 8): {} -> {}",
                 original_model, target
             ));
-            return target;
+            return Some(target);
         }
     }
 
@@ -322,7 +323,18 @@ pub fn resolve_model_route(
             "[Router] Wildcard match: {} -> {} (rule: {})",
             original_model, target, pattern
         ));
-        return target.to_string();
+        return Some(target.to_string());
+    }
+
+    None
+}
+
+pub fn resolve_model_route(
+    original_model: &str,
+    custom_mapping: &std::collections::HashMap<String, String>,
+) -> String {
+    if let Some(target) = resolve_configured_model_route(original_model, custom_mapping) {
+        return target;
     }
 
     // 3. 系统默认映射
@@ -670,6 +682,40 @@ mod tests {
         assert_eq!(
             resolve_model_route("gemini-4.0-flash", &custom),
             "gemini-4.0-flash-tiered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod lee_routing_tests {
+    use super::*;
+    use crate::proxy::common::variant_mapping::{resolve_with_tier, VariantTier};
+
+    #[test]
+    fn compat_custom_alias_precedes_default_variant_and_preserves_target_tier() {
+        let mappings = HashMap::from([(
+            "gemini-3-flash".to_string(),
+            "gemini-3.7-flash-medium".to_string(),
+        )]);
+        let target = resolve_configured_model_route("gemini-3-flash", &mappings).unwrap();
+        let spec = resolve_with_tier(&target, Some(VariantTier::High), None).unwrap();
+        assert_eq!(spec.id, "gemini-3.7-flash-medium");
+    }
+
+    #[test]
+    fn compat_wildcard_alias_is_resolved_before_variant_without_chaining() {
+        let mappings =
+            HashMap::from([("gpt-4o*".to_string(), "gemini-3.7-flash-medium".to_string())]);
+        assert_eq!(
+            resolve_configured_model_route("gpt-4o-mini", &mappings).as_deref(),
+            Some("gemini-3.7-flash-medium")
+        );
+        assert!(resolve_configured_model_route("gemini-3.8-flash", &mappings).is_none());
+        assert_eq!(
+            resolve_with_tier("gemini-3.8-flash", Some(VariantTier::High), None)
+                .unwrap()
+                .id,
+            "gemini-3.8-flash-tiered"
         );
     }
 }

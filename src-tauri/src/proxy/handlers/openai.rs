@@ -1967,6 +1967,14 @@ pub async fn handle_chat_completions(
         debug!("[{}] Client Adapter detected", trace_id);
     }
 
+    let configured_model = crate::proxy::common::model_mapping::resolve_configured_model_route(
+        &openai_req.model,
+        &*state.custom_mapping.read().await,
+    );
+    if let Some(ref target) = configured_model {
+        openai_req.model = target.clone();
+    }
+
     // [Variant] Resolve canonical model + variant → real model + real params.
     // Replace the client's model/thinking/max_tokens with verified real values so the
     // forwarded request matches the expected upstream format. OpenCode encodes the variant as
@@ -2066,10 +2074,14 @@ pub async fn handle_chat_completions(
     let mut retried_without_thinking = false;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
-    let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
-        &openai_req.model,
-        &*state.custom_mapping.read().await,
-    );
+    let mapped_model = if configured_model.is_some() {
+        openai_req.model.clone()
+    } else {
+        crate::proxy::common::model_mapping::resolve_model_route(
+            &openai_req.model,
+            &*state.custom_mapping.read().await,
+        )
+    };
     let fallback_sid = SessionManager::extract_openai_session_id(&openai_req);
     let session_scope = crate::proxy::thinking_store::SessionScope::from_headers_and_body(
         &headers,

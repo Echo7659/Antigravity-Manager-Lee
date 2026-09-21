@@ -3,4 +3,4 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.compat
-    image: antigravity-manager:4.7.12-lee.2
+    image: antigravity-manager:4.7.12-lee.3

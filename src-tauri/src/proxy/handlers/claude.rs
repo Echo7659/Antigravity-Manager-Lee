@@ -472,6 +472,62 @@ pub async fn handle_messages(
             }
         };
 
+    let configured_model = crate::proxy::common::model_mapping::resolve_configured_model_route(
+        &request.model,
+        &*state.custom_mapping.read().await,
+    );
+    // [Issue #703 Fix] 智能兜底判断:需要归一化模型名用于配额保护检查
+    let normalized_model = crate::proxy::common::model_mapping::normalize_to_standard_id(
+        configured_model.as_deref().unwrap_or(&request.model),
+    )
+    .unwrap_or_else(|| request.model.clone());
+
+    let use_zai = if !zai_enabled {
+        false
+    } else {
+        match zai.dispatch_mode {
+            crate::proxy::ZaiDispatchMode::Off => false,
+            crate::proxy::ZaiDispatchMode::Exclusive => true,
+            crate::proxy::ZaiDispatchMode::Fallback => {
+                if google_accounts == 0 {
+                    // 没有 Google 账号,使用兜底
+                    tracing::info!(
+                        "[{}] No Google accounts available, using fallback provider",
+                        trace_id
+                    );
+                    true
+                } else {
+                    // [Issue #703 Fix] 智能判断:检查是否有可用的 Google 账号
+                    let has_available = state
+                        .token_manager
+                        .has_available_account("claude", &normalized_model)
+                        .await;
+                    if !has_available {
+                        tracing::info!(
+                            "[{}] All Google accounts unavailable (rate-limited or quota-protected for {}), using fallback provider",
+                            trace_id,
+                            request.model
+                        );
+                    }
+                    !has_available
+                }
+            }
+            crate::proxy::ZaiDispatchMode::Pooled => {
+                // Treat z.ai as exactly one extra slot in the pool.
+                // No strict guarantees: it may get 0 requests if selection never hits.
+                let total = google_accounts.saturating_add(1).max(1);
+                let slot = state.provider_rr.fetch_add(1, Ordering::Relaxed) % total;
+                slot == 0
+            }
+        }
+    };
+
+    if !use_zai {
+        if let Some(ref target) = configured_model {
+            request.model = target.clone();
+        }
+    }
+
     // [Variant] Resolve canonical model + variant → real model + real params.
     let model_lower = request.model.to_lowercase();
     let is_v3_or_above = model_specs::is_gemini_v3_or_above(&request.model);
@@ -541,51 +597,6 @@ pub async fn handle_messages(
         )
         .await;
     }
-
-    // [Issue #703 Fix] 智能兜底判断:需要归一化模型名用于配额保护检查
-    let normalized_model =
-        crate::proxy::common::model_mapping::normalize_to_standard_id(&request.model)
-            .unwrap_or_else(|| request.model.clone());
-
-    let use_zai = if !zai_enabled {
-        false
-    } else {
-        match zai.dispatch_mode {
-            crate::proxy::ZaiDispatchMode::Off => false,
-            crate::proxy::ZaiDispatchMode::Exclusive => true,
-            crate::proxy::ZaiDispatchMode::Fallback => {
-                if google_accounts == 0 {
-                    // 没有 Google 账号,使用兜底
-                    tracing::info!(
-                        "[{}] No Google accounts available, using fallback provider",
-                        trace_id
-                    );
-                    true
-                } else {
-                    // [Issue #703 Fix] 智能判断:检查是否有可用的 Google 账号
-                    let has_available = state
-                        .token_manager
-                        .has_available_account("claude", &normalized_model)
-                        .await;
-                    if !has_available {
-                        tracing::info!(
-                            "[{}] All Google accounts unavailable (rate-limited or quota-protected for {}), using fallback provider",
-                            trace_id,
-                            request.model
-                        );
-                    }
-                    !has_available
-                }
-            }
-            crate::proxy::ZaiDispatchMode::Pooled => {
-                // Treat z.ai as exactly one extra slot in the pool.
-                // No strict guarantees: it may get 0 requests if selection never hits.
-                let total = google_accounts.saturating_add(1).max(1);
-                let slot = state.provider_rr.fetch_add(1, Ordering::Relaxed) % total;
-                slot == 0
-            }
-        }
-    };
 
     // [Stage 1 Timing] 初始会话清洗计时
     let clean_start = std::time::Instant::now();
@@ -872,10 +883,14 @@ pub async fn handle_messages(
         let norm_start = std::time::Instant::now();
 
         // 2. 模型路由解析
-        let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
-            &request_for_body.model,
-            &*state.custom_mapping.read().await,
-        );
+        let mapped_model = if configured_model.is_some() {
+            request_for_body.model.clone()
+        } else {
+            crate::proxy::common::model_mapping::resolve_model_route(
+                &request_for_body.model,
+                &*state.custom_mapping.read().await,
+            )
+        };
         last_mapped_model = Some(mapped_model.clone());
 
         // 将 Claude 工具转为 Value 数组以便探测联网
