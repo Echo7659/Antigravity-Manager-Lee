@@ -85,8 +85,9 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m.insert("gemini-2.5-flash", "gemini-2.5-flash");
     m.insert("gemini-3-flash", "gemini-3-flash");
     m.insert("gemini-3.5-flash", "gemini-3.5-flash");
-    m.insert("gemini-3.6-flash", "gemini-3.6-flash");
-    m.insert("gemini-3.7-flash", "gemini-3.7-flash");
+    m.insert("gemini-3.6-flash", "gemini-3.6-flash-tiered");
+    m.insert("gemini-3.7-flash", "gemini-3.7-flash-tiered");
+    m.insert("gemini-3.8-flash", "gemini-3.8-flash-tiered");
     m.insert("gemini-3.7-flash-tiered", "gemini-3.7-flash-tiered");
     m.insert("gemini-3.7-flash-low", "gemini-3.7-flash-low");
     m.insert("gemini-3.7-flash-medium", "gemini-3.7-flash-medium");
@@ -287,6 +288,20 @@ pub fn resolve_model_route(
         return target.clone();
     }
 
+    // 1.5 [NEW] 检查是否命中自定义映射中的通配符规则 `gemini-3.x-flash`（要求 x > 8）
+    // 统一转为 3.x-flash-tiered 模型
+    if custom_mapping.contains_key("gemini-3.x-flash") {
+        if let Some(target) =
+            crate::proxy::model_specs::resolve_gemini_3x_flash_tiered(original_model)
+        {
+            crate::modules::logger::log_info(&format!(
+                "[Router] 命中内置通配符规则 gemini-3.x-flash (x > 8): {} -> {}",
+                original_model, target
+            ));
+            return target;
+        }
+    }
+
     // 2. Wildcard match - most specific (highest non-wildcard chars) wins
     // Note: When multiple patterns have the SAME specificity, HashMap iteration order
     // determines the result (non-deterministic). Users can avoid this by making patterns
@@ -311,6 +326,17 @@ pub fn resolve_model_route(
     }
 
     // 3. 系统默认映射
+    // [NEW] 检查是否为 >= 3.6 的无后缀 Flash 衍生模型（如 gemini-3.6-flash, gemini-3.7-flash, gemini-3.8-flash 等）
+    // 统一自动预设路由到对应的 tiered 自适应思考模型
+    if crate::proxy::model_specs::is_bare_gemini_v36_or_above_flash(original_model) {
+        let routed = format!("{}-tiered", original_model);
+        crate::modules::logger::log_info(&format!(
+            "[Router] 无后缀 Gemini >= 3.6 Flash 模型统一预设路由至 Tiered: {} -> {}",
+            original_model, routed
+        ));
+        return routed;
+    }
+
     let result = map_claude_model_to_gemini(original_model);
     if result != original_model {
         crate::modules::logger::log_info(&format!(
@@ -332,6 +358,38 @@ pub fn resolve_model_route(
 /// - `claude-sonnet-4-5`: All Claude Sonnet variants (3-5-sonnet, sonnet-4-5, etc.)
 ///
 /// Returns `None` if the model doesn't match any of the 3 protected categories.
+/// 判断是否为 Gemini 3.5 Flash 及以上的高阶 Flash 模型（与 3.1 Pro 共享高级配额）
+/// 严格语义通配：gemini-{ver}-flash*，当版本数值 ver >= 3.5 时生效（支持未来任意 3.10、4.x 等）
+fn is_high_tier_flash(lower: &str) -> bool {
+    if !lower.contains("flash") {
+        return false;
+    }
+
+    if let Some(pos) = lower.find("gemini-") {
+        let rest = &lower[pos + 7..];
+        if let Some(flash_pos) = rest.find("-flash") {
+            let ver = &rest[..flash_pos];
+            let mut parts = ver.split('.');
+            if let Some(major_s) = parts.next() {
+                if let Ok(major) = major_s.parse::<u32>() {
+                    if major > 3 {
+                        return true;
+                    }
+                    if major == 3 {
+                        if let Some(minor_s) = parts.next() {
+                            if let Ok(minor) = minor_s.parse::<u32>() {
+                                return minor >= 5;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
 pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
     let lower = model_name.to_lowercase();
 
@@ -345,12 +403,17 @@ pub fn normalize_to_standard_id(model_name: &str) -> Option<String> {
         return Some("gemini-3-pro-image".to_string());
     }
 
-    // 2. gemini-3-flash (包含所有 flash 变体)
+    // 2. 3.5 Flash 及以上的高阶 Flash 模型（如 3.5-flash, 3.7-flash, 3.8-flash 等）与 3.1 Pro 共享高级配额
+    if is_high_tier_flash(&lower) {
+        return Some("gemini-3-pro-high".to_string());
+    }
+
+    // 3. gemini-3-flash (包含普通 1.5-flash, 2.0-flash, 2.5-flash, 3.0-flash 等基础 flash 变体)
     if lower.contains("flash") {
         return Some("gemini-3-flash".to_string());
     }
 
-    // 3. gemini-3-pro-high (包含 pro 变体)
+    // 4. gemini-3-pro-high (包含 pro 变体)
     if lower.contains("pro") && !lower.contains("image") {
         return Some("gemini-3-pro-high".to_string());
     }
@@ -559,5 +622,54 @@ mod tests {
         assert_eq!(resolve_model_route("random-model", &custom), "catch-all");
         // Multi-wildcard: "a*b*c" (3)
         assert_eq!(resolve_model_route("a-test-b-foo-c", &custom), "multi-wild");
+    }
+
+    #[test]
+    fn test_gemini_3x_flash_wildcard_route() {
+        let mut custom = crate::proxy::config::default_custom_mapping();
+        assert!(custom.contains_key("gemini-3.6-flash"));
+        assert!(custom.contains_key("gemini-3.7-flash"));
+        assert!(custom.contains_key("gemini-3.8-flash"));
+        assert!(custom.contains_key("gemini-3.x-flash"));
+
+        // 1. 3.6 / 3.7 / 3.8 精确匹配默认预设
+        assert_eq!(
+            resolve_model_route("gemini-3.6-flash", &custom),
+            "gemini-3.6-flash-tiered"
+        );
+        assert_eq!(
+            resolve_model_route("gemini-3.7-flash", &custom),
+            "gemini-3.7-flash-tiered"
+        );
+        assert_eq!(
+            resolve_model_route("gemini-3.8-flash", &custom),
+            "gemini-3.8-flash-tiered"
+        );
+
+        // 2. x > 8 命中通配符规则 gemini-3.x-flash，统一转为 3.x-flash-tiered
+        assert_eq!(
+            resolve_model_route("gemini-3.9-flash", &custom),
+            "gemini-3.9-flash-tiered"
+        );
+        assert_eq!(
+            resolve_model_route("gemini-3.10-flash", &custom),
+            "gemini-3.10-flash-tiered"
+        );
+
+        // 3. 用户如果自定义精确覆盖 gemini-3.9-flash，用户自定义优先
+        custom.insert(
+            "gemini-3.9-flash".to_string(),
+            "gemini-3.9-flash-high".to_string(),
+        );
+        assert_eq!(
+            resolve_model_route("gemini-3.9-flash", &custom),
+            "gemini-3.9-flash-high"
+        );
+
+        // 4. 大于 3.8 的未来模型即使不在精确表中也统一走 tiered（含 4.x）
+        assert_eq!(
+            resolve_model_route("gemini-4.0-flash", &custom),
+            "gemini-4.0-flash-tiered"
+        );
     }
 }

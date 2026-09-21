@@ -22,6 +22,8 @@ pub struct UpdateInfo {
     pub published_at: String,
     #[serde(default)]
     pub source: Option<String>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,10 +59,55 @@ struct GitHubRelease {
 const UPDATER_JSON_URL: &str =
     "https://github.com/lbjlaq/Antigravity-Manager/releases/latest/download/updater.json";
 
+pub fn get_upstream_proxy_url() -> Option<String> {
+    if let Ok(config) = crate::modules::config::load_app_config() {
+        if config.proxy.upstream_proxy.enabled && !config.proxy.upstream_proxy.url.trim().is_empty()
+        {
+            let url = config.proxy.upstream_proxy.url.trim();
+            let normalized = if !url.contains("://") {
+                format!("http://{}", url)
+            } else {
+                url.to_string()
+            };
+            return Some(normalized);
+        }
+    }
+
+    // 兜底：若未显式配置上游代理，尝试从系统环境变量获取代理 (HTTPS_PROXY / HTTP_PROXY / ALL_PROXY)
+    for env_var in &[
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(val) = std::env::var(env_var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                let normalized = if !trimmed.contains("://") {
+                    format!("http://{}", trimmed)
+                } else {
+                    trimmed.to_string()
+                };
+                return Some(normalized);
+            }
+        }
+    }
+
+    None
+}
+
 /// Check for updates with improved strategy:
 /// 1. Check updater.json (Source of Truth for Auto-Update)
 /// 2. Fallback to GitHub API (Informational)
 pub async fn check_for_updates() -> Result<UpdateInfo, String> {
+    let mut info = check_for_updates_internal().await?;
+    info.proxy_url = get_upstream_proxy_url();
+    Ok(info)
+}
+
+async fn check_for_updates_internal() -> Result<UpdateInfo, String> {
     // 1. Try updater.json first (Critical for functional Auto-Update)
     match check_updater_json().await {
         Ok(info) => return Ok(info),
@@ -182,6 +229,7 @@ async fn check_updater_json() -> Result<UpdateInfo, String> {
             .pub_date
             .unwrap_or_else(|| Utc::now().to_rfc3339()),
         source: Some("updater.json".to_string()),
+        proxy_url: None,
     })
 }
 
@@ -191,22 +239,17 @@ async fn create_client() -> Result<reqwest::Client, String> {
         .timeout(std::time::Duration::from_secs(10));
 
     // Load config to check for upstream proxy
-    if let Ok(config) = crate::modules::config::load_app_config() {
-        if config.proxy.upstream_proxy.enabled && !config.proxy.upstream_proxy.url.is_empty() {
-            logger::log_info(&format!(
-                "Update checker using upstream proxy: {}",
-                config.proxy.upstream_proxy.url
-            ));
-            match reqwest::Proxy::all(&config.proxy.upstream_proxy.url) {
-                Ok(proxy) => {
-                    builder = builder.proxy(proxy);
-                }
-                Err(e) => {
-                    logger::log_warn(&format!(
-                        "Failed to parse proxy URL '{}': {}",
-                        config.proxy.upstream_proxy.url, e
-                    ));
-                }
+    if let Some(proxy_url) = get_upstream_proxy_url() {
+        logger::log_info(&format!(
+            "Update checker using upstream proxy: {}",
+            proxy_url
+        ));
+        match reqwest::Proxy::all(&proxy_url) {
+            Ok(proxy) => {
+                builder = builder.proxy(proxy);
+            }
+            Err(e) => {
+                logger::log_warn(&format!("Failed to parse proxy URL '{}': {}", proxy_url, e));
             }
         }
     }
@@ -260,6 +303,7 @@ async fn check_github_api() -> Result<UpdateInfo, String> {
         release_notes: release.body,
         published_at: release.published_at,
         source: Some("GitHub API".to_string()),
+        proxy_url: None,
     })
 }
 
@@ -323,6 +367,7 @@ async fn check_static_url(url: &str, source_name: &str) -> Result<UpdateInfo, St
         release_notes,
         published_at: Utc::now().to_rfc3339(), // Approximate time
         source: Some(source_name.to_string()),
+        proxy_url: None,
     })
 }
 

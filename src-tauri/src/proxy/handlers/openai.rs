@@ -1,6 +1,7 @@
 // OpenAI Handler
 use axum::{
-    extract::Json, extract::State, http::StatusCode, response::IntoResponse, response::Response,
+    body::Body, extract::Json, extract::State, http::StatusCode, response::IntoResponse,
+    response::Response,
 };
 use base64::Engine as _;
 use bytes::Bytes;
@@ -913,11 +914,9 @@ fn convert_chat_response_to_responses(chat_response: &OpenAIResponse) -> Value {
     })
 }
 
-/// Visible Codex commentary is part of the local transcript, not Gemini
-/// conversation history. Codex omits output item IDs when it replays a task, so
-/// `phase=commentary` is the durable discriminator. The text-prefix fallback
-/// heals tasks written by builds that accidentally finalized a thought blob as
-/// a normal answer.
+/// 仅识别客户端本地私有展示项（如本地渲染的思考块），绝不误杀伴随工具调用的真实过程进度说明。
+/// 只有明确以 `msg_thought_` 为 ID 前缀或历史遗留以 `**Thinking**` 开头的消息才被视为 transcript-only。
+/// 真实的 `phase="commentary"` 消息包含正文说明，必须作为上下文历史保留以保证模型少样本进度输出范式。
 fn is_codex_transcript_only_assistant_message(item: &Value, text: &str) -> bool {
     if responses_input_item_type(item) != "message"
         || item.get("role").and_then(Value::as_str) != Some("assistant")
@@ -925,11 +924,9 @@ fn is_codex_transcript_only_assistant_message(item: &Value, text: &str) -> bool 
         return false;
     }
 
-    item.get("phase").and_then(Value::as_str) == Some("commentary")
-        || item
-            .get("id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| id.starts_with(CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX))
+    item.get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with(CODEX_VISIBLE_THOUGHT_MESSAGE_PREFIX))
         || text.trim_start().starts_with("**Thinking**")
 }
 
@@ -1122,7 +1119,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
                     "call_id": "call_image",
                     "output": [
                         {"type": "input_text", "text": "image generated"},
-                        {"type": "input_image", "image_url": "data:image/png;base64,AQ=="}
+                        {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="}
                     ]
                 }
             ]
@@ -1154,7 +1151,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
         );
         assert!(!function_response.to_string().contains("data:image/"));
         assert_eq!(inline_data["inlineData"]["mimeType"], "image/png");
-        assert_eq!(inline_data["inlineData"]["data"], "AQ==");
+        assert_eq!(inline_data["inlineData"]["data"], "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");
     }
 
     #[test]
@@ -1463,7 +1460,7 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
         assert!(is_codex_transcript_only_assistant_message(
             &thought, "thinking"
         ));
-        assert!(is_codex_transcript_only_assistant_message(
+        assert!(!is_codex_transcript_only_assistant_message(
             &normal_commentary,
             "progress"
         ));
@@ -1475,6 +1472,66 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             &clean_final,
             "done"
         ));
+    }
+
+    #[test]
+    fn test_codex_process_commentary_is_retained_in_request_messages() {
+        let input = json!({
+            "model": "gemini-2.5-pro",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "检查系统故障"}]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_thought_123",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "private thought"}]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_comm_123",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "概览显示 HTTP 502，接下来检查网关连接。"}]
+                },
+                {
+                    "type": "function_call",
+                    "id": "call_inspect",
+                    "name": "inspect_case",
+                    "arguments": "{\"case\":\"case_1\"}"
+                }
+            ]
+        });
+
+        let converted = convert_codex_to_openai_request(input);
+        let messages = converted["messages"].as_array().expect("messages array");
+
+        // 验证：user 消息存在
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "检查系统故障");
+
+        // 验证：私有思考 msg_thought_123 被成功过滤，未进入 messages
+        assert!(messages
+            .iter()
+            .all(|m| m.get("content").and_then(Value::as_str) != Some("private thought")));
+
+        // 验证：普通进度 commentary 消息被成功保留
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(
+            messages[1]["content"],
+            "概览显示 HTTP 502，接下来检查网关连接。"
+        );
+
+        // 验证：工具调用正常跟随
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(
+            messages[2]["tool_calls"][0]["function"]["name"],
+            "inspect_case"
+        );
     }
 
     #[test]
@@ -1739,8 +1796,12 @@ fn prefix_with_step_marker(_marker: Option<String>, content: String) -> String {
 pub async fn handle_chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap, // [CHANGED] Extract headers
+    upstream_recorder: Option<
+        axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>,
+    >,
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let clean_start = std::time::Instant::now();
     // [NEW] Check for Image Model Redirection
     let model_name = body
         .get("model")
@@ -1823,7 +1884,6 @@ pub async fn handle_chat_completions(
         }
     }
 
-    let client_reasoning_effort = body.get("reasoning_effort").and_then(Value::as_str).map(str::to_owned);
     let normalized_interaction_ledger = body.get("_interaction_ledger").cloned();
     let mut openai_req: OpenAIRequest = serde_json::from_value(body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
@@ -1839,12 +1899,18 @@ pub async fn handle_chat_completions(
                     " ".to_string(),
                 )),
                 reasoning_content: None,
+                signature: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
                 refusal: None,
             });
     }
+
+    let clean_ms = clean_start.elapsed().as_micros() as f64 / 1000.0;
+    let mut norm_ms = 0.0f64;
+    let mut think_fill_ms = 0.0f64;
+    let mut ttft_ms = 0.0f64;
 
     let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
     info!(
@@ -1905,19 +1971,60 @@ pub async fn handle_chat_completions(
     // Replace the client's model/thinking/max_tokens with verified real values so the
     // forwarded request matches the expected upstream format. OpenCode encodes the variant as
     // thinking.budget_tokens; we infer the tier from its magnitude.
-    let client_budget = openai_req.thinking.as_ref().and_then(|t| t.budget_tokens);
+    let model_lower = openai_req.model.to_lowercase();
+    let is_v3_or_above = crate::proxy::model_specs::is_gemini_v3_or_above(&openai_req.model);
+    let is_explicit_tier_model = model_lower.ends_with("-high")
+        || model_lower.ends_with("-medium")
+        || model_lower.ends_with("-low")
+        || model_lower.ends_with("-extra-low");
+    let client_budget = if is_v3_or_above || is_explicit_tier_model {
+        if let Some(ref mut t) = openai_req.thinking {
+            t.budget_tokens = None; // 清理客户端 budget_tokens，防止污染
+        }
+        None
+    } else {
+        openai_req.thinking.as_ref().and_then(|t| t.budget_tokens)
+    };
+    let effective_budget_hint = if is_explicit_tier_model || is_v3_or_above {
+        None
+    } else {
+        client_budget
+    };
+
+    let effort_hint = openai_req
+        .reasoning_effort
+        .as_deref()
+        .or_else(|| {
+            openai_req
+                .reasoning
+                .as_ref()
+                .and_then(|r| r.effort.as_deref())
+        })
+        .or_else(|| {
+            openai_req
+                .thinking
+                .as_ref()
+                .and_then(|t| t.effort.as_deref())
+        });
+    let effort_tier = crate::proxy::common::variant_mapping::tier_from_effort(effort_hint);
+
     let variant_spec =
         if crate::proxy::mappers::openai::request::is_tiered_flash_model(&openai_req.model) {
             None
         } else {
-            crate::proxy::common::variant_mapping::resolve(&openai_req.model, client_budget)
+            crate::proxy::common::variant_mapping::resolve_with_tier(
+                &openai_req.model,
+                effort_tier,
+                effective_budget_hint,
+            )
         };
     if let Some(spec) = variant_spec {
         tracing::info!(
-            "[{}] [Variant] canonical='{}' budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
+            "[{}] [Variant] canonical='{}' effort={:?} budget_hint={:?} -> real_model='{}' budget={} maxOut={}",
             trace_id,
             openai_req.model,
-            client_budget,
+            effort_hint,
+            effective_budget_hint,
             spec.id,
             spec.thinking_budget,
             spec.max_output_tokens
@@ -1933,8 +2040,8 @@ pub async fn handle_chat_completions(
         } else {
             openai_req.thinking = Some(crate::proxy::mappers::openai::models::ThinkingConfig {
                 thinking_type: Some("enabled".to_string()),
-                budget_tokens: Some(spec.effective_thinking_budget(client_budget)),
-                effort: None,
+                budget_tokens: Some(spec.thinking_budget),
+                effort: effort_hint.map(|s| s.to_string()),
             });
         }
         openai_req.max_tokens = Some(spec.max_output_tokens);
@@ -1956,15 +2063,24 @@ pub async fn handle_chat_completions(
 
     let mut image_permit = None;
     let mut failure_statuses = FailureStatusTracker::default();
+    let mut retried_without_thinking = false;
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route(
         &openai_req.model,
         &*state.custom_mapping.read().await,
     );
-    let mapped_model = token_manager.resolve_effort_model(&mapped_model, client_reasoning_effort.as_deref().or_else(|| openai_req.reasoning.as_ref().and_then(|r| r.effort.as_deref())));
+    let fallback_sid = SessionManager::extract_openai_session_id(&openai_req);
+    let session_scope = crate::proxy::thinking_store::SessionScope::from_headers_and_body(
+        &headers,
+        original_body.as_ref(),
+        fallback_sid,
+    );
+    openai_req.session_id = Some(session_scope.store_key.clone());
+    let client_session_id = session_scope.client_id.clone();
 
     for attempt in 0..max_attempts {
+        let norm_start = std::time::Instant::now();
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
             .tools
@@ -1981,7 +2097,7 @@ pub async fn handle_chat_completions(
         );
 
         // 3. 提取 SessionId (粘性指纹)
-        let session_id = SessionManager::extract_openai_session_id(&openai_req);
+        let session_id = session_scope.store_key.clone();
 
         // 4. 获取 Token (使用准确的 request_type)
 
@@ -2034,11 +2150,13 @@ pub async fn handle_chat_completions(
                             None,
                             &e,
                         );
-                        return Ok((
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            headers,
-                            format!("Token error: {}", e),
-                        )
+                        let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+                            "openai",
+                            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                            mapped_model.as_str(),
+                            &e,
+                        );
+                        return Ok((StatusCode::SERVICE_UNAVAILABLE, headers, Json(dual_err))
                             .into_response());
                     }
                 }
@@ -2055,12 +2173,29 @@ pub async fn handle_chat_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         // 4. 转换请求 (返回内容包含 session_id, message_count, prefix_hash)
-        let (gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
+        let tf_start = std::time::Instant::now();
+        let (mut gemini_body, session_id, message_count, _prefix_hash) = transform_openai_request(
             &openai_req,
             &project_id,
             &mapped_model,
             proxy_token.as_ref(),
         );
+        let tf_micros = tf_start.elapsed().as_micros() as u64;
+        let norm_total_micros = norm_start.elapsed().as_micros() as u64;
+        norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
+        think_fill_ms = tf_micros as f64 / 1000.0;
+        let _ =
+            crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
+                &mut gemini_body,
+                &mapped_model,
+            );
+        crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+            &mut gemini_body,
+        );
+        crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        if let Some(ref recorder) = upstream_recorder {
+            recorder.set_value(&gemini_body);
+        }
         let gemini_body_for_debug = debug_logger::is_enabled(&debug_cfg)
             .then(|| debug_value_without_inline_data(&gemini_body));
 
@@ -2118,6 +2253,7 @@ pub async fn handle_chat_completions(
 
         // [FIX #1522] Inject Anthropic Beta Headers for Claude models (OpenAI path)
         let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert("x-session-id".to_string(), client_session_id.clone());
         if mapped_model.to_lowercase().contains("claude") {
             extra_headers.insert(
                 "anthropic-beta".to_string(),
@@ -2129,6 +2265,7 @@ pub async fn handle_chat_completions(
             );
         }
 
+        let upstream_req_start = std::time::Instant::now();
         let call_result = match upstream
             .call_v1_internal_with_headers(
                 method,
@@ -2219,12 +2356,18 @@ pub async fn handle_chat_completions(
                 // [P1 FIX] Enhanced Peek logic to handle heartbeats and slow start
                 // Pre-read until we find meaningful content, skip heartbeats
                 use crate::proxy::mappers::openai::streaming::create_openai_sse_stream;
+                let include_usage = openai_req
+                    .stream_options
+                    .as_ref()
+                    .map(|o| o.include_usage)
+                    .unwrap_or(false);
                 let mut openai_stream = create_openai_sse_stream(
                     gemini_stream,
                     openai_req.model.clone(),
                     session_id,
                     message_count,
                     Some(client_tool_names.clone()),
+                    include_usage,
                 );
 
                 let mut first_data_chunk = None;
@@ -2259,6 +2402,7 @@ pub async fn handle_chat_completions(
                             }
 
                             // We found real data!
+                            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
                             first_data_chunk = Some(bytes);
                             break;
                         }
@@ -2400,6 +2544,12 @@ pub async fn handle_chat_completions(
                         .header("X-Accel-Buffering", "no")
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
+                        .header("X-Session-Id", &client_session_id)
+                        .header("X-Antigravity-Session-Id", &client_session_id)
+                        .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                        .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                        .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                        .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
                         .body(body)
                         .unwrap()
                         .into_response());
@@ -2433,14 +2583,21 @@ pub async fn handle_chat_completions(
                                 )
                                 .await;
                             }
-                            return Ok((
-                                StatusCode::OK,
-                                [
-                                    ("X-Account-Email", email.as_str()),
-                                    ("X-Mapped-Model", mapped_model.as_str()),
-                                ],
-                                Json(full_response),
-                            )
+                            return Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/json")
+                                .header("X-Account-Email", email.as_str())
+                                .header("X-Mapped-Model", mapped_model.as_str())
+                                .header("X-Session-Id", client_session_id.as_str())
+                                .header("X-Antigravity-Session-Id", client_session_id.as_str())
+                                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                .body(Body::from(
+                                    serde_json::to_string(&full_response).unwrap_or_default(),
+                                ))
+                                .unwrap()
                                 .into_response());
                         }
                         Err(e) => {
@@ -2455,10 +2612,13 @@ pub async fn handle_chat_completions(
                 }
             }
 
+            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
             let gemini_resp: Value = response
                 .json()
                 .await
                 .map_err(|e| (StatusCode::BAD_GATEWAY, format!("Parse error: {}", e)))?;
+
+            crate::proxy::thinking_store::capture_gemini_response(&session_id, &gemini_resp);
 
             // [CACHE] 从 Gemini 响应中提取缓存信息，关闭反馈循环
             // 兼容两种格式: cachedContentTokenCount (旧), total_cached_tokens (新)
@@ -2510,14 +2670,21 @@ pub async fn handle_chat_completions(
                 )
                 .await;
             }
-            return Ok((
-                StatusCode::OK,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
-                Json(openai_response),
-            )
+            return Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("X-Account-Email", email.as_str())
+                .header("X-Mapped-Model", mapped_model.as_str())
+                .header("X-Session-Id", client_session_id.as_str())
+                .header("X-Antigravity-Session-Id", client_session_id.as_str())
+                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                .body(Body::from(
+                    serde_json::to_string(&openai_response).unwrap_or_default(),
+                ))
+                .unwrap()
                 .into_response());
         }
 
@@ -2564,10 +2731,56 @@ pub async fn handle_chat_completions(
             .await;
         }
 
-        // 确定重试策略
         let strategy = account_retry_strategy(status_code);
-        let should_mark_limited =
-            status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500;
+        // 统一流水线决策判定：协议无关的限流与错误判定
+        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+        );
+
+        if classification.is_thought_signature_error() {
+            if !retried_without_thinking {
+                retried_without_thinking = true;
+                tracing::warn!(
+                    "[{}] Pipeline: Thinking signature error detected on upstream (HTTP {}). Surgically purging corrupted signatures and rotating to the next account.",
+                    trace_id, status_code
+                );
+                // 1. 精准定向净化 ThinkingStore 中的异构污染签名（保留思考文本与健康签名）
+                crate::proxy::thinking_store::ThinkingStore::global()
+                    .purge_corrupted_signatures(&session_id, &mapped_model);
+                // 2. 清理当前 session 的 SignatureCache
+                crate::proxy::SignatureCache::global().delete_session_signature(&client_session_id);
+                // 3. 追加修复提示词到最后一条用户消息
+                if let Some(last_msg) = openai_req.messages.last_mut() {
+                    if last_msg.role == "user" {
+                        let repair_prompt = "\n\n[System Recovery] Your previous output contained an invalid signature. Please regenerate the response without the corrupted signature block.";
+                        if let Some(content) = &mut last_msg.content {
+                            use crate::proxy::mappers::openai::{
+                                OpenAIContent, OpenAIContentBlock,
+                            };
+                            match content {
+                                OpenAIContent::String(s) => {
+                                    s.push_str(repair_prompt);
+                                }
+                                OpenAIContent::Array(arr) => {
+                                    arr.push(OpenAIContentBlock::Text {
+                                        text: repair_prompt.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "[{}] Pipeline: Thinking signature error persisted after signature recovery; continuing the bounded account rotation.",
+                    trace_id
+                );
+            }
+        }
+
+        let should_mark_limited = classification.should_lock_account();
         let needs_quota_refresh = if config.request_type == "image_gen" && should_mark_limited {
             token_manager
                 .mark_rate_limited_fast(
@@ -2599,6 +2812,12 @@ pub async fn handle_chat_completions(
                     &error_text,
                     Some(&mapped_model),
                 )
+                .await;
+        }
+
+        if status_code == 429 || status_code == 529 {
+            token_manager
+                .unbind_session_and_clear_last_used(Some(&session_id))
                 .await;
         }
 
@@ -2652,49 +2871,6 @@ pub async fn handle_chat_completions(
             continue;
         }
 
-        // [NEW] 处理 400 错误 (Thinking 签名失效)
-        if status_code == 400
-            && (error_text.contains("Invalid `signature`")
-                || error_text.contains("thinking.signature")
-                || error_text.contains("Invalid signature")
-                || error_text.contains("Corrupted thought signature"))
-        {
-            tracing::warn!(
-                "[OpenAI] Signature error detected on account {}, retrying without thinking",
-                email
-            );
-
-            // [FIX #3391] 彻底清除 thinking 配置并去除 -thinking 模型后缀，确保下一轮重试时完全关闭思考
-            openai_req.thinking = None;
-            if openai_req.model.ends_with("-thinking") {
-                openai_req.model = openai_req.model.trim_end_matches("-thinking").to_string();
-            }
-
-            // 追加修复提示词到最后一条用户消息
-            if let Some(last_msg) = openai_req.messages.last_mut() {
-                if last_msg.role == "user" {
-                    let repair_prompt = "\n\n[System Recovery] Your previous output contained an invalid signature. Please regenerate the response without the corrupted signature block.";
-
-                    if let Some(content) = &mut last_msg.content {
-                        use crate::proxy::mappers::openai::{OpenAIContent, OpenAIContentBlock};
-                        match content {
-                            OpenAIContent::String(s) => {
-                                s.push_str(repair_prompt);
-                            }
-                            OpenAIContent::Array(arr) => {
-                                arr.push(OpenAIContentBlock::Text {
-                                    text: repair_prompt.to_string(),
-                                });
-                            }
-                        }
-                        tracing::debug!("[OpenAI] Appended repair prompt to last user message");
-                    }
-                }
-            }
-
-            continue; // 重试
-        }
-
         // [FIX session-1M] 上游按 sessionId 在服务端累计会话输入,长工具循环会把累计推过 1M,
         // 之后该 sessionId 的所有请求都 400 "input token count exceeds ... 1048576"。
         // 给 (账号, 对话) 的 sessionId 升代并立即重试:新 sessionId = 上游全新会话,对话无感恢复。
@@ -2712,20 +2888,19 @@ pub async fn handle_chat_completions(
             "OpenAI Upstream non-retryable error {} on account {}: {}",
             status_code, email, error_text
         );
+        let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+            "openai",
+            status_code,
+            &mapped_model,
+            &error_text,
+        );
         return Ok((
             status,
             [
                 ("X-Account-Email", email.as_str()),
                 ("X-Mapped-Model", mapped_model.as_str()),
             ],
-            // [FIX] Return JSON error for better client compatibility
-            Json(json!({
-                "error": {
-                    "message": error_text,
-                    "type": "upstream_error",
-                    "code": status_code
-                }
-            })),
+            Json(dual_err),
         )
             .into_response());
     }
@@ -2852,8 +3027,13 @@ fn responses_store_enabled(body: &Value) -> bool {
 pub async fn handle_completions(
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     State(state): State<AppState>,
+    headers: HeaderMap,
+    upstream_recorder: Option<
+        axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>,
+    >,
     Json(mut body): Json<Value>,
 ) -> Response {
+    let clean_start = std::time::Instant::now();
     debug!(
         "Received /v1/completions or /v1/responses payload: {} bytes",
         serialized_json_len(&body)
@@ -2872,11 +3052,19 @@ pub async fn handle_completions(
         .get("previous_response_id")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let explicit_session_id = body
-        .get("session_id")
-        .and_then(Value::as_str)
+    let explicit_session_id = headers
+        .get("x-session-id")
+        .or_else(|| headers.get("session-id"))
+        .or_else(|| headers.get("x-claude-code-session-id"))
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.trim().to_string())
         .filter(|id| !id.is_empty())
-        .map(str::to_string);
+        .or_else(|| {
+            body.get("session_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        });
     let response_id_for_save = format!("resp-{}", uuid::Uuid::new_v4());
     let http_tool_call_cache: std::collections::HashMap<String, serde_json::Value> =
         std::collections::HashMap::new();
@@ -3053,25 +3241,41 @@ pub async fn handle_completions(
                             .and_then(Value::as_str)
                             .unwrap_or("user")
                             .to_string();
-                        let transcript_only_metadata =
-                            is_codex_transcript_only_assistant_message(&item, "");
                         let (text_parts, image_parts) = responses_message_parts(&mut item);
-
                         let joined_text = text_parts.join("\n");
-                        if transcript_only_metadata
-                            || joined_text.trim_start().starts_with("**Thinking**")
+                        if is_codex_transcript_only_assistant_message(&item, &joined_text) {
+                            continue;
+                        }
+
+                        let reasoning_content = item
+                            .get("reasoning_content")
+                            .or_else(|| item.get("thought"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let signature = item
+                            .get("thoughtSignature")
+                            .or_else(|| item.get("thought_signature"))
+                            .or_else(|| item.get("signature"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+
+                        // 若为 assistant 角色且没有任何实际正文、图像或思考元数据，属于纯空占位消息，予以过滤
+                        if role == "assistant"
+                            && joined_text.trim().is_empty()
+                            && image_parts.is_empty()
+                            && reasoning_content.is_none()
+                            && signature.is_none()
                         {
                             continue;
                         }
 
                         // 构造消息内容：如果有图像则使用数组格式
-                        if image_parts.is_empty() {
+                        let mut message = if image_parts.is_empty() {
                             let content = prefix_with_step_marker(step_marker, joined_text);
-                            let message = json!({
+                            json!({
                                 "role": role,
                                 "content": content
-                            });
-                            messages.push(message);
+                            })
                         } else {
                             let mut content_blocks: Vec<Value> = Vec::new();
                             let marker_text = prefix_with_step_marker(step_marker, joined_text);
@@ -3082,12 +3286,59 @@ pub async fn handle_completions(
                                 }));
                             }
                             content_blocks.extend(image_parts);
-                            let message = json!({
+                            json!({
                                 "role": role,
                                 "content": content_blocks
-                            });
-                            messages.push(message);
+                            })
+                        };
+
+                        if let Some(rc) = reasoning_content {
+                            if let Some(obj) = message.as_object_mut() {
+                                obj.insert("reasoning_content".to_string(), json!(rc));
+                            }
                         }
+                        if let Some(sig) = signature {
+                            if let Some(obj) = message.as_object_mut() {
+                                obj.insert("thoughtSignature".to_string(), json!(sig));
+                            }
+                        }
+
+                        messages.push(message);
+                    }
+                    "reasoning" => {
+                        let mut thought_text = String::new();
+                        if let Some(summary_arr) = item.get("summary").and_then(Value::as_array) {
+                            for s in summary_arr {
+                                if let Some(t) = s.get("text").and_then(Value::as_str) {
+                                    thought_text.push_str(t);
+                                }
+                            }
+                        }
+                        if thought_text.is_empty() {
+                            if let Some(t) = item
+                                .get("text")
+                                .or_else(|| item.get("thought"))
+                                .and_then(Value::as_str)
+                            {
+                                thought_text.push_str(t);
+                            }
+                        }
+                        let sig = item
+                            .get("thoughtSignature")
+                            .or_else(|| item.get("thought_signature"))
+                            .or_else(|| item.get("signature"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+
+                        let mut msg_obj = json!({
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": thought_text,
+                        });
+                        if let Some(s) = sig {
+                            msg_obj["thoughtSignature"] = json!(s);
+                        }
+                        messages.push(msg_obj);
                     }
                     "function_call" | "custom_tool_call" | "local_shell_call"
                     | "web_search_call" => {
@@ -3116,16 +3367,12 @@ pub async fn handle_completions(
                             name = "shell";
                             if let Some(action) = item.get("action") {
                                 if let Some(exec) = action.get("exec") {
-                                    // Map to ShellCommandToolCallParams (string command) or ShellToolCallParams (array command)
-                                    // Most LLMs prefer a single string for shell
                                     let mut args_obj = serde_json::Map::new();
                                     if let Some(cmd) = exec.get("command") {
-                                        // CRITICAL FIX: The 'shell' tool schema defines 'command' as an ARRAY of strings.
-                                        // We MUST pass it as an array, not a joined string, otherwise Gemini rejects with 400 INVALID_ARGUMENT.
                                         let cmd_val = if cmd.is_string() {
-                                            json!([cmd]) // Wrap in array
+                                            json!([cmd])
                                         } else {
-                                            cmd.clone() // Assume already array
+                                            cmd.clone()
                                         };
                                         args_obj.insert("command".to_string(), cmd_val);
                                     }
@@ -3150,20 +3397,33 @@ pub async fn handle_completions(
                             }
                         }
 
-                        let message = json!({
+                        let tool_sig = item
+                            .get("thoughtSignature")
+                            .or_else(|| item.get("thought_signature"))
+                            .or_else(|| item.get("signature"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+
+                        let mut tc_obj = json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": args_str
+                            }
+                        });
+                        if let Some(ref s) = tool_sig {
+                            tc_obj["thoughtSignature"] = json!(s);
+                        }
+
+                        let mut message = json!({
                             "role": "assistant",
                             "content": "",
-                            "tool_calls": [
-                                {
-                                    "id": call_id,
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": args_str
-                                    }
-                                }
-                            ]
+                            "tool_calls": [ tc_obj ]
                         });
+                        if let Some(ref s) = tool_sig {
+                            message["thoughtSignature"] = json!(s);
+                        }
                         messages.push(message);
                     }
                     "function_call_output" | "custom_tool_call_output" => {
@@ -3476,6 +3736,7 @@ pub async fn handle_completions(
                     " ".to_string(),
                 )),
                 reasoning_content: None,
+                signature: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -3484,11 +3745,23 @@ pub async fn handle_completions(
     }
 
     // [NEW v4.2.0] Context Management & Reasoning Replay
-    let session_id_str = if is_responses_api {
-        routing_session_id.clone()
+    let fallback_sid = if is_responses_api {
+        if explicit_session_id.is_some() || previous_response_id.is_some() {
+            routing_session_id.clone()
+        } else {
+            SessionManager::extract_openai_session_id(&openai_req)
+        }
     } else {
         SessionManager::extract_openai_session_id(&openai_req)
     };
+    let session_scope = crate::proxy::thinking_store::SessionScope::from_headers_and_body(
+        &headers,
+        original_body.as_ref(),
+        fallback_sid,
+    );
+    openai_req.session_id = Some(session_scope.store_key.clone());
+    let session_id_str = session_scope.store_key.clone();
+    let client_session_id = session_scope.client_id.clone();
     let signature_session_id_str = if is_responses_api {
         previous_response_id
             .clone()
@@ -3500,10 +3773,9 @@ pub async fn handle_completions(
     let client_tool_names =
         crate::proxy::mappers::openai::request::extract_client_tool_names(&openai_req.tools);
 
-    crate::proxy::mappers::context_manager::ContextManager::restore_openai_reasoning_content(
-        &mut openai_req.messages,
-        &signature_session_id_str,
-    );
+    // Server-authoritative thinking: do NOT prefill messages.reasoning_content from
+    // SignatureCache. OpenAI mapping ignores client/cached reasoning text and fills
+    // placeholders via ThinkingStore hydrate + finalize instead.
 
     let experimental_cfg = state.experimental.read().await;
     let compression_level = if experimental_cfg.compression_level == "disabled" {
@@ -3713,6 +3985,11 @@ pub async fn handle_completions(
 
     let mut failure_statuses = FailureStatusTracker::default();
 
+    let clean_ms = clean_start.elapsed().as_micros() as f64 / 1000.0;
+    let mut norm_ms = 0.0f64;
+    let mut think_fill_ms = 0.0f64;
+    let mut ttft_ms = 0.0f64;
+
     if debug_logger::is_enabled(&debug_cfg) {
         let payload = json!({
             "kind": "original_request",
@@ -3733,6 +4010,7 @@ pub async fn handle_completions(
     let mut account_attempts = AccountAttempts::default();
 
     for attempt in 0..max_attempts {
+        let norm_start = std::time::Instant::now();
         // 3. 模型配置解析
         // 将 OpenAI 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = openai_req
@@ -3795,14 +4073,16 @@ pub async fn handle_completions(
         info!("✓ Using account: {} (type: {})", email, config.request_type);
 
         let proxy_token = token_manager.get_token_by_id(&account_id);
-        let (gemini_body, session_id, message_count, _prefix_hash) = if is_responses_api {
+        let tf_start = std::time::Instant::now();
+        let (mut gemini_body, session_id, message_count, _prefix_hash) = if is_responses_api {
             transform_openai_request_with_session(
                 &openai_req,
                 &project_id,
                 &mapped_model,
                 proxy_token.as_ref(),
-                &routing_session_id,
+                &session_id_str,
                 signature_read_key.as_deref(),
+                true, // is_responses_api
             )
         } else {
             transform_openai_request(
@@ -3812,6 +4092,22 @@ pub async fn handle_completions(
                 proxy_token.as_ref(),
             )
         };
+        let tf_micros = tf_start.elapsed().as_micros() as u64;
+        let norm_total_micros = norm_start.elapsed().as_micros() as u64;
+        norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
+        think_fill_ms = tf_micros as f64 / 1000.0;
+        let _ =
+            crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
+                &mut gemini_body,
+                &mapped_model,
+            );
+        crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+            &mut gemini_body,
+        );
+        crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        if let Some(ref recorder) = upstream_recorder {
+            recorder.set_value(&gemini_body);
+        }
         let gemini_body_for_debug = debug_logger::is_enabled(&debug_cfg)
             .then(|| debug_value_without_inline_data(&gemini_body));
         if debug_logger::is_enabled(&debug_cfg) {
@@ -3883,12 +4179,17 @@ pub async fn handle_completions(
         };
         let query_string = if list_response { Some("alt=sse") } else { None };
 
+        let mut extra_headers = std::collections::HashMap::new();
+        extra_headers.insert("x-session-id".to_string(), client_session_id.clone());
+
+        let upstream_req_start = std::time::Instant::now();
         let call_result = match upstream
-            .call_v1_internal(
+            .call_v1_internal_with_headers(
                 method,
                 &access_token,
                 gemini_body,
                 query_string,
+                extra_headers,
                 Some(account_id.as_str()),
             )
             .await
@@ -3957,7 +4258,7 @@ pub async fn handle_completions(
                         create_codex_sse_stream(
                             gemini_stream,
                             openai_req.model.clone(),
-                            response_id_for_save.clone(),
+                            session_id_str.clone(),
                             message_count,
                             assistant_turn_index,
                             response_id_for_save.clone(),
@@ -4000,6 +4301,7 @@ pub async fn handle_completions(
                                     retry_this_account = true;
                                     break;
                                 }
+                                ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
                                 first_data_chunk = Some(bytes);
                                 break;
                             }
@@ -4085,6 +4387,12 @@ pub async fn handle_completions(
                         .header("Connection", "keep-alive")
                         .header("X-Account-Email", &email)
                         .header("X-Mapped-Model", &mapped_model)
+                        .header("X-Session-Id", &session_scope.client_id)
+                        .header("X-Antigravity-Session-Id", &session_scope.client_id)
+                        .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                        .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                        .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                        .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
                         .body(Body::from_stream(combined_stream))
                         .unwrap()
                         .into_response();
@@ -4104,6 +4412,7 @@ pub async fn handle_completions(
                         },
                         message_count,
                         Some(client_tool_names.clone()),
+                        true,
                     );
 
                     // Peek Logic (Repeated for safety/correctness on this stream type)
@@ -4131,6 +4440,7 @@ pub async fn handle_completions(
                                     retry_this_account = true;
                                     break;
                                 }
+                                ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
                                 first_data_chunk = Some(bytes);
                                 break;
                             }
@@ -4229,14 +4539,24 @@ pub async fn handle_completions(
                                     .await;
                                 }
 
-                                return (
-                                    StatusCode::OK,
-                                    [
-                                        ("X-Account-Email", email.as_str()),
-                                        ("X-Mapped-Model", mapped_model.as_str()),
-                                    ],
-                                    Json(resp),
-                                )
+                                return Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("Content-Type", "application/json")
+                                    .header("X-Account-Email", email.as_str())
+                                    .header("X-Mapped-Model", mapped_model.as_str())
+                                    .header("X-Session-Id", session_scope.client_id.as_str())
+                                    .header(
+                                        "X-Antigravity-Session-Id",
+                                        session_scope.client_id.as_str(),
+                                    )
+                                    .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                    .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                    .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                    .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                    .body(Body::from(
+                                        serde_json::to_string(&resp).unwrap_or_default(),
+                                    ))
+                                    .unwrap()
                                     .into_response();
                             }
 
@@ -4293,14 +4613,24 @@ pub async fn handle_completions(
                                 .await;
                             }
 
-                            return (
-                                StatusCode::OK,
-                                [
-                                    ("X-Account-Email", email.as_str()),
-                                    ("X-Mapped-Model", mapped_model.as_str()),
-                                ],
-                                Json(legacy_resp),
-                            )
+                            return Response::builder()
+                                .status(StatusCode::OK)
+                                .header("Content-Type", "application/json")
+                                .header("X-Account-Email", email.as_str())
+                                .header("X-Mapped-Model", mapped_model.as_str())
+                                .header("X-Session-Id", session_scope.client_id.as_str())
+                                .header(
+                                    "X-Antigravity-Session-Id",
+                                    session_scope.client_id.as_str(),
+                                )
+                                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                                .body(Body::from(
+                                    serde_json::to_string(&legacy_resp).unwrap_or_default(),
+                                ))
+                                .unwrap()
                                 .into_response();
                         }
                         Err(e) => {
@@ -4314,6 +4644,7 @@ pub async fn handle_completions(
                 }
             }
 
+            ttft_ms = upstream_req_start.elapsed().as_micros() as f64 / 1000.0;
             let gemini_resp: Value = match response.json().await {
                 Ok(json) => json,
                 Err(e) => {
@@ -4326,9 +4657,11 @@ pub async fn handle_completions(
                 }
             };
 
+            crate::proxy::thinking_store::capture_gemini_response(&session_id_str, &gemini_resp);
+
             let chat_resp = transform_openai_response(
                 &gemini_resp,
-                Some("session-123"),
+                Some(&signature_session_id_str),
                 1,
                 Some(&client_tool_names),
             );
@@ -4357,14 +4690,19 @@ pub async fn handle_completions(
                     .await;
                 }
 
-                return (
-                    StatusCode::OK,
-                    [
-                        ("X-Account-Email", email.as_str()),
-                        ("X-Mapped-Model", mapped_model.as_str()),
-                    ],
-                    Json(resp),
-                )
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", "application/json")
+                    .header("X-Account-Email", email.as_str())
+                    .header("X-Mapped-Model", mapped_model.as_str())
+                    .header("X-Session-Id", session_scope.client_id.as_str())
+                    .header("X-Antigravity-Session-Id", session_scope.client_id.as_str())
+                    .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                    .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                    .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                    .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                    .body(Body::from(serde_json::to_string(&resp).unwrap_or_default()))
+                    .unwrap()
                     .into_response();
             }
 
@@ -4409,14 +4747,21 @@ pub async fn handle_completions(
                 .await;
             }
 
-            return (
-                StatusCode::OK,
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", mapped_model.as_str()),
-                ],
-                Json(legacy_resp),
-            )
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("X-Account-Email", email.as_str())
+                .header("X-Mapped-Model", mapped_model.as_str())
+                .header("X-Session-Id", session_scope.client_id.as_str())
+                .header("X-Antigravity-Session-Id", session_scope.client_id.as_str())
+                .header("X-Timing-Clean-Ms", format!("{:.3}", clean_ms))
+                .header("X-Timing-Norm-Ms", format!("{:.3}", norm_ms))
+                .header("X-Timing-Thinking-Ms", format!("{:.3}", think_fill_ms))
+                .header("X-Timing-Ttft-Ms", format!("{:.3}", ttft_ms))
+                .body(Body::from(
+                    serde_json::to_string(&legacy_resp).unwrap_or_default(),
+                ))
+                .unwrap()
                 .into_response();
         }
 
@@ -4440,8 +4785,36 @@ pub async fn handle_completions(
             error_text
         );
 
-        // 3. 标记限流状态(用于 UI 显示)
-        if status_code == 429 || status_code == 529 || status_code == 503 || status_code == 500 {
+        // 3. 统一流水线判定与标记限流状态(用于 UI 显示)
+        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+        );
+
+        if classification.is_model_not_found() {
+            tracing::warn!(
+                "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Terminating completions retry loop without account lockout.",
+                trace_id, mapped_model, status_code
+            );
+            let dual_err = crate::proxy::handlers::common::build_dual_track_error(
+                "openai",
+                status_code,
+                &mapped_model,
+                &error_text,
+            );
+            return Response::builder()
+                .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::NOT_FOUND))
+                .header("X-Account-Email", email.as_str())
+                .header("X-Mapped-Model", mapped_model.as_str())
+                .body(Body::from(
+                    serde_json::to_string(&dual_err).unwrap_or_default(),
+                ))
+                .unwrap()
+                .into_response();
+        }
+
+        if classification.should_lock_account() {
             token_manager
                 .mark_rate_limited_async(
                     &email,
@@ -4450,6 +4823,12 @@ pub async fn handle_completions(
                     &error_text,
                     Some(&mapped_model),
                 )
+                .await;
+        }
+
+        if status_code == 429 || status_code == 529 {
+            token_manager
+                .unbind_session_and_clear_last_used(Some(&session_id_str))
                 .await;
         }
 
@@ -4520,9 +4899,12 @@ pub async fn handle_list_models(State(state): State<AppState>) -> impl IntoRespo
 pub async fn handle_chat_redirection(
     State(state): State<AppState>,
     headers: HeaderMap,
+    upstream_recorder: Option<
+        axum::extract::Extension<crate::proxy::monitor::UpstreamRequestBodyHolder>,
+    >,
     Json(body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    handle_chat_completions(State(state), headers, Json(body)).await
+    handle_chat_completions(State(state), headers, upstream_recorder, Json(body)).await
 }
 
 async fn intercept_chat_to_image(
@@ -4877,9 +5259,13 @@ pub async fn handle_images_generations_internal(
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
                             let strategy = account_retry_strategy(status_code);
-                            // 429/500/503: mark limited before retry/rotation
-                            let should_mark_limited =
-                                status_code == 429 || status_code == 503 || status_code == 500;
+                            // 统一流水线限流裁决：500/503等服务异常绝不打入限流
+                            let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+                                status_code,
+                                &err_text,
+                                retry_after.as_deref(),
+                            );
+                            let should_mark_limited = classification.should_lock_account();
                             let needs_quota_refresh = if should_mark_limited {
                                 tracing::warn!(
                                     "[Images] Account {} rate limited/error ({}), rotating...",
@@ -5319,9 +5705,14 @@ pub async fn handle_images_edits(
                             let status_code = status.as_u16();
                             last_error = format!("Upstream error {}: {}", status, err_text);
                             let strategy = account_retry_strategy(status_code);
-                            // 429/500/503 等错误进行标记和重试
-                            let should_mark_limited =
-                                status_code == 429 || status_code == 503 || status_code == 500;
+                            // 统一流水线限流裁决：500/503等服务异常绝不打入限流
+                            let classification =
+                                crate::proxy::pipeline::UpstreamClassification::classify(
+                                    status_code,
+                                    &err_text,
+                                    retry_after.as_deref(),
+                                );
+                            let should_mark_limited = classification.should_lock_account();
                             let needs_quota_refresh = if should_mark_limited {
                                 tracing::warn!(
                                     "[Images] Account {} rate limited/error ({}), rotating...",
@@ -5343,7 +5734,10 @@ pub async fn handle_images_edits(
                             drop(image_permit.take());
                             if needs_quota_refresh {
                                 token_manager
-                                    .refresh_quota_lock_after_fast_mark(&email, Some(&resolved_model))
+                                    .refresh_quota_lock_after_fast_mark(
+                                        &email,
+                                        Some(&resolved_model),
+                                    )
                                     .await;
                             }
 
@@ -5368,12 +5762,19 @@ pub async fn handle_images_edits(
                             Ok(json) => {
                                 if response_has_inline_image_data(&json) {
                                     token_manager.mark_account_success(&account_id);
-                                    token_manager
-                                        .clear_persisted_live_limit(&account_id, Some(&model_to_use));
+                                    token_manager.clear_persisted_live_limit(
+                                        &account_id,
+                                        Some(&model_to_use),
+                                    );
                                 }
                                 return Ok((json, response_format.clone(), email));
                             }
-                            Err(e) => return Err((StatusCode::BAD_GATEWAY, format!("Parse error: {}", e))),
+                            Err(e) => {
+                                return Err((
+                                    StatusCode::BAD_GATEWAY,
+                                    format!("Parse error: {}", e),
+                                ))
+                            }
                         }
                     }
                     Err(e) => {
@@ -5664,8 +6065,13 @@ async fn handle_websocket_session(mut socket: WebSocket, headers: HeaderMap, sta
         };
 
         let openai_body = convert_codex_to_openai_request(normalized);
-        let response_result =
-            handle_chat_completions(State(state.clone()), headers.clone(), Json(openai_body)).await;
+        let response_result = handle_chat_completions(
+            State(state.clone()),
+            headers.clone(),
+            None,
+            Json(openai_body),
+        )
+        .await;
 
         let response = match response_result {
             Ok(res) => res.into_response(),
@@ -6238,14 +6644,24 @@ fn convert_codex_to_openai_request(mut body: Value) -> Value {
                         .unwrap_or("user")
                         .to_string();
                     let (text_parts, image_parts) = responses_message_parts(&mut item);
+                    let joined_text = text_parts.join("\n");
+                    if is_codex_transcript_only_assistant_message(&item, &joined_text) {
+                        continue;
+                    }
+
+                    if role == "assistant"
+                        && joined_text.trim().is_empty()
+                        && image_parts.is_empty()
+                    {
+                        continue;
+                    }
 
                     if image_parts.is_empty() {
-                        let content = prefix_with_step_marker(step_marker, text_parts.join("\n"));
+                        let content = prefix_with_step_marker(step_marker, joined_text);
                         messages.push(json!({ "role": role, "content": content }));
                     } else {
                         let mut content_blocks = Vec::new();
-                        let marker_text =
-                            prefix_with_step_marker(step_marker, text_parts.join("\n"));
+                        let marker_text = prefix_with_step_marker(step_marker, joined_text);
                         if !marker_text.is_empty() {
                             content_blocks.push(json!({ "type": "text", "text": marker_text }));
                         }
@@ -6932,6 +7348,7 @@ async fn try_compress_openai_with_summary(
         ),
         refusal: None,
         reasoning_content: None,
+        signature: None,
         tool_calls: None,
         tool_call_id: None,
         name: None,
@@ -6972,6 +7389,7 @@ async fn try_compress_openai_with_summary(
             ))),
             refusal: None,
             reasoning_content: None,
+            signature: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,
@@ -6983,6 +7401,7 @@ async fn try_compress_openai_with_summary(
             )),
             refusal: None,
             reasoning_content: None,
+            signature: None,
             tool_calls: None,
             tool_call_id: None,
             name: None,

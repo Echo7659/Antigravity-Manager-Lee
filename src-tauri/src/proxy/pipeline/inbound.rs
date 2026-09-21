@@ -1,0 +1,636 @@
+use super::policy::ProxyProtocol;
+use serde_json::{json, Value};
+
+/// 统一进站思考管线（InboundThinkingPipeline）
+/// 接收任何协议转译成的 Google contents 统一报文，单向流转执行：
+/// 1. 协议策略签名清洗 (Chat 协议丢弃客户端签名，其他协议验签)
+/// 2. 思考块首位强制排序与占位符规范化
+/// 3. 状态机历史思维链无损复活 (Hydration)
+/// 4. 终审脱敏与前缀缓存格式规范化 (Finalize)
+pub struct InboundThinkingPipeline;
+
+impl InboundThinkingPipeline {
+    /// 执行统一进站处理
+    pub fn process_contents(
+        contents: &mut Vec<Value>,
+        protocol: ProxyProtocol,
+        target_model: &str,
+        is_thinking_enabled: bool,
+        session_id: Option<&str>,
+        is_retry: bool,
+    ) {
+        let trusts_signature = protocol.trusts_client_signature();
+        let is_claude = target_model.to_lowercase().contains("claude");
+
+        // 1. 协议策略清洗与位置规范化
+        for content in contents.iter_mut() {
+            let is_model = matches!(
+                content.get("role").and_then(|r| r.as_str()),
+                Some("model") | Some("assistant")
+            );
+
+            if let Some(parts) = content.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                if is_model {
+                    let mut thinking_part = None;
+                    let mut extra_thinking_parts = Vec::new();
+                    let mut other_parts = Vec::new();
+
+                    for mut part in parts.drain(..) {
+                        let is_thought = part
+                            .get("thought")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                            || (part.get("thoughtSignature").is_some()
+                                && part.get("functionCall").is_none()
+                                && part.get("functionResponse").is_none());
+
+                        if is_thought {
+                            let text = part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                            let is_placeholder =
+                                crate::proxy::thinking_store::is_placeholder_thought(text);
+
+                            // 校验客户端签名有效性与模型兼容性
+                            let mut effective_sig = None;
+                            if let Some(sig) = part
+                                .get("thoughtSignature")
+                                .or_else(|| part.get("thought_signature"))
+                                .or_else(|| part.get("signature"))
+                                .and_then(|s| s.as_str())
+                            {
+                                if sig == crate::proxy::thinking_store::SENTINEL_SIGNATURE {
+                                    // Claude 模型绝不接受 Gemini 哨兵签名，避免触发 400 Invalid signature
+                                    if !is_claude {
+                                        effective_sig = Some(sig.to_string());
+                                    }
+                                } else if trusts_signature && sig.len() >= 50 {
+                                    let cached_family = crate::proxy::SignatureCache::global()
+                                        .get_signature_family(sig);
+                                    let compatible = match cached_family {
+                                        Some(family) => {
+                                            crate::proxy::mappers::common_utils::is_model_compatible(
+                                                &family,
+                                                target_model,
+                                            ) || (is_claude
+                                                && family.to_lowercase().contains("claude"))
+                                        }
+                                        None => {
+                                            if target_model.to_lowercase().contains("gemini") {
+                                                crate::proxy::thinking_store::is_likely_gemini_signature(sig)
+                                            } else if is_claude {
+                                                crate::proxy::thinking_store::is_claude_signature(
+                                                    sig,
+                                                )
+                                            } else {
+                                                true
+                                            }
+                                        }
+                                    };
+                                    if compatible {
+                                        let final_sig = if is_claude {
+                                            crate::proxy::thinking_store::ensure_google_claude_thought_signature(sig)
+                                        } else {
+                                            sig.to_string()
+                                        };
+                                        effective_sig = Some(final_sig);
+                                    } else if target_model.to_lowercase().contains("gemini") {
+                                        tracing::warn!(
+                                            "[InboundPipeline] Stripping foreign signature (len: {}) from thought block for Gemini model {}",
+                                            sig.len(), target_model
+                                        );
+                                        effective_sig = None;
+                                    } else if is_claude {
+                                        tracing::warn!(
+                                            "[InboundPipeline] Stripping foreign signature (len: {}) from thought block for Claude model {}",
+                                            sig.len(), target_model
+                                        );
+                                        effective_sig = None;
+                                    }
+                                }
+                            }
+
+                            // 保留真实原始思考文本的尾部换行与空白，绝不进行破坏性 trim，保证与上一轮流式输出字节级严格一致
+                            let final_thought_text = if (is_placeholder || text.trim().is_empty())
+                                && effective_sig.is_none()
+                            {
+                                "..."
+                            } else {
+                                text
+                            };
+
+                            let mut thought_obj = json!({
+                                "text": final_thought_text,
+                                "thought": true,
+                            });
+                            if let Some(sig) = effective_sig {
+                                thought_obj["thoughtSignature"] = json!(sig);
+                            }
+
+                            if thinking_part.is_none() {
+                                thinking_part = Some(thought_obj);
+                            } else {
+                                // 多个思考块时，非首位的多余思考块降级为普通文本
+                                if !final_thought_text.is_empty() && final_thought_text != "..." {
+                                    extra_thinking_parts
+                                        .push(json!({ "text": final_thought_text }));
+                                }
+                            }
+                        } else {
+                            if target_model.to_lowercase().contains("gemini") {
+                                if let Some(fc_sig) =
+                                    part.get("thoughtSignature").and_then(|s| s.as_str())
+                                {
+                                    if !crate::proxy::thinking_store::is_likely_gemini_signature(
+                                        fc_sig,
+                                    ) {
+                                        tracing::warn!(
+                                            "[InboundPipeline] Replacing foreign functionCall thoughtSignature (len: {}) with sentinel for Gemini",
+                                            fc_sig.len()
+                                        );
+                                        part["thoughtSignature"] =
+                                            json!(crate::proxy::thinking_store::SENTINEL_SIGNATURE);
+                                    }
+                                }
+                            } else if is_claude {
+                                if let Some(obj) = part.as_object_mut() {
+                                    obj.remove("thoughtSignature");
+                                    obj.remove("thought_signature");
+                                }
+                            }
+                            // 非思考部件：可能是普通正文/过程进度说明（commentary），也可能是 functionCall 等
+                            let is_plain_text = part.get("text").is_some()
+                                && part.get("functionCall").is_none()
+                                && part.get("functionResponse").is_none();
+
+                            if is_plain_text {
+                                let raw_text =
+                                    part.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                                if raw_text.trim().is_empty() {
+                                    // 丢弃纯空白文本部件，避免触发 Gemini 400 校验或破坏前缀缓存哈希稳定性
+                                    continue;
+                                }
+
+                                // 协议无关自愈：检查是否夹带旧版遗留思考前缀 (如 **Thinking**)
+                                if raw_text.trim_start().starts_with("**Thinking**") {
+                                    let clean_thought = Self::strip_thinking_prefix(raw_text);
+                                    if thinking_part.is_none() {
+                                        // 历史无原生思考块时，将遗留思考文字提炼为合法的首位思考块
+                                        let final_thought = if clean_thought.trim().is_empty() {
+                                            "..."
+                                        } else {
+                                            &clean_thought
+                                        };
+                                        let mut t_obj = json!({
+                                            "text": final_thought,
+                                            "thought": true,
+                                        });
+                                        if !is_claude {
+                                            t_obj["thoughtSignature"] = json!(
+                                                crate::proxy::thinking_store::SENTINEL_SIGNATURE
+                                            );
+                                        }
+                                        thinking_part = Some(t_obj);
+                                    }
+                                    // 若已有思考块，该遗留思考块作为陈旧副本剥离，防止二次污染正文
+                                    continue;
+                                }
+
+                                other_parts.push(part);
+                            } else {
+                                other_parts.push(part);
+                            }
+                        }
+                    }
+
+                    // 核心前缀保序：首位强制存在且仅存在一个 thinking_part，其余正文与工具调用紧随其后
+                    let mut new_parts = Vec::with_capacity(parts.len() + 1);
+                    if let Some(tp) = thinking_part {
+                        new_parts.push(tp);
+                    }
+                    new_parts.extend(extra_thinking_parts);
+                    new_parts.extend(other_parts);
+                    *parts = new_parts;
+                }
+            }
+        }
+
+        // 2. 状态机无损复活 (Hydration)
+        if is_thinking_enabled && !is_retry {
+            if let Some(s_id) = session_id {
+                crate::proxy::thinking_store::hydrate_gemini_contents_with_model(
+                    s_id,
+                    contents,
+                    Some(target_model),
+                );
+            }
+        }
+
+        // 3. 终审把关与脱敏规范化 (Finalize)
+        crate::proxy::thinking_store::finalize_gemini_contents_thinking_with_model(
+            contents,
+            is_thinking_enabled,
+            Some(target_model),
+        );
+    }
+
+    /// 统一进站思考配置与参数治理（流水线节点）：
+    /// 保证四大协议（OpenAI, Claude, Gemini, Codex）的协议无关性。
+    /// 1. 自动识别目标模型（包括 Tiered 自适应模型与具名模型）
+    /// 2. 忽略客户端数字 budget 防污染，精准捕获客户端无后缀思考参数 (low/medium/high)
+    /// 3. 在网关控制模式下，思考参数仅对 Tiered 模型开放操控权，分别映射至网关思考板块的 flash_low, flash_medium, flash_high
+    /// 4. 组装并规范化 generationConfig 中的 thinkingConfig 与 maxOutputTokens
+    pub fn configure_inbound_thinking(
+        target_model: &str,
+        generation_config: &mut Value,
+        client_effort: Option<&str>,
+        client_budget: Option<u64>,
+        token: Option<&crate::proxy::token_manager::ProxyToken>,
+    ) -> Option<i64> {
+        let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(target_model);
+        if is_under_v3 {
+            // Gemini < 3 非思考模型严禁注入 thinkingConfig
+            if let Some(obj) = generation_config.as_object_mut() {
+                obj.remove("thinkingConfig");
+                obj.remove("thinking_config");
+            }
+            return None;
+        }
+
+        let tb_config = crate::proxy::config::get_thinking_budget_config();
+        let resolved_budget = crate::proxy::model_specs::resolve_custom_budget(
+            target_model,
+            client_effort,
+            client_budget,
+            &tb_config,
+            token,
+        );
+
+        let is_tiered = crate::proxy::model_specs::is_tiered_flash_model(target_model)
+            || target_model.to_lowercase().contains("tiered");
+
+        let mut tc = json!({
+            "includeThoughts": true
+        });
+
+        if let Some(budget) = resolved_budget {
+            tc["thinkingBudget"] = json!(budget);
+
+            // 确保 maxOutputTokens 大于 thinkingBudget 避免 400
+            let min_overhead = 8192;
+            let current_max = generation_config
+                .get("maxOutputTokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(65536);
+            if current_max <= budget {
+                generation_config["maxOutputTokens"] = json!(budget + min_overhead);
+            }
+        } else if is_tiered {
+            // Tiered 模型未指定具体数字 budget 时，纯自适应模式：不注入 thinkingBudget
+            tc = json!({
+                "includeThoughts": true
+            });
+        }
+
+        generation_config["thinkingConfig"] = tc;
+
+        // 终审上限保护
+        let target_lower = target_model.to_lowercase();
+        let safe_limit = if target_lower.contains("claude") {
+            64000
+        } else if target_lower.contains("pro") {
+            65535
+        } else {
+            65536
+        };
+        if let Some(val) = generation_config["maxOutputTokens"].as_i64() {
+            if val > safe_limit {
+                generation_config["maxOutputTokens"] = json!(safe_limit);
+            }
+        }
+
+        resolved_budget
+    }
+
+    /// 剥离遗留思考块的前缀标记 (**Thinking**)
+    fn strip_thinking_prefix(text: &str) -> String {
+        let trimmed = text.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("**Thinking**") {
+            let rest = rest.trim_start_matches(':');
+            rest.trim_start_matches(|c| c == '\r' || c == '\n' || c == ' ' || c == '\t')
+                .to_string()
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_preserves_process_commentary_alongside_tool_call() {
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "text": "正在检查网关与后端的连接配置。" },
+                {
+                    "functionCall": {
+                        "name": "inspect_case",
+                        "args": { "case": "case_1" }
+                    }
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::OpenAIResponses,
+            "gemini-2.5-pro",
+            true,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        // 开启思考时，补齐首位思考块，随后的普通进度文本与工具调用均完整保留
+        assert!(parts[0]
+            .get("thought")
+            .and_then(Value::as_bool)
+            .unwrap_or(false));
+        assert_eq!(parts[1]["text"], "正在检查网关与后端的连接配置。");
+        assert!(parts[2].get("functionCall").is_some());
+    }
+
+    #[test]
+    fn test_preserves_multiple_plain_text_parts_intact() {
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "text": "第一阶段：检查概览。" },
+                { "text": "第二阶段：深入诊断。" },
+                {
+                    "functionCall": {
+                        "name": "run_check",
+                        "args": {}
+                    }
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::OpenAIChat,
+            "gemini-2.5-pro",
+            false,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["text"], "第一阶段：检查概览。");
+        assert_eq!(parts[1]["text"], "第二阶段：深入诊断。");
+        assert!(parts[2].get("functionCall").is_some());
+    }
+
+    #[test]
+    fn test_heals_legacy_thinking_prefix_without_corrupting_prose() {
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "text": "**Thinking**\n\n分析了案例数据，准备调用工具。" },
+                { "text": "正在执行检查。" },
+                {
+                    "functionCall": {
+                        "name": "inspect",
+                        "args": {}
+                    }
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::OpenAIResponses,
+            "gemini-2.5-pro",
+            true,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert!(parts[0]
+            .get("thought")
+            .and_then(Value::as_bool)
+            .unwrap_or(false));
+        assert_eq!(parts[0]["text"], "分析了案例数据，准备调用工具。");
+        assert_eq!(parts[1]["text"], "正在执行检查。");
+        assert!(parts[2].get("functionCall").is_some());
+    }
+
+    #[test]
+    fn test_claude_model_packages_signature_for_google_vertex() {
+        let raw_claude_sig = "Eu8CCpIBCBIQAhgCKkAtARbmpPNxYxc/Yz+mpbWJOqMo9c9RF4ESxACD0e/d6SZTpwmbrf9gPP/XMGZ9+kBkTMBfdK7ICuVonHJuu1AcMg9jbGF1ZGUtb3B1cy00LTY4AEIIdGhpbmtpbmdaDDg4NDM1NDkxOTA1MnIQLmWKBlED8AVhXRwj5Lb+PogBAagBosG91QawAQISDFXhwclEQyYNjsDteRoMuuu1Y/dUbn7sPe5OIjBoGvxrSlIgU78kwl701wfF0Rj0BCaCpE6a+KRGaB5pO2vL3ox4+yqum5a8o7mQ8+kqiQFDBTvaDITieiRVrkA8EKBUrpV0rLDyEcL7iQnAMsdQOk31ZKDeBddhEVX+Tb7Qs9mNWXNW9cbrs82iea09O+j2IMs0ibbWXPHB20IlkhVc5q9MmKBYgeQSTzKz+8Tgf7EDd78lkYieVk6GHqQaNiWD1Sl+RO0mIDGwURmOON6Fyw6WkCh/WSF+ORgB";
+        let expected_google_vertex_sig = "RXU4Q0NwSUJDQklRQWhnQ0trQXRBUmJtcFBOeFl4Yy9ZeittcGJXSk9xTW85YzlSRjRFU3hBQ0QwZS9kNlNaVHB3bWJyZjlnUFAvWE1HWjkra0JrVE1CZmRLN0lDdVZvbkhKdXUxQWNNZzlqYkdGMVpHVXRiM0IxY3kwMExUWTRBRUlJZEdocGJtdHBibWRhRERnNE5ETTFORGt4T1RBMU1uSVFMbVdLQmxFRDhBVmhYUndqNUxiK1BvZ0JBYWdCb3NHOTFRYXdBUUlTREZYaHdjbEVReVlOanNEdGVSb011dXUxWS9kVWJuN3NQZTVPSWpCb0d2eHJTbElnVTc4a3dsNzAxd2ZGMFJqMEJDYUNwRTZhK0tSR2FCNXBPMnZMM294NCt5cXVtNWE4bzdtUTgra3FpUUZEQlR2YURJVGllaVJWcmtBOEVLQlVycFYwckxEeUVjTDdpUW5BTXNkUU9rMzFaS0RlQmRkaEVWWCtUYjdRczltTldYTlc5Y2JyczgyaWVhMDlPK2oySU1zMGliYldYUEhCMjBJbGtoVmM1cTlNbUtCWWdlUVNUekt6KzhUZ2Y3RURkNzhsa1lpZVZrNkdIcVFhTmlXRDFTbCtSTzBtSURHd1VSbU9PTjZGeXc2V2tDaC9XU0YrT1JnQg==";
+
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                {
+                    "text": "Let me think about this.",
+                    "thought": true,
+                    "thoughtSignature": raw_claude_sig
+                },
+                {
+                    "text": "Here is the response."
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::AnthropicClaude,
+            "claude-opus-4-6-thinking",
+            true,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[0]["thoughtSignature"], expected_google_vertex_sig);
+        assert_eq!(parts[1]["text"], "Here is the response.");
+    }
+
+    #[test]
+    fn test_claude_model_from_openai_protocol_packages_signature() {
+        let raw_claude_sig = "Eu8CCpIBCBIQAhgCKkAtARbmpPNxYxc/Yz+mpbWJOqMo9c9RF4ESxACD0e/d6SZTpwmbrf9gPP/XMGZ9+kBkTMBfdK7ICuVonHJuu1AcMg9jbGF1ZGUtb3B1cy00LTY4AEIIdGhpbmtpbmdaDDg4NDM1NDkxOTA1MnIQLmWKBlED8AVhXRwj5Lb+PogBAagBosG91QawAQISDFXhwclEQyYNjsDteRoMuuu1Y/dUbn7sPe5OIjBoGvxrSlIgU78kwl701wfF0Rj0BCaCpE6a+KRGaB5pO2vL3ox4+yqum5a8o7mQ8+kqiQFDBTvaDITieiRVrkA8EKBUrpV0rLDyEcL7iQnAMsdQOk31ZKDeBddhEVX+Tb7Qs9mNWXNW9cbrs82iea09O+j2IMs0ibbWXPHB20IlkhVc5q9MmKBYgeQSTzKz+8Tgf7EDd78lkYieVk6GHqQaNiWD1Sl+RO0mIDGwURmOON6Fyw6WkCh/WSF+ORgB";
+        let expected_google_vertex_sig = "RXU4Q0NwSUJDQklRQWhnQ0trQXRBUmJtcFBOeFl4Yy9ZeittcGJXSk9xTW85YzlSRjRFU3hBQ0QwZS9kNlNaVHB3bWJyZjlnUFAvWE1HWjkra0JrVE1CZmRLN0lDdVZvbkhKdXUxQWNNZzlqYkdGMVpHVXRiM0IxY3kwMExUWTRBRUlJZEdocGJtdHBibWRhRERnNE5ETTFORGt4T1RBMU1uSVFMbVdLQmxFRDhBVmhYUndqNUxiK1BvZ0JBYWdCb3NHOTFRYXdBUUlTREZYaHdjbEVReVlOanNEdGVSb011dXUxWS9kVWJuN3NQZTVPSWpCb0d2eHJTbElnVTc4a3dsNzAxd2ZGMFJqMEJDYUNwRTZhK0tSR2FCNXBPMnZMM294NCt5cXVtNWE4bzdtUTgra3FpUUZEQlR2YURJVGllaVJWcmtBOEVLQlVycFYwckxEeUVjTDdpUW5BTXNkUU9rMzFaS0RlQmRkaEVWWCtUYjdRczltTldYTlc5Y2JyczgyaWVhMDlPK2oySU1zMGliYldYUEhCMjBJbGtoVmM1cTlNbUtCWWdlUVNUekt6KzhUZ2Y3RURkNzhsa1lpZVZrNkdIcVFhTmlXRDFTbCtSTzBtSURHd1VSbU9PTjZGeXc2V2tDaC9XU0YrT1JnQg==";
+
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                {
+                    "text": "Thinking process",
+                    "thought": true,
+                    "thoughtSignature": raw_claude_sig
+                },
+                {
+                    "text": "Answer from OpenAI gateway"
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::OpenAIResponses,
+            "claude-sonnet-4-6",
+            true,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thoughtSignature"], expected_google_vertex_sig);
+        assert_eq!(parts[1]["text"], "Answer from OpenAI gateway");
+    }
+
+    #[test]
+    fn test_gemini_native_signature_preserved_without_double_encoding() {
+        let gemini_sig = "EudDCuRDAWkUfRO9pMXsHitwdfey4TDAgCv1WzzMfBXVamvaqJ01BJPawr58";
+
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                {
+                    "text": "Gemini thinking",
+                    "thought": true,
+                    "thoughtSignature": gemini_sig
+                },
+                {
+                    "text": "Gemini answer"
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::GeminiNative,
+            "gemini-3.8-flash-high",
+            true,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        // Gemini 原生签名绝不被二次编码，必须原样保留
+        assert_eq!(parts[0]["thoughtSignature"], gemini_sig);
+        assert_eq!(parts[1]["text"], "Gemini answer");
+    }
+
+    #[test]
+    fn test_inbound_pipeline_intercepts_foreign_claude_signature_for_gemini() {
+        let foreign_claude_sig = "3mgp11XmVXq9InniGA4VAKd7c97NqFw+dWZt79Uz/w9znho88gSM76jv2bZmir7wI86Ixpha7eWdGuznAot4PNbe3+V9bgMTIEyUarn4MLAiiFVb830ZlM+H5ukQwXdD2Zv8nUSmmZTYinpLPGha8TORZAfpU1FJEvwyECel5+W7kc9kpTWrd8DqRNBTOz5EDtvoatiZgKv5SqInhGXK74SJ+PRIC6fNXvYG082HR6TsVxvVYaerz8A40rloIVTxRNK43h3Ecs1boxY4PZqBT8Yhl2qn/iZ+4Xt7FNkI0DAuS9iK0HYKMC4yw0OqKx/LeU+WFZlyc6hGm1BkzLY6yG97MH7kmJ0OPlBWgWFaTeL/uXuGJX6QkKObXN+phoq+kkF2vdFt/mdJMbdgfmSCVQ9037hGBhOHm0zN50KLkp1SxuAY1oWc+lDcI4ufWoyn";
+
+        let mut contents = vec![json!({
+            "role": "model",
+            "parts": [
+                {
+                    "text": "Cross-model thinking from Claude",
+                    "thought": true,
+                    "thoughtSignature": foreign_claude_sig
+                },
+                {
+                    "thoughtSignature": foreign_claude_sig,
+                    "functionCall": {
+                        "name": "bash",
+                        "args": { "command": "ls" }
+                    }
+                }
+            ]
+        })];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::AnthropicClaude,
+            "gemini-3.7-flash-high",
+            true,
+            None,
+            false,
+        );
+
+        let parts = contents[0]["parts"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["thought"], true);
+        assert!(
+            parts[0].get("thoughtSignature").is_none(),
+            "Thinking block for Gemini should NOT carry foreign signature or sentinel in pure text"
+        );
+        assert_eq!(
+            parts[1]["thoughtSignature"],
+            crate::proxy::thinking_store::SENTINEL_SIGNATURE,
+            "FunctionCall must fall back to sentinel signature in InboundThinkingPipeline"
+        );
+    }
+
+    #[test]
+    fn test_inbound_pipeline_intercepts_foreign_gemini_signature_for_claude() {
+        // 模拟 Gemini 原生签名
+        let foreign_gemini_sig =
+            "Ep4KCpsKAWkUfRMa5ZYMDdlPjxrQTLzVZ6MZeopI88888888888888888888888888888888";
+
+        let mut contents = vec![
+            json!({
+                "role": "user",
+                "parts": [{ "text": "hello" }]
+            }),
+            json!({
+                "role": "model",
+                "parts": [
+                    {
+                        "text": "The input is a Chinese greeting...",
+                        "thought": true,
+                        "thoughtSignature": foreign_gemini_sig
+                    },
+                    {
+                        "text": "Hello! How can I help you today?"
+                    }
+                ]
+            }),
+            json!({
+                "role": "user",
+                "parts": [{ "text": "continue" }]
+            }),
+        ];
+
+        InboundThinkingPipeline::process_contents(
+            &mut contents,
+            ProxyProtocol::OpenAIChat,
+            "claude-opus-4-6-thinking",
+            true,
+            None,
+            false,
+        );
+
+        let model_parts = contents[1]["parts"].as_array().expect("parts array");
+        // 关键验证：发往 Claude 时，由于历史异构签名不是合法 Claude 签名，
+        // 思考块绝不能带着 Gemini 签名发给 Claude，而是安全降级为普通正文文本！
+        let has_thought_block = model_parts
+            .iter()
+            .any(|p| p.get("thought").and_then(|v| v.as_bool()) == Some(true));
+        assert!(
+            !has_thought_block,
+            "Claude turn must NOT contain unvalidated thinking block with foreign Gemini signature"
+        );
+        let has_gemini_sig = model_parts
+            .iter()
+            .any(|p| p.get("thoughtSignature").is_some() || p.get("thought_signature").is_some());
+        assert!(
+            !has_gemini_sig,
+            "Foreign Gemini signature must be completely eliminated from Claude turn"
+        );
+    }
+}

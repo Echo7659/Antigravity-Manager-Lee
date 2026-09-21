@@ -31,65 +31,14 @@ pub fn store_thought_signature(sig: &str, session_id: &str, message_count: usize
 
 /// 将 Gemini 用量转换为 OpenAI 用量，兼容独立思考与合并思考计数。
 fn extract_usage_metadata(u: &Value) -> Option<super::models::OpenAIUsage> {
-    use super::models::{CompletionTokensDetails, OpenAIUsage, PromptTokensDetails};
-
-    // 优先使用新格式字段，fallback 到旧格式
-    let prompt_tokens = u
-        .get("total_input_tokens")
-        .or_else(|| u.get("promptTokenCount"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let raw_output_tokens = u
-        .get("total_output_tokens")
-        .or_else(|| u.get("candidatesTokenCount"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let raw_total_tokens = u
-        .get("total_tokens")
-        .or_else(|| u.get("totalTokenCount"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let cached_tokens = u
-        .get("total_cached_tokens")
-        .or_else(|| u.get("cachedContentTokenCount"))
-        .or_else(|| u.get("cachedTokens"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let reasoning_tokens = u
-        .get("total_thought_tokens")
-        .or_else(|| u.get("totalThoughtTokens"))
-        .or_else(|| u.get("thoughtsTokenCount"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-    let tool_use_tokens = u
+    let canonical = crate::proxy::pipeline::CanonicalUsage::from_gemini(u);
+    let mut usage = super::models::OpenAIUsage::from(&canonical);
+    usage.input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
+    usage.total_tool_use_tokens = u
         .get("total_tool_use_tokens")
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
-    let input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
-
-    // 输出计数统一包含思考，并保留上游原始字段供核对。
-    let completion_tokens = crate::proxy::mappers::usage::gemini_output_tokens(u).unwrap_or(0);
-
-    // cached_tokens is a subset of prompt_tokens. Keep prompt_tokens in the same
-    // raw-input-token unit as Gemini usageMetadata so downstream logs can reconcile it.
-    let final_total_tokens = prompt_tokens.saturating_add(completion_tokens);
-
-    Some(OpenAIUsage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: final_total_tokens,
-        prompt_tokens_details: cached_tokens.map(|ct| PromptTokensDetails {
-            cached_tokens: Some(ct),
-        }),
-        completion_tokens_details: reasoning_tokens.map(|rt| CompletionTokensDetails {
-            reasoning_tokens: Some(rt),
-        }),
-        input_tokens_by_modality,
-        raw_output_tokens: Some(raw_output_tokens),
-        total_thought_tokens: reasoning_tokens,
-        total_tool_use_tokens: tool_use_tokens,
-        gemini_total_tokens: raw_total_tokens,
-    })
+    Some(usage)
 }
 
 pub fn create_openai_sse_stream<S, E>(
@@ -98,6 +47,7 @@ pub fn create_openai_sse_stream<S, E>(
     session_id: String,
     message_count: usize,
     client_tool_names: Option<std::collections::HashSet<String>>,
+    include_usage: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -118,6 +68,7 @@ where
         let mut has_emitted_content = false;
         let mut received_refusal = false;
         let mut tool_call_index = 0;
+        let mut thinking_acc = crate::proxy::thinking_store::TurnAccumulator::new();
 
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -175,6 +126,7 @@ where
 
                                                     if let Some(parts_list) = parts {
                                                         for part in parts_list {
+                                                            thinking_acc.ingest_part(part);
                                                             let is_thought_part = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                                                 let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
@@ -206,10 +158,23 @@ where
 
                                                                     let final_name = super::response::resolve_shell_tool_name(name, &client_tool_names);
 
-                                                                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                                                    use std::hash::{Hash, Hasher};
-                                                                    serde_json::to_string(func_call).unwrap_or_default().hash(&mut hasher);
-                                                                    let call_id = format!("call_{:x}", hasher.finish());
+                                                                    let call_id = func_call
+                                                                        .get("id")
+                                                                        .and_then(|v| v.as_str())
+                                                                        .map(|s| s.to_string())
+                                                                        .unwrap_or_else(|| {
+                                                                            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                                                            use std::hash::{Hash, Hasher};
+                                                                            serde_json::to_string(func_call).unwrap_or_default().hash(&mut hasher);
+                                                                            tool_call_index.hash(&mut hasher);
+                                                                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().hash(&mut hasher);
+                                                                            format!("call_{:x}", hasher.finish())
+                                                                        });
+
+                                                                    if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
+                                                                        crate::proxy::SignatureCache::global().cache_tool_signature(&call_id, sig.to_string());
+                                                                    }
+                                                                    thinking_acc.record_tool_id(name, &call_id);
 
                                                                     let args_str = serde_json::to_string(&args).unwrap_or_default();
                                                                     let tool_call_chunk = json!({
@@ -328,11 +293,13 @@ where
                                                             }]
                                                         });
                                                         if finish_reason.is_some() {
-                                                            if let Some(ref usage) = final_usage {
-                                                                openai_chunk["usage"] = serde_json::to_value(usage).unwrap();
+                                                            if !include_usage {
+                                                                if let Some(ref usage) = final_usage {
+                                                                    openai_chunk["usage"] = serde_json::to_value(usage).unwrap();
+                                                                }
+                                                                final_usage = None;
                                                             }
                                                         }
-                                                        if finish_reason.is_some() { final_usage = None; }
                                                         let sse_out = format!("data: {}\n\n", serde_json::to_string(&openai_chunk).unwrap_or_default());
                                                         yield Ok::<Bytes, String>(Bytes::from(sse_out));
                                                     }
@@ -365,6 +332,7 @@ where
             }
         }
 
+        thinking_acc.commit(&session_id);
         if !error_occurred {
             if !has_emitted_content && emitted_tool_calls.is_empty() && !received_refusal {
                 let mut failure = json!({
@@ -376,7 +344,7 @@ where
                     failure["usage"] = serde_json::to_value(usage).unwrap();
                 }
                 yield Ok::<Bytes, String>(Bytes::from(format!("data: {}\n\n", failure)));
-            } else if let Some(ref usage) = final_usage {
+            } else if let Some(ref usage) = final_usage.as_ref().filter(|_| include_usage) {
                 let usage_chunk = json!({
                     "id": &stream_id, "object": "chat.completion.chunk", "created": created_ts,
                     "model": &model, "choices": [], "usage": usage
@@ -415,6 +383,7 @@ where
         let mut final_usage: Option<super::models::OpenAIUsage> = None;
         let mut usage_snapshot = json!({});
         let mut error_occurred = false;
+        let mut thinking_acc = crate::proxy::thinking_store::TurnAccumulator::new();
         let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(15));
         heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -449,6 +418,7 @@ where
                                                 if let Some(candidate) = candidates.get(0) {
                                                     if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                         for part in parts {
+                                                            thinking_acc.ingest_part(part);
                                                             let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
                                                                 let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
@@ -497,6 +467,7 @@ where
                 _ = heartbeat_interval.tick() => { yield Ok::<Bytes, String>(Bytes::from(": ping\n\n")); }
             }
         }
+        thinking_acc.commit(&session_id);
         if !error_occurred {
             yield Ok::<Bytes, String>(Bytes::from("data: [DONE]\n\n"));
         }
@@ -627,6 +598,7 @@ where
         let mut emitted_tool_calls = std::collections::HashSet::new();
         let mut accumulated_text = String::new();
         let mut accumulated_thinking = String::new();
+        let mut thinking_acc = crate::proxy::thinking_store::TurnAccumulator::new();
         let mut has_seen_tool_calls = false;
         let mut final_finish_reason: Option<String> = None;
 
@@ -676,49 +648,43 @@ where
                                                 }
                                                 if let Some(parts) = candidate.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                                                     for part in parts {
+                                                        thinking_acc.ingest_part(part);
                                                         let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
 
-                                                        // Codex Desktop renders `reasoning` as compact/ephemeral status
-                                                        // text. The durable, large transcript block in the "Working"
-                                                        // section is an assistant `message` with phase=commentary.
-                                                        // Close that synthetic thought message before opening normal text
+                                                        // Close the reasoning summary before opening normal text
                                                         // or a tool item so output item lifecycles never overlap.
                                                         let is_text_or_tool = part.get("text").is_some() || part.get("functionCall").is_some() || part.get("inlineData").is_some();
                                                         if is_text_or_tool && !is_thought && reasoning_open {
                                                             let text_done = json!({
-                                                                "type": "response.output_text.done",
+                                                                "type": "response.reasoning_summary_text.done",
                                                                 "item_id": &active_reasoning_item_id,
                                                                 "output_index": reasoning_output_index,
-                                                                "content_index": 0,
+                                                                "summary_index": 0,
                                                                 "text": &accumulated_thinking
                                                             });
                                                             let text_done = inject_seq(text_done, &mut sequence_number);
                                                             yield Ok::<Bytes, String>(codex_sse_frame(&text_done));
 
-                                                            let content_part_done = json!({
-                                                                "type": "response.content_part.done",
+                                                            let summary_part_done = json!({
+                                                                "type": "response.reasoning_summary_part.done",
                                                                 "item_id": &active_reasoning_item_id,
                                                                 "output_index": reasoning_output_index,
-                                                                "content_index": 0,
+                                                                "summary_index": 0,
                                                                 "part": {
-                                                                    "type": "output_text",
-                                                                    "text": &accumulated_thinking,
-                                                                    "annotations": []
+                                                                    "type": "summary_text",
+                                                                    "text": &accumulated_thinking
                                                                 }
                                                             });
-                                                            let content_part_done = inject_seq(content_part_done, &mut sequence_number);
-                                                            yield Ok::<Bytes, String>(codex_sse_frame(&content_part_done));
+                                                            let summary_part_done = inject_seq(summary_part_done, &mut sequence_number);
+                                                            yield Ok::<Bytes, String>(codex_sse_frame(&summary_part_done));
 
                                                             let reasoning_item = json!({
                                                                 "id": &active_reasoning_item_id,
-                                                                "type": "message",
-                                                                "role": "assistant",
-                                                                "phase": "commentary",
+                                                                "type": "reasoning",
                                                                 "status": "completed",
-                                                                "content": [{
-                                                                    "type": "output_text",
-                                                                    "text": &accumulated_thinking,
-                                                                    "annotations": []
+                                                                "summary": [{
+                                                                    "type": "summary_text",
+                                                                    "text": &accumulated_thinking
                                                                 }]
                                                             });
 
@@ -741,25 +707,25 @@ where
                                                                     // Once ordinary assistant text has started, it is the
                                                                     // authoritative result for this response. A late thought
                                                                     // delta must not be appended to it or open an overlapping
-                                                                    // commentary item.
+                                                                    // reasoning item.
                                                                     tracing::warn!("[Codex-Stream] Dropping late thought delta after assistant text started");
                                                                 } else if is_thought {
                                                                     if !reasoning_open {
                                                                         reasoning_output_index = next_output_index;
                                                                         next_output_index += 1;
                                                                         active_reasoning_item_id = format!(
-                                                                            "msg_thought_{}_{}",
+                                                                            "rs_{}_{}",
                                                                             &item_id_prefix[..16],
                                                                             reasoning_item_seq
                                                                         );
                                                                         reasoning_item_seq += 1;
                                                                         accumulated_thinking.clear();
 
-                                                                        let output_item_added = json!({"type": "response.output_item.added", "output_index": reasoning_output_index, "item": {"id": &active_reasoning_item_id, "type": "message", "role": "assistant", "phase": "commentary", "status": "in_progress", "content": []}});
+                                                                        let output_item_added = json!({"type": "response.output_item.added", "output_index": reasoning_output_index, "item": {"id": &active_reasoning_item_id, "type": "reasoning", "status": "in_progress", "summary": []}});
                                                                         let output_item_added = inject_seq(output_item_added, &mut sequence_number);
                                                                         yield Ok::<Bytes, String>(codex_sse_frame(&output_item_added));
 
-                                                                        let part_added = json!({"type": "response.content_part.added", "item_id": &active_reasoning_item_id, "output_index": reasoning_output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}});
+                                                                        let part_added = json!({"type": "response.reasoning_summary_part.added", "item_id": &active_reasoning_item_id, "output_index": reasoning_output_index, "summary_index": 0, "part": {"type": "summary_text", "text": ""}});
                                                                         let part_added = inject_seq(part_added, &mut sequence_number);
                                                                         yield Ok::<Bytes, String>(codex_sse_frame(&part_added));
 
@@ -768,10 +734,10 @@ where
 
                                                                     accumulated_thinking.push_str(&clean_text);
                                                                     let delta_ev = json!({
-                                                                        "type": "response.output_text.delta",
+                                                                        "type": "response.reasoning_summary_text.delta",
                                                                         "item_id": &active_reasoning_item_id,
                                                                         "output_index": reasoning_output_index,
-                                                                        "content_index": 0,
+                                                                        "summary_index": 0,
                                                                         "delta": clean_text
                                                                     });
                                                                     let delta_ev = inject_seq(delta_ev, &mut sequence_number);
@@ -818,10 +784,23 @@ where
 
                                                                 let args_str = serde_json::to_string(&args).unwrap_or_default();
 
-                                                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                                                use std::hash::{Hash, Hasher};
-                                                                call_key.hash(&mut hasher);
-                                                                let call_id = format!("call_{:x}", hasher.finish());
+                                                                let call_id = func_call
+                                                                    .get("id")
+                                                                    .and_then(|v| v.as_str())
+                                                                    .map(|s| s.to_string())
+                                                                    .unwrap_or_else(|| {
+                                                                        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                                                                        use std::hash::{Hash, Hasher};
+                                                                        call_key.hash(&mut hasher);
+                                                                        sequence_number.hash(&mut hasher);
+                                                                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos().hash(&mut hasher);
+                                                                        format!("call_{:x}", hasher.finish())
+                                                                    });
+
+                                                                if let Some(sig) = part.get("thoughtSignature").or(part.get("thought_signature")).and_then(|s| s.as_str()) {
+                                                                    crate::proxy::SignatureCache::global().cache_tool_signature(&call_id, sig.to_string());
+                                                                }
+                                                                thinking_acc.record_tool_id(name, &call_id);
 
                                                                 let (actual_name, namespace) = split_namespace_tool_name(name);
                                                                 let tool_item_id = format!("item-{}", &Uuid::new_v4().to_string()[..16]);
@@ -1037,42 +1016,38 @@ where
             }
         }
 
-        // 最终收尾时，若可见思考 commentary 还开着，则先物化为完整 message。
+        // Finalize any reasoning summary still open when the upstream stream ends.
         if reasoning_open {
             let text_done = json!({
-                "type": "response.output_text.done",
+                "type": "response.reasoning_summary_text.done",
                 "item_id": &active_reasoning_item_id,
                 "output_index": reasoning_output_index,
-                "content_index": 0,
+                "summary_index": 0,
                 "text": &accumulated_thinking
             });
             let text_done = inject_seq(text_done, &mut sequence_number);
             yield Ok::<Bytes, String>(codex_sse_frame(&text_done));
 
-            let content_part_done = json!({
-                "type": "response.content_part.done",
+            let summary_part_done = json!({
+                "type": "response.reasoning_summary_part.done",
                 "item_id": &active_reasoning_item_id,
                 "output_index": reasoning_output_index,
-                "content_index": 0,
+                "summary_index": 0,
                 "part": {
-                    "type": "output_text",
-                    "text": &accumulated_thinking,
-                    "annotations": []
+                    "type": "summary_text",
+                    "text": &accumulated_thinking
                 }
             });
-            let content_part_done = inject_seq(content_part_done, &mut sequence_number);
-            yield Ok::<Bytes, String>(codex_sse_frame(&content_part_done));
+            let summary_part_done = inject_seq(summary_part_done, &mut sequence_number);
+            yield Ok::<Bytes, String>(codex_sse_frame(&summary_part_done));
 
             let reasoning_item = json!({
                 "id": &active_reasoning_item_id,
-                "type": "message",
-                "role": "assistant",
-                "phase": "commentary",
+                "type": "reasoning",
                 "status": "completed",
-                "content": [{
-                    "type": "output_text",
-                    "text": &accumulated_thinking,
-                    "annotations": []
+                "summary": [{
+                    "type": "summary_text",
+                    "text": &accumulated_thinking
                 }]
             });
 
@@ -1216,6 +1191,11 @@ where
             }
         }
 
+        thinking_acc.clone().commit(&session_id);
+        if session_id != response_id {
+            thinking_acc.commit(&response_id);
+        }
+
         let mut completed_ev = json!({
             "type": terminal_type,
             "response": {
@@ -1335,7 +1315,7 @@ mod tests {
     async fn codex_response_id_matches_saved_session_key() {
         let response_id = format!("resp-test-{}", uuid::Uuid::new_v4());
         let upstream = vec![Ok::<Bytes, String>(Bytes::from(
-            "data: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"text\":\"done\"}]}}]}}\n\n",
+            "data: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\",\"content\":{\"parts\":[{\"thought\":true,\"text\":\"Checking.\"},{\"text\":\"done\"}]}}]}}\n\n",
         ))];
         let (completion_tx, completion_rx) =
             tokio::sync::oneshot::channel::<(Vec<Value>, tokio::sync::oneshot::Sender<()>)>();
@@ -1376,6 +1356,18 @@ mod tests {
                     .await
                     .expect("session exists when response.completed is visible");
                 assert_eq!(restored.input_items[0]["id"], "user-1");
+                let completed: Value = serde_json::from_str(
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .expect("completion data"),
+                )
+                .expect("completion JSON");
+                assert_eq!(restored.input_items[1]["type"], "reasoning");
+                assert_eq!(restored.input_items[1]["summary"][0]["text"], "Checking.");
+                assert_eq!(
+                    &restored.input_items[1..],
+                    completed["response"]["output"].as_array().expect("output")
+                );
                 assert!(restored
                     .input_items
                     .iter()
@@ -1409,7 +1401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_codex_visible_thought_commentary_and_tool_are_distinct_output_items() {
+    async fn test_codex_reasoning_summary_and_tool_are_distinct_output_items() {
         let (raw, events) = collect_codex_stream(vec![
             json!({
                 "response": {
@@ -1445,8 +1437,17 @@ mod tests {
             .collect();
         assert_eq!(names[0], "response.created");
         assert_eq!(names[1], "response.in_progress");
-        assert!(names.contains(&"response.output_text.delta"));
-        assert!(!names.contains(&"response.reasoning_summary_text.delta"));
+        assert!(!names.contains(&"response.output_text.delta"));
+        assert_eq!(
+            &names[3..8],
+            &[
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+            ]
+        );
         assert!(names.contains(&"response.function_call_arguments.delta"));
         assert_eq!(names.last().copied(), Some("response.completed"));
 
@@ -1455,19 +1456,24 @@ mod tests {
         }
         assert!(events
             .iter()
-            .filter(|event| event["type"] == "response.output_text.delta")
-            .all(|event| event["content_index"] == 0));
+            .filter(|event| event["type"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("response.reasoning_summary_")))
+            .all(|event| event["summary_index"] == 0
+                && event["output_index"] == 0
+                && event["item_id"] == events[2]["item"]["id"]));
 
         let added: Vec<&Value> = events
             .iter()
             .filter(|event| event["type"] == "response.output_item.added")
             .collect();
         assert_eq!(added.len(), 2);
-        assert_eq!(added[0]["item"]["type"], "message");
-        assert_eq!(added[0]["item"]["phase"], "commentary");
+        assert_eq!(added[0]["item"]["type"], "reasoning");
+        assert_eq!(added[0]["item"]["summary"], json!([]));
+        assert_eq!(added[0]["item"]["status"], "in_progress");
         assert!(added[0]["item"]["id"]
             .as_str()
-            .is_some_and(|id| id.starts_with("msg_thought_")));
+            .is_some_and(|id| id.starts_with("rs_")));
         assert_eq!(added[0]["output_index"], 0);
         assert_eq!(added[1]["item"]["type"], "function_call");
         assert_eq!(added[1]["output_index"], 1);
@@ -1477,9 +1483,12 @@ mod tests {
             .as_array()
             .expect("completed output");
         assert_eq!(output.len(), 2);
-        assert_eq!(output[0]["type"], "message");
-        assert_eq!(output[0]["phase"], "commentary");
-        assert_eq!(output[0]["content"][0]["text"], "Inspecting the workspace.");
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "Inspecting the workspace.");
+        assert_eq!(output[0], events[7]["item"]);
+        assert_eq!(events[8]["item"], added[1]["item"]);
+        assert_eq!(events[9]["item_id"], output[1]["id"]);
+        assert_eq!(added[1]["item"]["call_id"], output[1]["call_id"]);
         assert!(!raw.contains("**Thinking**"));
         assert_eq!(output[1]["type"], "function_call");
     }
@@ -1487,6 +1496,8 @@ mod tests {
     #[tokio::test]
     async fn test_codex_final_message_is_promoted_and_persisted() {
         let (_, events) = collect_codex_stream(vec![
+            json!({"candidates": [{"content": {"parts": [{"text": "Checking ", "thought": true}]}}]}),
+            json!({"candidates": [{"content": {"parts": [{"text": "results.", "thought": true}]}}]}),
             json!({
                 "candidates": [{
                     "content": {"parts": [{"text": "The task is complete."}]}
@@ -1518,15 +1529,58 @@ mod tests {
         assert_eq!(done["item"]["phase"], "final_answer");
         assert_eq!(done["item"]["content"][0]["text"], "The task is complete.");
         assert_eq!(done["item"]["content"][0]["annotations"], json!([]));
+        assert_eq!(
+            events[3]["part"],
+            json!({"type": "summary_text", "text": ""})
+        );
+        assert_eq!(events[4]["delta"], "Checking ");
+        assert_eq!(events[5]["delta"], "results.");
+        assert_eq!(events[4]["item_id"], events[5]["item_id"]);
+        assert_eq!(events[6]["text"], "Checking results.");
+        assert_eq!(
+            events[7]["part"],
+            json!({"type": "summary_text", "text": "Checking results."})
+        );
+        assert_eq!(events[8]["type"], "response.output_item.done");
+        assert_eq!(events[9]["item"], added["item"]);
 
         let terminal = events.last().expect("terminal event");
         assert_eq!(terminal["type"], "response.completed");
         assert_eq!(terminal["response"]["status"], "completed");
-        assert_eq!(terminal["response"]["output"][0]["phase"], "final_answer");
+        assert_eq!(terminal["response"]["output"][0], events[8]["item"]);
+        assert_eq!(terminal["response"]["output"][1], done["item"]);
+        assert_eq!(terminal["response"]["output"][1]["phase"], "final_answer");
         assert_eq!(
-            terminal["response"]["output"][0]["content"][0]["text"],
+            terminal["response"]["output"][1]["content"][0]["text"],
             "The task is complete."
         );
+    }
+
+    #[tokio::test]
+    async fn test_codex_reasoning_summary_is_closed_at_stream_end() {
+        let (_, events) = collect_codex_stream(vec![json!({
+            "candidates": [{"content": {"parts": [{"text": "Checking.", "thought": true}]}}]
+        })])
+        .await;
+        assert_eq!(events[5]["type"], "response.reasoning_summary_text.done");
+        assert_eq!(events[5]["text"], "Checking.");
+        assert_eq!(events[6]["type"], "response.reasoning_summary_part.done");
+        assert_eq!(
+            events[6]["part"],
+            json!({"type": "summary_text", "text": "Checking."})
+        );
+        assert_eq!(events[7]["type"], "response.output_item.done");
+        assert_eq!(events[7]["item"]["type"], "reasoning");
+        assert_eq!(events[7]["item"]["status"], "completed");
+        assert_eq!(events[7]["item"]["summary"], json!([events[6]["part"]]));
+        let terminal = events.last().expect("terminal event");
+        assert_eq!(terminal["response"]["output"], json!([events[7]["item"]]));
+        assert_eq!(terminal["type"], "response.incomplete");
+        assert_eq!(
+            terminal["response"]["incomplete_details"]["reason"],
+            "interrupted"
+        );
+        assert_eq!(terminal["response"]["error"]["code"], "empty_response");
     }
 
     #[tokio::test]
@@ -1556,7 +1610,7 @@ mod tests {
             !(event["type"] == "response.output_item.added"
                 && event["item"]["id"]
                     .as_str()
-                    .is_some_and(|id| id.starts_with("msg_thought_")))
+                    .is_some_and(|id| id.starts_with("rs_")))
         }));
         let terminal = events.last().expect("terminal event");
         assert_eq!(terminal["type"], "response.completed");
@@ -1667,6 +1721,7 @@ mod tests {
             "test-session".to_string(),
             0,
             None,
+            false,
         );
 
         let mut chunks = Vec::new();
@@ -1717,6 +1772,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_openai_streaming_with_include_usage_true() {
+        let chunk1_json = json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{ "text": "Hello" }]
+                }
+            }]
+        });
+
+        let chunk2_json = json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [{ "text": " world" }]
+                }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }
+        });
+
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(format!("data: {}\n\n", chunk1_json))),
+            Ok(Bytes::from(format!("data: {}\n\n", chunk2_json))),
+        ];
+
+        let gemini_stream = Box::pin(stream::iter(items));
+
+        let mut openai_stream = create_openai_sse_stream(
+            gemini_stream,
+            "gemini-1.5-flash".to_string(),
+            "test-session".to_string(),
+            0,
+            None,
+            true, // include_usage = true
+        );
+
+        let mut chunks = Vec::new();
+        while let Some(result) = openai_stream.next().await {
+            if let Ok(bytes) = result {
+                let s = String::from_utf8_lossy(&bytes).to_string();
+                for line in s.lines() {
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        chunks.push(line.to_string());
+                    }
+                }
+            }
+        }
+
+        // With include_usage: true, the last chunk before [DONE] MUST have choices: [] and usage
+        assert!(
+            chunks.len() >= 3,
+            "Expected at least 3 chunks: partial, finish, usage"
+        );
+        let last_chunk: Value =
+            serde_json::from_str(chunks.last().unwrap().trim_start_matches("data: ").trim())
+                .unwrap();
+        assert_eq!(last_chunk["choices"], json!([]));
+        assert!(
+            last_chunk.get("usage").is_some(),
+            "Standalone usage chunk must contain usage"
+        );
+        let usage = &last_chunk["usage"];
+        assert_eq!(usage["prompt_tokens"], 10);
+        assert_eq!(usage["completion_tokens"], 5);
+        assert_eq!(usage["total_tokens"], 15);
+    }
+
+    #[tokio::test]
+    async fn test_hermes_stream_without_include_usage_never_emits_empty_choices() {
+        // Simulates real Gemini streaming where finishReason arrives in chunk 1,
+        // and usageMetadata arrives in chunk 2 without candidates.
+        let chunk1_json = json!({
+            "candidates": [{
+                "finishReason": "STOP",
+                "content": {
+                    "parts": [{ "text": "Task complete." }]
+                }
+            }]
+        });
+
+        let chunk2_json = json!({
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "candidatesTokenCount": 8,
+                "totalTokenCount": 28
+            }
+        });
+
+        let items: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from(format!("data: {}\n\n", chunk1_json))),
+            Ok(Bytes::from(format!("data: {}\n\n", chunk2_json))),
+        ];
+
+        let gemini_stream = Box::pin(stream::iter(items));
+
+        // Hermes / standard OpenAI Python SDK default: include_usage = false
+        let mut openai_stream = create_openai_sse_stream(
+            gemini_stream,
+            "gemini-1.5-flash".to_string(),
+            "hermes-session".to_string(),
+            0,
+            None,
+            false,
+        );
+
+        let mut chunks = Vec::new();
+        while let Some(result) = openai_stream.next().await {
+            if let Ok(bytes) = result {
+                let s = String::from_utf8_lossy(&bytes).to_string();
+                for line in s.lines() {
+                    if line.starts_with("data: ") && !line.contains("[DONE]") {
+                        chunks.push(line.to_string());
+                    }
+                }
+            }
+        }
+
+        // CRITICAL: Ensure NO chunk has empty choices: []!
+        // Hermes iterates `chunk.choices[0]`. An empty choices: [] chunk crashes Hermes with IndexError!
+        for chunk_str in &chunks {
+            let json_str = chunk_str.trim_start_matches("data: ").trim();
+            let json: Value = serde_json::from_str(json_str).unwrap();
+            if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+                assert!(
+                    !choices.is_empty(),
+                    "Crash hazard! Found empty choices: [] chunk when include_usage=false: {}",
+                    json_str
+                );
+                // Verify choices[0] can be accessed without panic
+                assert!(choices.get(0).is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_openai_streaming_reasoning_content() {
         // Chunk with thought part
         let chunk_json = json!({
@@ -1741,6 +1934,7 @@ mod tests {
             "test-session".to_string(),
             0,
             None,
+            false,
         );
 
         let mut chunks = Vec::new();

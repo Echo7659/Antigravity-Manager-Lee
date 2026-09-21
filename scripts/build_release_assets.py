@@ -45,11 +45,13 @@ with tarfile.open(archive, 'w:gz') as bundle:
 - Platform: `linux/amd64`
 - Image: `{reference}`
 
-Includes Gemini request compatibility, cumulative/reasoning token accounting and explicit empty-stream error handling. See `docs/GEMINI_COMPAT_DEPLOYMENT.md` for behavior and deployment details.
+Synchronizes official v4.7.12, including the protocol pipeline, signature recovery, model routing, quota dashboard and UTF-8 safety fixes. Thanks to upstream lbjlaq/Antigravity-Manager contributors, including @jeikl. See `docs/UPSTREAM_4_7_12.md` for reconciliation details.
+
+Retains uncovered Gemini request compatibility, cumulative/reasoning token accounting and explicit empty-stream error handling. See `docs/GEMINI_COMPAT_DEPLOYMENT.md` for behavior and deployment details.
 
 Account failover now tries the initial account plus up to five different accounts for upstream HTTP errors, including 400 and 429. Successful attempts return immediately; exhaustion preserves the last actual failure. Native Gemini 429 responses now update account/model cooldowns. See `docs/ACCOUNT_FAILOVER.md` for stream and eligibility boundaries.
 
-Fixes account sorting panics that disconnected HTTP requests, restores advertised Gemini Flash variants from OpenAI reasoning_effort, and checks inclusive model quota thresholds before account selection. Used-account quotas refresh after responses, selection samples the full eligible subscription tier, and quota reloads preserve cooldowns. See `docs/QUOTA_AND_STABILITY.md` for limits and behavior.
+Fixes account sorting panics that disconnected HTTP requests, uses upstream model/effort routing, and checks inclusive model quota thresholds before account selection. Used-account quotas refresh after responses, selection samples the full eligible subscription tier, and quota reloads preserve cooldowns. See `docs/QUOTA_AND_STABILITY.md` for limits and behavior.
 
 The attached deployment bundle pins the tested image digest and contains no credentials. Existing deployments must retain their data mounts and secrets.
 ''')

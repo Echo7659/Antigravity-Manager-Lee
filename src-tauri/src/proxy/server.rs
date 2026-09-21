@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -330,6 +331,8 @@ struct QuotaBucketDto {
     remaining_fraction: f64,
     reset_time: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    cycle_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
@@ -348,6 +351,7 @@ fn quota_group_to_dto(g: &crate::models::quota::QuotaGroup) -> QuotaGroupDto {
                 window: b.window.clone(),
                 remaining_fraction: b.remaining_fraction,
                 reset_time: b.reset_time.clone(),
+                cycle_tokens: b.cycle_tokens,
                 display_name: b.display_name.clone(),
                 description: b.description.clone(),
             })
@@ -407,7 +411,7 @@ fn to_account_response(
 /// Axum 服务器实例
 #[derive(Clone)]
 pub struct AxumServer {
-    shutdown_tx: Arc<tokio::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    cancel_token: tokio_util::sync::CancellationToken,
     custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     proxy_state: Arc<tokio::sync::RwLock<crate::proxy::config::UpstreamProxyConfig>>,
     upstream: Arc<crate::proxy::upstream::client::UpstreamClient>,
@@ -675,6 +679,15 @@ impl AxumServer {
             .route("/internal/warmup", post(handlers::warmup::handle_warmup)) // 内部预热端点
             .route("/v1/api/event_logging/batch", post(silent_ok_handler))
             .route("/v1/api/event_logging", post(silent_ok_handler))
+            .route(
+                "/v1/thinking/end",
+                post(handlers::thinking::handle_end_session),
+            )
+            .route(
+                "/v1/thinking/sessions/:session_id",
+                axum::routing::get(handlers::thinking::handle_session_stats)
+                    .delete(handlers::thinking::handle_delete_session),
+            )
             // 应用 AI 服务特定的层
             // 注意：Axum layer 执行顺序是从下往上（洋葱模型）
             // 请求: ip_filter -> auth -> monitor -> handler
@@ -756,10 +769,18 @@ impl AxumServer {
                 "/proxy/opencode/status",
                 post(admin_get_opencode_sync_status),
             )
+            .route(
+                "/proxy/opencode/providers",
+                get(admin_get_opencode_providers),
+            )
             .route("/proxy/opencode/sync", post(admin_execute_opencode_sync))
             .route(
                 "/proxy/opencode/openai-sync",
                 post(admin_execute_opencode_openai_sync),
+            )
+            .route(
+                "/proxy/opencode/remove-provider",
+                post(admin_execute_opencode_remove_provider),
             )
             .route(
                 "/proxy/opencode/restore",
@@ -834,7 +855,12 @@ impl AxumServer {
             .route("/proxy/stats", get(admin_get_proxy_stats))
             .route("/logs", get(admin_get_proxy_logs_filtered))
             .route("/logs/count", get(admin_get_proxy_logs_count_filtered))
+            .route("/logs/disk-size", get(admin_get_proxy_db_disk_size))
             .route("/logs/clear", post(admin_clear_proxy_logs))
+            .route(
+                "/proxy/thinking-store/clear",
+                post(admin_clear_thinking_store),
+            )
             .route("/logs/:logId", get(admin_get_proxy_log_detail))
             // Debug Console (Log Bridge)
             .route("/debug/enable", post(admin_enable_debug_console))
@@ -878,7 +904,10 @@ impl AxumServer {
             )
             .route("/accounts/warmup", post(admin_warm_up_all_accounts))
             .route("/accounts/:accountId/warmup", post(admin_warm_up_account))
-            .route("/system/data-dir", get(admin_get_data_dir_path))
+            .route(
+                "/system/data-dir",
+                get(admin_get_data_dir_path).post(admin_set_data_dir),
+            )
             .route("/system/updates/settings", get(admin_get_update_settings))
             .route(
                 "/system/updates/check-status",
@@ -987,19 +1016,22 @@ impl AxumServer {
             app
         };
 
-        // 绑定地址
-        let addr = format!("{}:{}", host, port);
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .map_err(|e| format!("地址 {} 绑定失败: {}", addr, e))?;
+        // 绑定地址（使用 socket2 开启 SO_REUSEADDR，通配地址自动开启 IPv6/IPv4 双栈支持）
+        let listener = bind_tcp_listener(&host, port)?;
+        let display_host = if host == "0.0.0.0" || host == "::" || host == "[::]" {
+            "0.0.0.0 / [::] (IPv4/IPv6 Dual-Stack)".to_string()
+        } else if host.contains(':') && !host.starts_with('[') {
+            format!("[{}]", host)
+        } else {
+            host.to_string()
+        };
+        tracing::info!("反代服务器启动在 http://{}:{}", display_host, port);
 
-        tracing::info!("反代服务器启动在 http://{}", addr);
-
-        // 创建关闭通道
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        // 创建统一取消令牌
+        let cancel_token = tokio_util::sync::CancellationToken::new();
 
         let server_instance = Self {
-            shutdown_tx: Arc::new(tokio::sync::Mutex::new(Some(shutdown_tx))),
+            cancel_token: cancel_token.clone(),
             custom_mapping: custom_mapping_state.clone(),
             proxy_state,
             upstream: state.upstream.clone(),
@@ -1015,6 +1047,7 @@ impl AxumServer {
             only_raw_quota_models: only_raw_quota_models_state,
         };
 
+        let server_cancel_token = cancel_token.clone();
         // 在新任务中启动服务器
         let handle = tokio::spawn(async move {
             use hyper::server::conn::http1;
@@ -1023,39 +1056,66 @@ impl AxumServer {
 
             loop {
                 tokio::select! {
+                    _ = server_cancel_token.cancelled() => {
+                        tracing::info!("反代服务器收到终止信号，停止监听并释放端口");
+                        break;
+                    }
                     res = listener.accept() => {
                         match res {
                             Ok((stream, remote_addr)) => {
                                 let io = TokioIo::new(stream);
 
+                                // 若为 IPv4 映射的 IPv6 地址 (如 ::ffff:192.168.1.1)，将其规范化为原生 IPv4 地址
+                                let normalized_remote_addr = match remote_addr {
+                                    std::net::SocketAddr::V6(v6_addr) => {
+                                        if let Some(v4) = v6_addr.ip().to_ipv4_mapped() {
+                                            std::net::SocketAddr::V4(std::net::SocketAddrV4::new(v4, v6_addr.port()))
+                                        } else {
+                                            std::net::SocketAddr::V6(v6_addr)
+                                        }
+                                    }
+                                    v4_addr => v4_addr,
+                                };
+
                                 // 注入 ConnectInfo (用于获取真实 IP)
                                 use tower::ServiceExt;
                                 use hyper::body::Incoming;
                                 let app_with_info = app.clone().map_request(move |mut req: axum::http::Request<Incoming>| {
-                                    req.extensions_mut().insert(axum::extract::ConnectInfo(remote_addr));
+                                    req.extensions_mut().insert(axum::extract::ConnectInfo(normalized_remote_addr));
                                     req
                                 });
 
                                 let service = TowerToHyperService::new(app_with_info);
+                                let conn_cancel_token = server_cancel_token.clone();
 
                                 tokio::task::spawn(async move {
-                                    if let Err(err) = http1::Builder::new()
+                                    let conn = http1::Builder::new()
                                         .serve_connection(io, service)
-                                        .with_upgrades() // 支持 WebSocket (如果以后需要)
-                                        .await
-                                    {
-                                        debug!("连接处理结束或出错: {:?}", err);
+                                        .with_upgrades();
+                                    tokio::pin!(conn);
+
+                                    tokio::select! {
+                                        res = conn.as_mut() => {
+                                            if let Err(err) = res {
+                                                debug!("连接处理结束或出错: {:?}", err);
+                                            }
+                                        }
+                                        _ = conn_cancel_token.cancelled() => {
+                                            // 收到全局关闭通知，通知 Hyper 优雅终止连接
+                                            conn.as_mut().graceful_shutdown();
+                                            // 给予请求最多 500ms 缓冲，超时后自动强行断开并关闭底层套接字
+                                            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), conn).await;
+                                        }
                                     }
                                 });
                             }
                             Err(e) => {
+                                if server_cancel_token.is_cancelled() {
+                                    break;
+                                }
                                 error!("接收连接失败: {:?}", e);
                             }
                         }
-                    }
-                    _ = &mut shutdown_rx => {
-                        tracing::info!("反代服务器停止监听");
-                        break;
                     }
                 }
             }
@@ -1066,15 +1126,131 @@ impl AxumServer {
 
     /// 停止服务器
     pub fn stop(&self) {
-        let tx_mutex = self.shutdown_tx.clone();
-        tokio::spawn(async move {
-            let mut lock = tx_mutex.lock().await;
-            if let Some(tx) = lock.take() {
-                let _ = tx.send(());
-                tracing::info!("Axum server 停止信号已发送");
-            }
-        });
+        self.cancel_token.cancel();
+        tracing::info!("Axum server 停止信号已发送");
     }
+
+    /// 检查服务器是否已被停止
+    pub fn is_stopped(&self) -> bool {
+        self.cancel_token.is_cancelled()
+    }
+}
+
+/// 绑定单个地址（IPv4 或指定 IPv6 专用）
+fn bind_single_socket(
+    socket_addr: std::net::SocketAddr,
+) -> Result<tokio::net::TcpListener, String> {
+    let domain = if socket_addr.is_ipv6() {
+        socket2::Domain::IPV6
+    } else {
+        socket2::Domain::IPV4
+    };
+
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .map_err(|e| format!("创建套接字失败 ({}): {}", socket_addr, e))?;
+
+    // 在 Windows 和 Unix 上开启地址复用，避免在服务重启或连接处于 TIME_WAIT 状态时报 10048 端口占用
+    let _ = socket.set_reuse_address(true);
+
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
+
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置非阻塞模式失败 ({}): {}", socket_addr, e))?;
+
+    socket
+        .bind(&socket_addr.into())
+        .map_err(|e| format!("地址 {} 绑定失败: {}", socket_addr, e))?;
+
+    socket
+        .listen(1024)
+        .map_err(|e| format!("监听地址 {} 失败: {}", socket_addr, e))?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| format!("转换为 Tokio TcpListener 失败 ({}): {}", socket_addr, e))
+}
+
+/// 绑定 IPv6 / IPv4 双栈通配监听器 ([::]:port)，实现单套接字同时接收 IPv6 与 IPv4 客户端连接
+fn bind_dual_stack_socket(port: u16) -> Result<tokio::net::TcpListener, String> {
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV6,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .map_err(|e| format!("创建 IPv6 双栈套接字失败: {}", e))?;
+
+    // 关键：Windows 默认 only_v6 为 true，必须显式设为 false 才能同时监听 IPv4
+    if let Err(e) = socket.set_only_v6(false) {
+        return Err(format!("开启双栈支持失败 (set_only_v6(false)): {}", e));
+    }
+
+    let _ = socket.set_reuse_address(true);
+
+    #[cfg(unix)]
+    let _ = socket.set_reuse_port(true);
+
+    socket
+        .set_nonblocking(true)
+        .map_err(|e| format!("设置非阻塞模式失败: {}", e))?;
+
+    let addr = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0));
+    socket
+        .bind(&addr.into())
+        .map_err(|e| format!("双栈地址 [::]:{} 绑定失败: {}", port, e))?;
+
+    socket
+        .listen(1024)
+        .map_err(|e| format!("双栈监听 [::]:{} 失败: {}", port, e))?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
+        .map_err(|e| format!("转换为 Tokio TcpListener 失败 ([::]:{}): {}", port, e))
+}
+
+/// 绑定 TCP 监听器（启用地址复用，遇通配地址如 0.0.0.0 / :: 时自动开启 IPv6/IPv4 双栈支持）
+fn bind_tcp_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener, String> {
+    let clean_host = host.trim_matches('[').trim_matches(']');
+    let is_wildcard = clean_host == "0.0.0.0" || clean_host == "::";
+
+    if is_wildcard {
+        // 优先尝试以 IPv6 / IPv4 双栈模式绑定 [::]:port
+        match bind_dual_stack_socket(port) {
+            Ok(listener) => {
+                tracing::info!("TCP 监听器就绪: [::]:{} (IPv6 / IPv4 双栈模式)", port);
+                return Ok(listener);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "IPv6 双栈监听绑定失败 ({})，正在优雅降级到 IPv4 监听 (0.0.0.0:{})",
+                    e,
+                    port
+                );
+            }
+        }
+        // 优雅降级到 IPv4 0.0.0.0
+        let v4_addr =
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port);
+        return bind_single_socket(v4_addr);
+    }
+
+    // 精确地址绑定 (如 127.0.0.1、::1 或特定网卡 IP)
+    use std::net::ToSocketAddrs;
+    let addr_str = if clean_host.contains(':') {
+        format!("[{}]:{}", clean_host, port)
+    } else {
+        format!("{}:{}", clean_host, port)
+    };
+    let socket_addr = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("无法解析地址 {}: {}", addr_str, e))?
+        .next()
+        .ok_or_else(|| format!("无法解析地址: {}", addr_str))?;
+
+    bind_single_socket(socket_addr)
 }
 
 // ===== API 处理器 (旧代码已移除，由 src/proxy/handlers/* 接管) =====
@@ -1658,6 +1834,36 @@ async fn admin_save_config(
         *pool = new_config.clone().proxy.proxy_pool;
     }
 
+    // [FIX Web Mode] 同步全局内存配置（热更新思考预算、系统提示词、图像思考模式、压缩等级、阈值与审计策略）
+    crate::proxy::update_thinking_budget_config(new_config.proxy.thinking_budget.clone());
+    crate::proxy::update_global_system_prompt_config(new_config.proxy.global_system_prompt.clone());
+    crate::proxy::update_image_thinking_mode(new_config.proxy.image_thinking_mode.clone());
+    crate::proxy::config::update_global_compression_level(
+        new_config.proxy.experimental.compression_level.clone(),
+        new_config.proxy.experimental.enable_usage_scaling,
+    );
+    crate::proxy::config::update_global_thresholds(
+        new_config
+            .proxy
+            .experimental
+            .context_compression_threshold_l1,
+        new_config
+            .proxy
+            .experimental
+            .context_compression_threshold_l2,
+        new_config
+            .proxy
+            .experimental
+            .context_compression_threshold_l3,
+    );
+    crate::proxy::config::update_global_audit_config(
+        new_config.proxy.experimental.payload_storage_mode.clone(),
+        new_config.proxy.experimental.log_retention_days,
+        new_config.proxy.experimental.thinking_store_enabled,
+        new_config.proxy.experimental.thinking_retention_days,
+        Some(new_config.proxy.experimental.thinking_max_memory_turns),
+    );
+
     Ok(StatusCode::OK)
 }
 
@@ -1975,10 +2181,11 @@ async fn admin_set_proxy_monitor_enabled(
 async fn admin_get_proxy_logs_count_filtered(
     Query(params): Query<LogsRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res = tokio::task::spawn_blocking(move || {
-        proxy_db::get_logs_count_filtered(&params.filter, params.errors_only)
-    })
-    .await;
+    let res: Result<Result<u64, String>, tokio::task::JoinError> =
+        tokio::task::spawn_blocking(move || {
+            proxy_db::get_logs_count_filtered(&params.filter, params.errors_only)
+        })
+        .await;
 
     match res {
         Ok(Ok(count)) => Ok(Json(count)),
@@ -2006,12 +2213,60 @@ async fn admin_clear_proxy_logs() -> impl IntoResponse {
     StatusCode::OK
 }
 
+async fn admin_clear_thinking_store() -> impl IntoResponse {
+    crate::proxy::thinking_store::ThinkingStore::global().clear();
+    crate::proxy::SignatureCache::global().clear();
+    let res = tokio::task::spawn_blocking(crate::modules::proxy_db::clear_all_thinking_data).await;
+    match res {
+        Ok(Ok(deleted)) => {
+            logger::log_info(&format!(
+                "[API] 已清空思考块存储 (共删除 {} 条记录)",
+                deleted
+            ));
+            (StatusCode::OK, Json(json!({ "deleted": deleted })))
+        }
+        Ok(Err(e)) => {
+            logger::log_error(&format!("[API] 清空思考块存储失败: {}", e));
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        ),
+    }
+}
+
+async fn admin_get_proxy_db_disk_size(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let res: Result<Result<u64, String>, tokio::task::JoinError> =
+        tokio::task::spawn_blocking(move || proxy_db::get_proxy_db_disk_bytes()).await;
+
+    match res {
+        Ok(Ok(bytes)) => Ok(Json(bytes)),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )),
+    }
+}
+
 async fn admin_get_proxy_log_detail(
     Path(log_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res =
-        tokio::task::spawn_blocking(move || crate::modules::proxy_db::get_log_detail(&log_id))
-            .await;
+    let res: Result<
+        Result<crate::proxy::monitor::ProxyRequestLog, String>,
+        tokio::task::JoinError,
+    > = tokio::task::spawn_blocking(move || crate::modules::proxy_db::get_log_detail(&log_id))
+        .await;
 
     match res {
         Ok(Ok(log)) => Ok(Json(log)),
@@ -2044,7 +2299,10 @@ struct LogsFilterQuery {
 async fn admin_get_proxy_logs_filtered(
     Query(params): Query<LogsFilterQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res = tokio::task::spawn_blocking(move || {
+    let res: Result<
+        Result<Vec<crate::proxy::monitor::ProxyRequestLog>, String>,
+        tokio::task::JoinError,
+    > = tokio::task::spawn_blocking(move || {
         crate::modules::proxy_db::get_logs_filtered(
             &params.filter,
             params.errors_only,
@@ -2078,9 +2336,41 @@ async fn admin_get_proxy_stats(
 
 async fn admin_get_data_dir_path() -> impl IntoResponse {
     match crate::modules::account::get_data_dir() {
-        Ok(p) => Json(p.to_string_lossy().to_string()),
+        Ok(p) => Json(crate::modules::account::format_data_dir_path(&p)),
         Err(e) => Json(format!("Error: {}", e)),
     }
+}
+
+#[derive(Deserialize)]
+struct SetDataDirRequest {
+    path: String,
+}
+
+async fn admin_set_data_dir(
+    Json(payload): Json<SetDataDirRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let path = payload.path;
+    let new_path = tokio::task::spawn_blocking(move || {
+        crate::modules::account::migrate_data_dir(std::path::PathBuf::from(path))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+    Ok(Json(crate::modules::account::format_data_dir_path(
+        &new_path,
+    )))
 }
 
 // --- User Token Handlers ---
@@ -2627,6 +2917,9 @@ async fn admin_fetch_account_quota(
             Json(ErrorResponse { error: e }),
         )
     })?;
+
+    let mut quota = quota;
+    quota.ensure_subscription_tier();
 
     Ok(Json(quota))
 }
@@ -3936,11 +4229,48 @@ async fn admin_execute_opencode_openai_sync(
     .await
     .map(|_| StatusCode::OK)
     .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
+        let status = if crate::proxy::opencode_sync::is_provider_validation_error(&e) {
+            StatusCode::BAD_REQUEST
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, Json(ErrorResponse { error: e }))
     })
+}
+
+async fn admin_get_opencode_providers(
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::opencode_sync::get_opencode_providers()
+        .await
+        .map(Json)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpencodeRemoveProviderRequest {
+    provider_id: String,
+}
+
+async fn admin_execute_opencode_remove_provider(
+    Json(payload): Json<OpencodeRemoveProviderRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    crate::proxy::opencode_sync::execute_opencode_remove_provider(payload.provider_id)
+        .await
+        .map(|_| StatusCode::OK)
+        .map_err(|e| {
+            let status = if crate::proxy::opencode_sync::is_provider_validation_error(&e) {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(ErrorResponse { error: e }))
+        })
 }
 
 async fn admin_execute_opencode_restore(
@@ -4201,12 +4531,35 @@ mod image_scheduler_tests {
     #[test]
     fn test_switch_request_deserialization_with_and_without_target_ide() {
         use super::SwitchRequest;
-        let with_ide: SwitchRequest = serde_json::from_str(r#"{"accountId": "acc_1", "targetIde": "agy"}"#).unwrap();
+        let with_ide: SwitchRequest =
+            serde_json::from_str(r#"{"accountId": "acc_1", "targetIde": "agy"}"#).unwrap();
         assert_eq!(with_ide.account_id, "acc_1");
         assert_eq!(with_ide.target_ide.as_deref(), Some("agy"));
 
         let without_ide: SwitchRequest = serde_json::from_str(r#"{"accountId": "acc_2"}"#).unwrap();
         assert_eq!(without_ide.account_id, "acc_2");
         assert_eq!(without_ide.target_ide, None);
+    }
+
+    #[tokio::test]
+    async fn test_bind_tcp_listener_and_reuse() {
+        let port = 18099;
+        let listener1 =
+            super::bind_tcp_listener("127.0.0.1", port).expect("first bind should succeed");
+        drop(listener1);
+        let listener2 = super::bind_tcp_listener("127.0.0.1", port)
+            .expect("immediate re-bind must succeed with SO_REUSEADDR");
+        drop(listener2);
+    }
+
+    #[tokio::test]
+    async fn test_bind_tcp_listener_wildcard_dual_stack() {
+        let port = 18100;
+        let listener = super::bind_tcp_listener("0.0.0.0", port)
+            .expect("wildcard dual-stack bind should succeed");
+        drop(listener);
+        let listener_v6 = super::bind_tcp_listener("::", port)
+            .expect("wildcard v6 dual-stack bind should succeed");
+        drop(listener_v6);
     }
 }

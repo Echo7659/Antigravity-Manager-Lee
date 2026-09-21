@@ -960,6 +960,7 @@ impl ContextManager {
 
     /// Estimate token usage for a Gemini Request represented as serde_json::Value
     pub fn estimate_gemini_token_usage(body: &Value) -> u32 {
+        let body = body.get("request").unwrap_or(body);
         let mut total = 0;
 
         // systemInstruction
@@ -1148,7 +1149,14 @@ impl ContextManager {
         body: &mut Value,
         protected_last_n: usize,
     ) -> bool {
-        if let Some(contents) = body.get_mut("contents").and_then(|c| c.as_array_mut()) {
+        let contents = if body.get("contents").and_then(|c| c.as_array()).is_some() {
+            body.get_mut("contents").and_then(|c| c.as_array_mut())
+        } else {
+            body.get_mut("request")
+                .and_then(|r| r.get_mut("contents"))
+                .and_then(|c| c.as_array_mut())
+        };
+        if let Some(contents) = contents {
             let total_turns = contents.len();
             if total_turns == 0 {
                 return false;
@@ -1196,6 +1204,27 @@ impl ContextManager {
         } else {
             false
         }
+    }
+
+    /// Re-estimate (and optionally compress) AFTER mapping + thinking restore on the transit body.
+    pub fn apply_post_transit_context_mgmt(body: &mut Value, mapped_model: &str) -> u32 {
+        let estimated = Self::estimate_gemini_token_usage(body);
+        let level = crate::proxy::config::get_global_compression_level();
+        if level != "high" {
+            return estimated;
+        }
+        let context_limit = if mapped_model.to_lowercase().contains("flash") {
+            1_000_000u32
+        } else {
+            2_000_000u32
+        };
+        let ratio = estimated as f32 / context_limit as f32;
+        if ratio > crate::proxy::config::get_global_threshold_l2() {
+            if Self::compress_gemini_thinking_preserve_signature(body, 4) {
+                return Self::estimate_gemini_token_usage(body);
+            }
+        }
+        estimated
     }
 }
 #[cfg(test)]
@@ -1343,7 +1372,11 @@ mod tests {
                 role: "assistant".into(),
                 refusal: None,
                 content: Some(OpenAIContent::String("read file".into())),
-                reasoning_content: Some("a very very long chain of reasoning thoughts that exceeds 10 characters".into()),
+                reasoning_content: Some(
+                    "a very very long chain of reasoning thoughts that exceeds 10 characters"
+                        .into(),
+                ),
+                signature: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".into(),
                     r#type: "function".into(),
@@ -1351,6 +1384,7 @@ mod tests {
                         name: "read_file".into(),
                         arguments: "{}".into(),
                     }),
+                    signature: None,
                     status: None,
                     call_id: None,
                     operation: None,
@@ -1363,6 +1397,7 @@ mod tests {
                 refusal: None,
                 content: Some(OpenAIContent::String("latest user message".into())),
                 reasoning_content: None,
+                signature: None,
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -1370,7 +1405,8 @@ mod tests {
         ];
 
         // protected_last_n = 1 (protects the last user message, leaves index 0 eligible)
-        let modified = ContextManager::compress_openai_thinking_preserve_signature(&mut messages, 1);
+        let modified =
+            ContextManager::compress_openai_thinking_preserve_signature(&mut messages, 1);
         assert!(modified);
         assert_eq!(messages[0].reasoning_content.as_deref(), Some("..."));
         assert!(messages[0].tool_calls.is_some());

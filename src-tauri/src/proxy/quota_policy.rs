@@ -98,20 +98,6 @@ pub fn is_protected(percentage: Option<i32>, threshold: i32) -> bool {
     percentage.is_some_and(|remaining| remaining <= threshold)
 }
 
-/// 将独立的 reasoning_effort 转回有档位的 Gemini Flash 型号候选。
-/// 调用方负责确认候选确实存在于账号提供的型号列表中。
-pub fn effort_model_candidate(model: &str, effort: Option<&str>) -> Option<String> {
-    let version = model.strip_prefix("gemini-")?.strip_suffix("-flash")?;
-    if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return None;
-    }
-    let effort = effort?;
-    if !matches!(effort, "low" | "medium" | "high") {
-        return None;
-    }
-    Some(format!("{model}-{effort}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,21 +161,5 @@ mod tests {
             model_percentage(&exact, &groups, "gemini-3.7-flash-high", "gemini-3-flash"),
             Some(100)
         );
-    }
-    #[test]
-    fn compat_effort_restores_stripped_suffix_without_changing_explicit_model() {
-        assert_eq!(
-            effort_model_candidate("gemini-3.8-flash", Some("high")).as_deref(),
-            Some("gemini-3.8-flash-high")
-        );
-        for name in [
-            "gemini-3.8-flash-high",
-            "gemini-3.8-flash-tiered",
-            "claude-sonnet-4-6",
-            "gpt-4o",
-        ] {
-            assert!(effort_model_candidate(name, Some("high")).is_none());
-        }
-        assert!(effort_model_candidate("gemini-3.8-flash", None).is_none());
     }
 }

@@ -1,5 +1,6 @@
 // OpenAI 协议响应转换模块
 use super::models::*;
+use crate::proxy::mappers::common_utils::safe_truncate_chars;
 use serde_json::Value;
 
 pub fn is_shell_or_terminal_tool(tool_name: &str) -> bool {
@@ -18,18 +19,349 @@ pub fn is_shell_or_terminal_tool(tool_name: &str) -> bool {
     )
 }
 
-/// 标准化并清洗 shell / 命令执行工具参数
+pub fn is_workflow_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.to_ascii_lowercase().as_str(),
+        "workflow" | "run_workflow" | "execute_workflow"
+    )
+}
+
+/// 剥离命令字符串外部包裹的 Markdown 代码块标签、反引号以及动作提示词前缀
+pub fn strip_markdown_and_action_prefixes(raw: &str) -> String {
+    let mut s = raw.trim();
+    // 剥离 Markdown 代码块: ```bash\n...\n``` 或 ```...```
+    if s.starts_with("```") {
+        if let Some(end) = s.rfind("```") {
+            if end > 3 {
+                let inner = &s[3..end];
+                if let Some(nl) = inner.find('\n') {
+                    s = inner[nl + 1..].trim();
+                } else {
+                    s = inner.trim();
+                }
+            }
+        }
+    }
+    // 剥离行内代码反引号: `cmd`
+    if s.starts_with('`') && s.ends_with('`') && s.len() >= 2 {
+        s = s[1..s.len() - 1].trim();
+    }
+
+    // 循环迭代剥离常见动作前缀（支持英文大小写不敏感，支持中英文全角半角标点）
+    let prefixes = [
+        "run: ",
+        "run ",
+        "execute: ",
+        "execute ",
+        "check: ",
+        "check ",
+        "command: ",
+        "command ",
+        "cmd: ",
+        "cmd ",
+        "执行: ",
+        "执行：",
+        "执行 ",
+        "运行: ",
+        "运行：",
+        "运行 ",
+        "命令: ",
+        "命令：",
+        "命令 ",
+        "powershell: ",
+        "pwsh: ",
+        "bash: ",
+        "sh: ",
+        "$ ",
+        "# ",
+        "> ",
+        "ps> ",
+    ];
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for pfx in &prefixes {
+            let matches = if pfx.is_ascii() {
+                s.to_ascii_lowercase().starts_with(pfx)
+            } else {
+                s.starts_with(pfx)
+            };
+            if matches {
+                s = s[pfx.len()..].trim();
+                changed = true;
+            }
+        }
+    }
+    s.to_string()
+}
+
+/// 判定清洗后的字符串是否符合可执行命令特征，避免与纯自然语言描述混淆
+pub fn is_likely_command(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // 1. 包含典型管道符或命令串联/重定向运算符
+    if trimmed.contains(" | ")
+        || trimmed.contains(" && ")
+        || trimmed.contains(" || ")
+        || trimmed.contains(';')
+    {
+        return true;
+    }
+
+    // 2. 路径形式命令（相对路径、绝对路径或 Windows 盘符路径）
+    if trimmed.starts_with("./")
+        || trimmed.starts_with(".\\")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with("..\\")
+        || trimmed.starts_with('/')
+    {
+        return true;
+    }
+    if trimmed.len() >= 3
+        && trimmed.as_bytes()[1] == b':'
+        && (trimmed.as_bytes()[2] == b'\\' || trimmed.as_bytes()[2] == b'/')
+    {
+        return true;
+    }
+
+    // 排除含有明显自然语言连词或英语叙述结构的短语（如 "Run git tag and git push", "git pull and build", "git tag to origin"）
+    // 避免因为以 "git", "npm", "cargo" 等开头就将复合英文描述误判为单一合法命令
+    let lower_trimmed = trimmed.to_ascii_lowercase();
+    for conjunction in &[
+        " and ",
+        " then ",
+        " but ",
+        " to origin",
+        " to main",
+        " to master",
+    ] {
+        if lower_trimmed.contains(conjunction) {
+            return false;
+        }
+    }
+
+    let first_token = trimmed.split_whitespace().next().unwrap_or("");
+    let first_token_lower = first_token.to_ascii_lowercase();
+
+    // 3. PowerShell 标准动宾 Cmdlet (如 Get-Process, Set-Item, New-Item, Test-Path, Invoke-RestMethod)
+    if first_token.contains('-') {
+        let parts: Vec<&str> = first_token.split('-').collect();
+        if parts.len() == 2
+            && parts[0].chars().all(|c| c.is_alphabetic())
+            && parts[1].chars().all(|c| c.is_alphanumeric())
+        {
+            return true;
+        }
+    }
+
+    // 4. 常见 CLI 工具与内置 Shell 命令库
+    const KNOWN_COMMANDS: &[&str] = &[
+        "git",
+        "ls",
+        "dir",
+        "cd",
+        "cat",
+        "cargo",
+        "npm",
+        "npx",
+        "pnpm",
+        "yarn",
+        "bun",
+        "deno",
+        "node",
+        "python",
+        "python3",
+        "py",
+        "pip",
+        "pip3",
+        "go",
+        "rustc",
+        "make",
+        "cmake",
+        "dotnet",
+        "mvn",
+        "gradle",
+        "docker",
+        "docker-compose",
+        "podman",
+        "kubectl",
+        "helm",
+        "find",
+        "grep",
+        "rg",
+        "sed",
+        "awk",
+        "curl",
+        "wget",
+        "tar",
+        "zip",
+        "unzip",
+        "gzip",
+        "ps",
+        "kill",
+        "killall",
+        "chmod",
+        "chown",
+        "mkdir",
+        "rm",
+        "rmdir",
+        "cp",
+        "mv",
+        "touch",
+        "echo",
+        "which",
+        "where",
+        "head",
+        "tail",
+        "more",
+        "less",
+        "clear",
+        "cls",
+        "powershell",
+        "pwsh",
+        "cmd",
+        "wsl",
+        "ssh",
+        "scp",
+        "sudo",
+        "apt",
+        "yum",
+        "brew",
+        "env",
+        "export",
+        "type",
+        "tasklist",
+        "taskkill",
+        "ipconfig",
+        "ifconfig",
+        "ping",
+        "netstat",
+        "whoami",
+        "attrib",
+        "tree",
+        "start",
+        "gci",
+        "gc",
+        "sc",
+        "gps",
+        "saps",
+        "iex",
+        "irm",
+        "iwr",
+    ];
+
+    if KNOWN_COMMANDS.contains(&first_token_lower.as_str()) {
+        return true;
+    }
+
+    // 5. 常见可执行脚本后缀
+    if first_token_lower.ends_with(".exe")
+        || first_token_lower.ends_with(".bat")
+        || first_token_lower.ends_with(".cmd")
+        || first_token_lower.ends_with(".ps1")
+        || first_token_lower.ends_with(".sh")
+        || first_token_lower.ends_with(".py")
+    {
+        return true;
+    }
+
+    // 6. 第二个 token 是典型命令行参数标志 (-f, --help 等)
+    if let Some(second_token) = trimmed.split_whitespace().nth(1) {
+        if second_token.starts_with('-') && !second_token.chars().all(|c| c.is_numeric()) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// 标准化并清洗 shell / PowerShell / DSH (DeepSeek Harness) 等工具参数
 /// 1. 将 cmd / code / script / shell_command / input 等别名重命名为 command
-/// 2. [Issue #3430] 若仍缺失 command，利用 description 或默认信息填充安全无害的占位命令，
-///    既防止下游客户端（如 WorkBuddy PowerShell/Bash 执行器）抛出 Cannot read properties of undefined (reading 'split') 崩溃，
-///    又带有明确的 [OK] 语义，防止模型在未达预期的循环中重复漏参重试导致死锁。
+/// 2. [DSH tool-pwsh / tool-bash & WorkBuddy]：
+///    - DSH 严格校验 `command` (string) 和 `description` (string) 两个字段必须都存在且非空。
+///    - 若模型将实际命令写在 description / text / prompt 中，且 command 缺失，则优先提取恢复为真实 command。
+///    - 若 command 存在但缺失 description，则基于 command 自动推导截取生成 description。
+///    - 若两者皆无，则填充安全占位命令并保证 description 完整，防止客户端崩溃 (Issue #3430 & #3440)。
+/// 3. [DSH tool-workflow]：
+///    - DSH 严格校验 `script` (string) 和 `meta` (object with `name` and `description`)。
+///    - 若模型返回扁平结构的 `name` / `description`，自动归拢装配进 `meta` 对象中，确保运行期校验通过。
 pub fn normalize_and_sanitize_tool_args(tool_name: &str, args: &mut Value) {
+    if is_workflow_tool(tool_name) {
+        if let Some(obj) = args.as_object_mut() {
+            // 1. 规范化 script 字段
+            if !obj.contains_key("script") {
+                for alt in &["code", "content", "command", "workflow", "body"] {
+                    if let Some(val) = obj.remove(*alt) {
+                        obj.insert("script".to_string(), val);
+                        break;
+                    }
+                }
+            }
+            // 若 script 为空或缺失，给一个合法的默认占位脚本
+            let script_empty = match obj.get("script") {
+                None => true,
+                Some(v) => v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false),
+            };
+            if script_empty {
+                obj.insert(
+                    "script".to_string(),
+                    Value::String("// Workflow action logged\nreturn true;".to_string()),
+                );
+            }
+
+            // 2. 规范化 meta 字段: { name: string, description: string }
+            let mut meta_obj = match obj.remove("meta") {
+                Some(Value::Object(m)) => m,
+                _ => serde_json::Map::new(),
+            };
+
+            // 从顶层回捞可能被打平的 name 和 description
+            if !meta_obj.contains_key("name") {
+                if let Some(top_name) = obj.remove("name") {
+                    meta_obj.insert("name".to_string(), top_name);
+                } else {
+                    meta_obj.insert(
+                        "name".to_string(),
+                        Value::String("dsh_workflow_task".to_string()),
+                    );
+                }
+            }
+            if !meta_obj.contains_key("description") {
+                if let Some(top_desc) = obj.remove("description") {
+                    meta_obj.insert("description".to_string(), top_desc);
+                } else {
+                    let desc = obj
+                        .get("script")
+                        .and_then(|v| v.as_str())
+                        .map(|s| {
+                            let first_line = s.lines().next().unwrap_or("Execute workflow");
+                            let clean = first_line.trim().trim_start_matches("//").trim();
+                            if clean.is_empty() {
+                                "Execute workflow script"
+                            } else {
+                                clean
+                            }
+                        })
+                        .unwrap_or("Execute workflow script");
+                    meta_obj.insert("description".to_string(), Value::String(desc.to_string()));
+                }
+            }
+
+            obj.insert("meta".to_string(), Value::Object(meta_obj));
+        }
+        return;
+    }
+
     if !is_shell_or_terminal_tool(tool_name) {
         return;
     }
 
     if let Some(obj) = args.as_object_mut() {
-        // 1. 别名归一化
+        // 1. 别名归一化至 command
         if !obj.contains_key("command") {
             for alt_key in &["cmd", "code", "script", "shell_command", "input"] {
                 if let Some(val) = obj.remove(*alt_key) {
@@ -44,38 +376,85 @@ pub fn normalize_and_sanitize_tool_args(tool_name: &str, args: &mut Value) {
             }
         }
 
-        // 2. 兜底保护：如果仍缺失 command 或 command 为空字符串
-        let needs_fallback = match obj.get("command") {
+        // 2. 检查 command 是否缺失或为空
+        let command_missing = match obj.get("command") {
             None => true,
             Some(v) => v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false),
         };
 
-        if needs_fallback {
-            let desc_owned: String = obj
+        if command_missing {
+            // 尝试查看模型是否把真实命令直接写在了 description 里
+            let raw_desc = obj
                 .get("description")
                 .and_then(|v| v.as_str())
-                .unwrap_or("Action logged")
+                .unwrap_or("")
+                .trim()
                 .to_string();
 
-            // 过滤危险字符，保留字母、数字、中文及常见标点，构造安全 echo 命令
-            let safe_desc: String = desc_owned
-                .chars()
-                .filter(|c| c.is_alphanumeric() || " _-:.,/".contains(*c))
-                .collect();
-            let trimmed = safe_desc.trim();
-            let safe_title = if trimmed.is_empty() {
-                "Action logged"
-            } else {
-                trimmed
-            };
+            let candidate_str = strip_markdown_and_action_prefixes(&raw_desc);
 
-            let fallback_cmd = format!("echo \"[OK: Action logged - {}]\"", safe_title);
-            obj.insert("command".to_string(), Value::String(fallback_cmd));
-            tracing::warn!(
-                tool = %tool_name,
-                description = %desc_owned,
-                "Injected safe fallback 'command' into tool call arguments to prevent downstream client crash (Issue #3430)"
-            );
+            if is_likely_command(&candidate_str) {
+                obj.insert("command".to_string(), Value::String(candidate_str));
+            } else {
+                let desc_for_log = if candidate_str.is_empty() {
+                    "Action required"
+                } else {
+                    candidate_str.as_str()
+                };
+
+                let safe_desc: String = desc_for_log
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || " _-:.,/".contains(*c))
+                    .collect();
+                let trimmed = safe_desc.trim();
+                let safe_title = if trimmed.is_empty() {
+                    "Action required"
+                } else {
+                    trimmed
+                };
+
+                let fallback_cmd = if tool_name.eq_ignore_ascii_case("cmd") {
+                    format!(
+                        "echo Error: No executable command provided in tool call - {} & exit /b 1",
+                        safe_title
+                    )
+                } else {
+                    format!(
+                        "echo \"[Error: No command provided - {}]\" >&2; exit 1",
+                        safe_title
+                    )
+                };
+                obj.insert("command".to_string(), Value::String(fallback_cmd));
+                tracing::warn!(
+                    tool = %tool_name,
+                    description = %raw_desc,
+                    "Injected non-zero error fallback 'command' into tool call arguments to trigger agent self-recovery (Issue #3430)"
+                );
+            }
+        }
+
+        // 3. [Issue #3440] DSH (DeepSeek Harness) 强依赖 `description` 字段（必填 string）。
+        //    如果缺失 description，必须从 command 生成简要描述，防止 DSH 抛出 description is required 崩溃。
+        let desc_missing = match obj.get("description") {
+            None => true,
+            Some(v) => v.as_str().map(|s| s.trim().is_empty()).unwrap_or(false),
+        };
+
+        if desc_missing {
+            let cmd_str = obj
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Execute shell command")
+                .trim();
+            // 取命令的前 60 字符作为简要描述 (Issue #3493: 保证 UTF-8 字符边界安全，杜绝多字节截断 Panic)
+            let auto_desc = if cmd_str.chars().nth(60).is_some() {
+                format!("Run: {}...", safe_truncate_chars(cmd_str, 57))
+            } else if !cmd_str.is_empty() {
+                format!("Run: {}", cmd_str)
+            } else {
+                "Execute command".to_string()
+            };
+            obj.insert("description".to_string(), Value::String(auto_desc));
         }
     }
 }
@@ -234,6 +613,15 @@ pub fn transform_openai_response(
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| format!("{}-{}", final_name, uuid::Uuid::new_v4()));
 
+                        if let Some(sig) = part
+                            .get("thoughtSignature")
+                            .or(part.get("thought_signature"))
+                            .and_then(|s| s.as_str())
+                        {
+                            crate::proxy::SignatureCache::global()
+                                .cache_tool_signature(&id, sig.to_string());
+                        }
+
                         tool_calls.push(ToolCall {
                             id,
                             r#type: "function".to_string(),
@@ -241,6 +629,7 @@ pub fn transform_openai_response(
                                 name: final_name.to_string(),
                                 arguments: arguments_str,
                             }),
+                            signature: None,
                             status: None,
                             call_id: None,
                             operation: None,
@@ -289,6 +678,9 @@ pub fn transform_openai_response(
                             ));
                         }
                     }
+                }
+                if let Some(sid) = session_id {
+                    crate::proxy::thinking_store::capture_gemini_parts(sid, parts);
                 }
             }
 
@@ -387,6 +779,7 @@ pub fn transform_openai_response(
                     } else {
                         Some(thought_out)
                     },
+                    signature: None,
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {
@@ -415,6 +808,7 @@ pub fn transform_openai_response(
                     role: "assistant".to_string(),
                     content: None,
                     reasoning_content: None,
+                    signature: None,
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -428,66 +822,15 @@ pub fn transform_openai_response(
     // Extract and map usage metadata from Gemini to OpenAI format
     // Supports both legacy v1internal format (promptTokenCount/candidatesTokenCount/totalTokenCount/cachedContentTokenCount)
     // and new Interactions API format (total_input_tokens/total_output_tokens/total_thought_tokens/total_cached_tokens)
-    let usage = raw.get("usageMetadata").and_then(|u| {
-        // 优先使用新格式字段，fallback 到旧格式
-        let prompt_tokens = u
-            .get("total_input_tokens")
-            .or_else(|| u.get("promptTokenCount"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let raw_output_tokens = u
-            .get("total_output_tokens")
-            .or_else(|| u.get("candidatesTokenCount"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let raw_total_tokens = u
-            .get("total_tokens")
-            .or_else(|| u.get("totalTokenCount"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let cached_tokens = u
-            .get("total_cached_tokens")
-            .or_else(|| u.get("cachedContentTokenCount"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        // [NEW] 从新格式提取 reasoning/thought tokens
-        let reasoning_tokens = u
-            .get("total_thought_tokens")
-            .or_else(|| u.get("totalThoughtTokens"))
-            .or_else(|| u.get("thoughtsTokenCount"))
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let tool_use_tokens = u
+    let usage = raw.get("usageMetadata").map(|u| {
+        let canonical = crate::proxy::pipeline::CanonicalUsage::from_gemini(u);
+        let mut usage = super::models::OpenAIUsage::from(&canonical);
+        usage.input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
+        usage.total_tool_use_tokens = u
             .get("total_tool_use_tokens")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
-        let input_tokens_by_modality = u.get("input_tokens_by_modality").cloned();
-
-        // 输出计数统一包含思考，并兼容旧上游已合并思考计数的格式。
-        let completion_tokens = crate::proxy::mappers::usage::gemini_output_tokens(u).unwrap_or(0);
-
-        // Keep prompt_tokens as Gemini's raw input token count. cached_tokens is a
-        // subset of the prompt, not an amount to subtract from it.
-        let final_total_tokens = prompt_tokens.saturating_add(completion_tokens);
-
-        Some(super::models::OpenAIUsage {
-            prompt_tokens,
-            completion_tokens,
-            total_tokens: final_total_tokens,
-            prompt_tokens_details: cached_tokens.map(|ct| super::models::PromptTokensDetails {
-                cached_tokens: Some(ct),
-            }),
-            completion_tokens_details: reasoning_tokens.map(|rt| {
-                super::models::CompletionTokensDetails {
-                    reasoning_tokens: Some(rt),
-                }
-            }),
-            input_tokens_by_modality,
-            raw_output_tokens: Some(raw_output_tokens),
-            total_thought_tokens: reasoning_tokens,
-            total_tool_use_tokens: tool_use_tokens,
-            gemini_total_tokens: raw_total_tokens,
-        })
+        usage
     });
 
     OpenAIResponse {
@@ -649,7 +992,7 @@ mod tests {
         normalize_and_sanitize_tool_args("PowerShell", &mut args);
         assert_eq!(
             args["command"],
-            "echo \"[OK: Action logged - 列出目录内容]\""
+            "echo \"[Error: No command provided - 列出目录内容]\" >&2; exit 1"
         );
         assert_eq!(args["description"], "列出目录内容");
     }
@@ -663,7 +1006,7 @@ mod tests {
         normalize_and_sanitize_tool_args("Bash", &mut args);
         assert_eq!(
             args["command"],
-            "echo \"[OK: Action logged - Fetch status]\""
+            "echo \"[Error: No command provided - Fetch status]\" >&2; exit 1"
         );
     }
 
@@ -704,7 +1047,142 @@ mod tests {
             serde_json::from_str(&tool_calls[0].function.as_ref().unwrap().arguments).unwrap();
         assert_eq!(
             parsed_args["command"],
-            "echo \"[OK: Action logged - 查看当前系统信息]\""
+            "echo \"[Error: No command provided - 查看当前系统信息]\" >&2; exit 1"
         );
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_dsh_pwsh_missing_description() {
+        // [Issue #3440] DSH tool-pwsh requires both command AND description
+        let mut args = json!({
+            "command": "Get-ChildItem -Path ./src -Recurse | Select-Object -First 10"
+        });
+        normalize_and_sanitize_tool_args("pwsh", &mut args);
+        assert_eq!(
+            args["command"],
+            "Get-ChildItem -Path ./src -Recurse | Select-Object -First 10"
+        );
+        assert!(args.get("description").is_some());
+        assert!(args["description"].as_str().unwrap().starts_with("Run: "));
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_dsh_pwsh_command_in_description() {
+        // [Issue #3440] Gemini puts actual command inside description
+        let mut args = json!({
+            "description": "git status -s"
+        });
+        normalize_and_sanitize_tool_args("pwsh", &mut args);
+        assert_eq!(args["command"], "git status -s");
+        assert_eq!(args["description"], "git status -s");
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_command_with_action_prefixes() {
+        let test_cases = [
+            ("Run: git diff", "git diff"),
+            ("Run git status", "git status"),
+            ("Execute: cargo check", "cargo check"),
+            ("执行: cargo test", "cargo test"),
+            ("运行: npm run build", "npm run build"),
+            ("powershell: Get-Process", "Get-Process"),
+            ("```bash\ngit log -n 5\n```", "git log -n 5"),
+            ("`docker ps -a`", "docker ps -a"),
+            ("$ ./deploy.sh --prod", "./deploy.sh --prod"),
+        ];
+
+        for (input_desc, expected_cmd) in test_cases {
+            let mut args = json!({ "description": input_desc });
+            normalize_and_sanitize_tool_args("bash", &mut args);
+            assert_eq!(
+                args["command"], expected_cmd,
+                "Failed to extract command from '{}'",
+                input_desc
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_likely_command_excludes_natural_language_conjunctions() {
+        // 自然语言动作描述（含 and, then, but, to origin 等），即使以 git/cargo 开头也不应被误判为合法命令
+        assert!(!is_likely_command("git tag and git push"));
+        assert!(!is_likely_command("git pull and build"));
+        assert!(!is_likely_command("git push to origin"));
+        assert!(!is_likely_command("cargo build then test"));
+
+        // 真实合法命令保持正常识别
+        assert!(is_likely_command("git tag -a v1.0"));
+        assert!(is_likely_command("git push origin main"));
+        assert!(is_likely_command("cargo check --workspace"));
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_dsh_workflow_flattened() {
+        // [Issue #3440] DSH tool-workflow requires script and meta: { name, description }
+        let mut args = json!({
+            "script": "console.log('running test');",
+            "name": "run_test",
+            "description": "Run unit test suite"
+        });
+        normalize_and_sanitize_tool_args("workflow", &mut args);
+        assert_eq!(args["script"], "console.log('running test');");
+        assert!(args.get("meta").is_some());
+        assert_eq!(args["meta"]["name"], "run_test");
+        assert_eq!(args["meta"]["description"], "Run unit test suite");
+        assert!(!args.as_object().unwrap().contains_key("name"));
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_dsh_workflow_missing_meta() {
+        let mut args = json!({
+            "code": "// Auto workflow\nreturn 42;"
+        });
+        normalize_and_sanitize_tool_args("workflow", &mut args);
+        assert_eq!(args["script"], "// Auto workflow\nreturn 42;");
+        assert_eq!(args["meta"]["name"], "dsh_workflow_task");
+        assert_eq!(args["meta"]["description"], "Auto workflow");
+    }
+
+    #[test]
+    fn test_normalize_and_sanitize_tool_args_utf8_char_boundary_issue_3493() {
+        // [Issue #3493] 验证第 57 字节落在 3 字节中文字符内部时不会发生切片 Panic
+        // 构造：55 字节 ASCII + "区域划分测试" ('区' 占用字节 55..58，第 57 字节正好落在 '区' 中间)
+        let prefix = "a".repeat(55);
+        let command_with_chinese = format!("{}区域划分测试", prefix);
+        assert!(!command_with_chinese.is_char_boundary(57));
+
+        let mut args = json!({
+            "command": command_with_chinese
+        });
+
+        // 在 issue 修复前，此处会直接 panic:
+        // "end byte index 57 is not a char boundary; it is inside '区' (bytes 55..58 of string)"
+        normalize_and_sanitize_tool_args("shell", &mut args);
+
+        let desc = args["description"]
+            .as_str()
+            .expect("description should exist");
+        assert!(desc.starts_with("Run: "));
+        assert!(desc.ends_with("..."));
+
+        // 验证超长纯中文命令
+        let chinese_cmd = "这是一个包含很多中文字符的超长测试命令用于验证UTF8字符边界截断绝对安全不会发生任何恐慌";
+        let mut args_chinese = json!({
+            "command": chinese_cmd
+        });
+        normalize_and_sanitize_tool_args("shell", &mut args_chinese);
+        let desc_chinese = args_chinese["description"].as_str().unwrap();
+        assert!(desc_chinese.starts_with("Run: "));
+        assert!(desc_chinese.ends_with("..."));
+
+        // 验证 Emoji 命令 (4 字节字符)
+        let emoji_cmd = "echo 🦀🎉🚀🐱🐶🐼🦊🐰🐯🦁🐮🐷🐸🐵🐔🐧🐦🐤🐣🐺🐗🐴🦄🐝🐛🦋🐌🐞🐜🪲🪳🦟🦗🕷️";
+        let mut args_emoji = json!({
+            "command": emoji_cmd
+        });
+        normalize_and_sanitize_tool_args("shell", &mut args_emoji);
+        let desc_emoji = args_emoji["description"].as_str().unwrap();
+        assert!(desc_emoji.starts_with("Run: "));
+        assert!(desc_emoji.ends_with("..."));
     }
 }

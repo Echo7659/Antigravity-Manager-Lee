@@ -27,8 +27,22 @@ pub struct ProxyServiceState {
 
 pub struct AdminServerInstance {
     pub axum_server: crate::proxy::AxumServer,
-    #[allow(dead_code)] // 保留句柄以便未来支持显式停服/诊断
     pub server_handle: tokio::task::JoinHandle<()>,
+}
+
+impl AdminServerInstance {
+    /// 优雅停止管理服务器并等待监听任务退出释放端口
+    pub async fn stop(mut self) {
+        self.axum_server.stop();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(1000),
+            &mut self.server_handle,
+        )
+        .await;
+        if !self.server_handle.is_finished() {
+            self.server_handle.abort();
+        }
+    }
 }
 
 /// 反代服务实例
@@ -57,13 +71,26 @@ pub async fn start_proxy_service(
     cf_state: State<'_, crate::commands::cloudflared::CloudflaredState>,
     app_handle: tauri::AppHandle,
 ) -> Result<ProxyStatus, String> {
-    internal_start_proxy_service(
+    let result = internal_start_proxy_service(
         config,
         &state,
         crate::modules::integration::SystemManager::Desktop(app_handle),
         Arc::new(cf_state.inner().clone()),
     )
-    .await
+    .await?;
+
+    // [FIX desktop] 对齐 Web/Docker admin_start_proxy_service (#1166):
+    // 持久化 auto_start = true，确保重启后自动拉起反代服务
+    if let Ok(mut app_config) = crate::modules::config::load_app_config() {
+        app_config.proxy.auto_start = true;
+        if let Err(e) = crate::modules::config::save_app_config(&app_config) {
+            tracing::warn!("[Desktop] Failed to persist auto_start=true: {}", e);
+        } else {
+            tracing::info!("[Desktop] Persisted auto_start=true to gui_config.json");
+        }
+    }
+
+    Ok(result)
 }
 
 struct StartingGuard(Arc<AtomicBool>);
@@ -221,6 +248,18 @@ pub async fn ensure_admin_server(
         return Ok(());
     }
 
+    crate::proxy::config::update_global_audit_config(
+        config.experimental.payload_storage_mode.clone(),
+        config.experimental.log_retention_days,
+        config.experimental.thinking_store_enabled,
+        config.experimental.thinking_retention_days,
+        Some(config.experimental.thinking_max_memory_turns),
+    );
+    crate::proxy::config::update_global_compression_level(
+        config.experimental.compression_level.clone(),
+        config.experimental.enable_usage_scaling,
+    );
+
     // Ensure monitor exists
     let monitor = {
         let mut monitor_lock = state.monitor.write().await;
@@ -283,6 +322,13 @@ pub async fn ensure_admin_server(
         config.experimental.compression_level.clone(),
         config.experimental.enable_usage_scaling,
     );
+    crate::proxy::config::update_global_audit_config(
+        config.experimental.payload_storage_mode.clone(),
+        config.experimental.log_retention_days,
+        config.experimental.thinking_store_enabled,
+        config.experimental.thinking_retention_days,
+        Some(config.experimental.thinking_max_memory_turns),
+    );
 
     Ok(())
 }
@@ -301,6 +347,17 @@ pub async fn stop_proxy_service(state: State<'_, ProxyServiceState>) -> Result<(
         instance.token_manager.abort_background_tasks().await;
         instance.axum_server.set_running(false).await;
         // 已移除 instance.axum_server.stop() 调用，防止杀死 Admin Server
+    }
+
+    // [FIX desktop] 对齐 Web/Docker admin_stop_proxy_service (#1166):
+    // 持久化 auto_start = false，确保重启后不会自动拉起反代服务
+    if let Ok(mut app_config) = crate::modules::config::load_app_config() {
+        app_config.proxy.auto_start = false;
+        if let Err(e) = crate::modules::config::save_app_config(&app_config) {
+            tracing::warn!("[Desktop] Failed to persist auto_start=false: {}", e);
+        } else {
+            tracing::info!("[Desktop] Persisted auto_start=false to gui_config.json");
+        }
     }
 
     Ok(())
@@ -393,8 +450,29 @@ pub async fn clear_proxy_logs(state: State<'_, ProxyServiceState>) -> Result<(),
     let monitor_lock = state.monitor.read().await;
     if let Some(monitor) = monitor_lock.as_ref() {
         monitor.clear().await;
+    } else {
+        tokio::task::spawn_blocking(|| {
+            if let Err(e) = crate::modules::proxy_db::clear_logs() {
+                tracing::error!("Failed to clear logs in DB: {}", e);
+            }
+        })
+        .await
+        .map_err(|e| format!("Spawn blocking failed: {}", e))?;
     }
     Ok(())
+}
+
+/// 清空所有思考块缓存与持久化数据 (包含 RAM 内存滑动窗口与 SQLite 数据库，但不删除任何请求日志)
+#[tauri::command]
+pub async fn clear_thinking_store() -> Result<usize, String> {
+    // 1. 清空内存中 ThinkingStore 实例与 SignatureCache
+    crate::proxy::thinking_store::ThinkingStore::global().clear();
+    crate::proxy::SignatureCache::global().clear();
+
+    // 2. 清空 SQLite 数据库中所有的 thinking_records 与 thinking_sessions
+    tokio::task::spawn_blocking(crate::modules::proxy_db::clear_all_thinking_data)
+        .await
+        .map_err(|e| format!("Spawn blocking failed: {}", e))?
 }
 
 /// 获取反代请求日志 (分页)
@@ -408,8 +486,14 @@ pub async fn get_proxy_logs_paginated(
 
 /// 获取单条日志的完整详情
 #[tauri::command]
-pub async fn get_proxy_log_detail(log_id: String) -> Result<ProxyRequestLog, String> {
-    crate::modules::proxy_db::get_log_detail(&log_id)
+pub async fn get_proxy_log_detail(
+    log_id: Option<String>,
+    #[allow(non_snake_case)] logId: Option<String>,
+) -> Result<ProxyRequestLog, String> {
+    let id = log_id
+        .or(logId)
+        .ok_or_else(|| "Missing log_id parameter".to_string())?;
+    crate::modules::proxy_db::get_log_detail(&id)
 }
 
 /// 获取日志总数
@@ -623,11 +707,7 @@ pub async fn fetch_zai_models(
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
     if !status.is_success() {
-        let preview = if text.len() > 4000 {
-            &text[..4000]
-        } else {
-            &text
-        };
+        let preview = crate::proxy::mappers::common_utils::safe_truncate_str(&text, 4000);
         return Err(format!("Upstream returned {}: {}", status, preview));
     }
 
@@ -797,4 +877,10 @@ pub async fn get_proxy_pool_config(
     } else {
         Err("服务未运行".to_string())
     }
+}
+
+/// 获取日志数据库占用的磁盘大小 (字节)
+#[tauri::command]
+pub async fn get_proxy_db_disk_size() -> Result<u64, String> {
+    crate::modules::proxy_db::get_proxy_db_disk_bytes()
 }

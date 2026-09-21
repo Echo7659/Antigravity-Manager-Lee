@@ -453,6 +453,31 @@ pub fn run() {
             // Initialize log bridge with app handle for debug console
             modules::log_bridge::init_log_bridge(app.handle().clone());
 
+            // 为主窗口显式设置应用图标（强制触发 Win32 WM_SETICON，防止透明/覆盖标题栏窗口在任务栏丢失图标）
+            if let Some(window) = app.get_webview_window("main") {
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let icon_bytes: &[u8] = include_bytes!("../icons/icon.png");
+                    if let Ok(img) = image::load_from_memory(icon_bytes) {
+                        let rgba = img.to_rgba8();
+                        let (width, height) = rgba.dimensions();
+                        let _ = window.set_icon(tauri::image::Image::new_owned(
+                            rgba.into_raw(),
+                            width,
+                            height,
+                        ));
+                    }
+                }
+            }
+
+            // Windows: 异步原生自愈桌面与开始菜单历史快捷方式图标缺失，并刷新外壳（零子进程，不调用 powershell）
+            #[cfg(target_os = "windows")]
+            {
+                std::thread::spawn(|| {
+                    crate::utils::win_shortcut::heal_shortcuts_native();
+                });
+            }
+
             // Linux: Workaround for transparent window crash/freeze
             // The transparent window feature is unstable on Linux with WebKitGTK
             // We disable the visual alpha channel to prevent softbuffer-related crashes
@@ -595,6 +620,7 @@ pub fn run() {
             commands::refresh_all_quotas,
             // Config commands
             commands::load_config,
+            commands::get_config,
             commands::save_config,
             // Additional commands
             commands::prepare_oauth_url,
@@ -616,6 +642,8 @@ pub fn run() {
             commands::get_antigravity_cache_paths,
             commands::open_data_folder,
             commands::get_data_dir_path,
+            commands::set_data_dir,
+            commands::migrate_data_dir,
             commands::show_main_window,
             commands::set_window_theme,
             commands::get_antigravity_path,
@@ -645,6 +673,8 @@ pub fn run() {
             commands::proxy::get_proxy_logs_filtered,
             commands::proxy::set_proxy_monitor_enabled,
             commands::proxy::clear_proxy_logs,
+            commands::proxy::clear_thinking_store,
+            commands::proxy::get_proxy_db_disk_size,
             commands::proxy::generate_api_key,
             commands::proxy::reload_proxy_accounts,
             commands::proxy::update_model_mapping,
@@ -658,7 +688,6 @@ pub fn run() {
             commands::proxy::get_preferred_account,
             commands::proxy::clear_proxy_rate_limit,
             commands::proxy::clear_all_proxy_rate_limits,
-            commands::proxy::check_proxy_health,
             // Proxy Pool Binding commands
             commands::proxy_pool::bind_account_proxy,
             commands::proxy_pool::unbind_account_proxy,
@@ -690,9 +719,11 @@ pub fn run() {
             proxy::cli_sync::execute_cli_restore,
             proxy::cli_sync::get_cli_config_content,
             proxy::opencode_sync::get_opencode_sync_status,
+            proxy::opencode_sync::get_opencode_providers,
             proxy::opencode_sync::get_canonical_families,
             proxy::opencode_sync::execute_opencode_sync,
             proxy::opencode_sync::execute_opencode_openai_sync,
+            proxy::opencode_sync::execute_opencode_remove_provider,
             proxy::opencode_sync::execute_opencode_restore,
             proxy::opencode_sync::get_opencode_config_content,
             proxy::opencode_sync::execute_opencode_clear,
@@ -745,33 +776,35 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             match event {
-                // Handle app exit - cleanup background tasks
+                // Handle app exit - cleanup background tasks and release ports
                 tauri::RunEvent::Exit => {
-                    tracing::info!("Application exiting, cleaning up background tasks...");
+                    tracing::info!("Application exiting, cleaning up background tasks and releasing ports...");
                     if let Some(state) =
                         app_handle.try_state::<crate::commands::proxy::ProxyServiceState>()
                     {
+                        let cf_state = app_handle.try_state::<crate::commands::cloudflared::CloudflaredState>();
                         tauri::async_runtime::block_on(async {
-                            // Use timeout-based read() instead of try_read() to handle lock contention
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(3),
-                                state.instance.read(),
-                            )
-                            .await
-                            {
-                                Ok(guard) => {
-                                    if let Some(instance) = guard.as_ref() {
-                                        // Use graceful_shutdown with 2s timeout for task cleanup
-                                        instance
-                                            .token_manager
-                                            .graceful_shutdown(std::time::Duration::from_secs(2))
-                                            .await;
-                                    }
+                            // 1. 停止 cloudflared 隧道
+                            if let Some(cf) = cf_state {
+                                let _ = tokio::time::timeout(std::time::Duration::from_millis(500), cf.stop()).await;
+                            }
+
+                            // 2. 停止 Admin Server（释放 TCP 监听器和 Socket）
+                            if let Ok(mut lock) = tokio::time::timeout(std::time::Duration::from_millis(1000), state.admin_server.write()).await {
+                                if let Some(admin) = lock.take() {
+                                    admin.stop().await;
                                 }
-                                Err(_) => {
-                                    tracing::warn!(
-                                        "Lock acquisition timed out after 3s, forcing exit"
-                                    );
+                            }
+
+                            // 3. 停止业务代理实例及后台任务
+                            if let Ok(mut lock) = tokio::time::timeout(std::time::Duration::from_millis(1000), state.instance.write()).await {
+                                if let Some(instance) = lock.take() {
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_millis(500),
+                                        instance.token_manager.graceful_shutdown(std::time::Duration::from_millis(400)),
+                                    ).await;
+                                    instance.axum_server.set_running(false).await;
+                                    instance.axum_server.stop();
                                 }
                             }
                         });

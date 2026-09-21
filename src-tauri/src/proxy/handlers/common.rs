@@ -41,13 +41,56 @@ impl RequestRetryState {
         retry_after: Option<&str>,
         retried_without_thinking: bool,
     ) -> RetryStrategy {
+        self.determine_strategy_with_grace(
+            account_id,
+            status_code,
+            error_text,
+            retry_after,
+            retried_without_thinking,
+            true,
+        )
+    }
+
+    pub fn determine_strategy_with_grace(
+        &mut self,
+        account_id: &str,
+        status_code: u16,
+        error_text: &str,
+        retry_after: Option<&str>,
+        retried_without_thinking: bool,
+        allow_grace: bool,
+    ) -> RetryStrategy {
+        self.determine_strategy_adaptive(
+            account_id,
+            status_code,
+            error_text,
+            retry_after,
+            retried_without_thinking,
+            0,
+            if allow_grace { 1 } else { 2 },
+        )
+    }
+
+    /// [NEW] 自适应感知多账号池轮次与配额重置间隙的重试裁决器
+    pub fn determine_strategy_adaptive(
+        &mut self,
+        account_id: &str,
+        status_code: u16,
+        error_text: &str,
+        retry_after: Option<&str>,
+        retried_without_thinking: bool,
+        attempt: usize,
+        pool_size: usize,
+    ) -> RetryStrategy {
         let allow_grace_retry = !self.grace_retried_accounts.contains(account_id);
-        let strategy = determine_retry_strategy_inner(
+        let strategy = determine_retry_strategy_adaptive(
             status_code,
             error_text,
             retry_after,
             retried_without_thinking,
             allow_grace_retry,
+            attempt,
+            pool_size,
         );
         if matches!(strategy, RetryStrategy::GraceRetry(_)) {
             self.grace_retried_accounts.insert(account_id.to_string());
@@ -105,57 +148,59 @@ impl FailureStatusTracker {
     }
 }
 
+/// 自适应计算最大重试次数
+/// - 单账号 (pool_size <= 1): 允许初次请求 + 2次基于 quotaResetDelay 的退避重试 (共 3 次)，绝不 50ms 刷死
+/// - 多账号 (pool_size > 1): 保证整池账号至少能完整轮换 2 轮 (Round 1 闪电快切 + Round 2 退避小等重试)
+///   最小 4 次，上限 12 次 (既能把 2~6 个账号试满 2 轮，又防止超长等待导致客户端超时)
+pub fn calculate_max_retry_attempts(pool_size: usize) -> usize {
+    if pool_size <= 1 {
+        3
+    } else {
+        (pool_size * 2).clamp(4, 12)
+    }
+}
+
 /// 根据错误状态码和错误信息确定重试策略
 pub fn determine_retry_strategy(
     status_code: u16,
     error_text: &str,
     retried_without_thinking: bool,
 ) -> RetryStrategy {
-    if status_code == 429 {
-        let lower = error_text.to_lowercase();
-        let is_hard_quota_exhausted = lower.contains("resource_exhausted")
-            || lower.contains("quota_exhausted")
-            || lower.contains("exceeded your current quota")
-            || lower.contains("insufficient_quota");
+    determine_retry_strategy_with_grace(status_code, error_text, retried_without_thinking, true)
+}
 
-        // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
-        if is_hard_quota_exhausted {
-            return RetryStrategy::FixedDelay(Duration::from_millis(50));
-        }
-
-        return match crate::proxy::upstream::retry::parse_legacy_retry_delay(error_text) {
-            Some(delay_ms) if delay_ms > 0 && delay_ms <= 2000 => {
-                let actual_delay = delay_ms.saturating_add(100);
-                tracing::info!(
-                    "Grace Retry Triggered: Delay {}ms is within window, using same account",
-                    actual_delay
-                );
-                RetryStrategy::GraceRetry(Duration::from_millis(actual_delay))
-            }
-            Some(delay_ms) => RetryStrategy::FixedDelay(Duration::from_millis(
-                delay_ms.saturating_add(200).min(30_000),
-            )),
-            None => RetryStrategy::LinearBackoff { base_ms: 5000 },
-        };
-    }
-
-    determine_retry_strategy_inner(
+pub fn determine_retry_strategy_with_grace(
+    status_code: u16,
+    error_text: &str,
+    retried_without_thinking: bool,
+    allow_grace: bool,
+) -> RetryStrategy {
+    determine_retry_strategy_adaptive(
         status_code,
         error_text,
         None,
         retried_without_thinking,
-        true,
+        allow_grace,
+        0,
+        if allow_grace { 1 } else { 2 },
     )
 }
 
-fn determine_retry_strategy_inner(
+/// [NEW] 自适应多账号池与单账号退避裁决核心逻辑
+pub fn determine_retry_strategy_adaptive(
     status_code: u16,
     error_text: &str,
     retry_after: Option<&str>,
     retried_without_thinking: bool,
     allow_grace_retry: bool,
+    attempt: usize,
+    pool_size: usize,
 ) -> RetryStrategy {
-    // 400 signature errors must be case-insensitive and cover all Google variants.
+    // [DEFENSE] 若错误已明确为模型不存在，绝对禁止无效轮换或退避重试！
+    if is_model_not_found_error(status_code, error_text) {
+        return RetryStrategy::NoRetry;
+    }
+
     let lower = error_text.to_lowercase();
     match status_code {
         // 400 错误：仅在特定 Thinking 签名失败时重试一次
@@ -174,50 +219,111 @@ fn determine_retry_strategy_inner(
 
         // 429 限流错误
         429 => {
-            let is_hard_quota_exhausted = lower.contains("resource_exhausted")
-                || lower.contains("quota_exhausted")
-                || lower.contains("exceeded your current quota")
-                || lower.contains("insufficient_quota");
+            // 1. 优先尝试解析结构化或自然语言的重试延迟 (quotaResetDelay / Retry-After)
+            let parsed_delay = crate::proxy::upstream::retry::parse_retry_delay_with_source(
+                error_text,
+                retry_after,
+            );
 
-            // [FIX] 硬配额耗尽必须立即轮换账号，绝不走 Grace Retry
+            // 2. 真正的硬配额耗尽检测：仅当没有提供重试延迟且包含确定性枯竭关键字时判定
+            // 绝不能将普通的 RESOURCE_EXHAUSTED 状态字作为硬配额耗尽！
+            let is_hard_quota_exhausted = parsed_delay.is_none()
+                && (lower.contains("quota_exhausted")
+                    || lower.contains("exceeded your current quota")
+                    || lower.contains("insufficient_quota")
+                    || lower.contains("credits")
+                    || lower.contains("zero_quota")
+                    || lower.contains("weekly quota"));
+
             if is_hard_quota_exhausted {
                 return RetryStrategy::FixedDelay(Duration::from_millis(50));
             }
 
-            // 优先使用服务端返回的 Retry-After / quotaResetDelay
-            if let Some(parsed_delay) = crate::proxy::upstream::retry::parse_retry_delay_with_source(
-                error_text,
-                retry_after,
-            ) {
-                let delay_ms = parsed_delay.raw_ms;
-                // 短期原账号重试已使用时，立即回到现有换号逻辑
-                if crate::proxy::upstream::retry::should_grace_retry(delay_ms) {
-                    if allow_grace_retry {
-                        let actual_delay = parsed_delay.actual_wait_ms();
+            // 3. 单账号模式 (pool_size <= 1)：无法切号，等待是唯一选择
+            if pool_size <= 1 {
+                if let Some(delay) = parsed_delay {
+                    let actual_ms = delay.actual_wait_ms();
+                    if actual_ms <= 30_000 {
                         tracing::info!(
-                            "Grace Retry Triggered: Delay {}ms is within window, using same account",
-                            actual_delay
+                            "[Retry] Single account 429: quotaResetDelay detected ({}ms), applying GraceRetry",
+                            actual_ms
                         );
-                        RetryStrategy::GraceRetry(Duration::from_millis(actual_delay))
+                        return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
                     } else {
-                        RetryStrategy::FixedDelay(Duration::ZERO)
+                        return RetryStrategy::FixedDelay(Duration::from_millis(30_000));
                     }
                 } else {
-                    let actual_delay = parsed_delay.actual_wait_ms().min(30_000);
-                    RetryStrategy::FixedDelay(Duration::from_millis(actual_delay))
+                    // 没有给出明确延迟时的保底退避 (单账号等待 3s~5s，杜绝 50ms 闪电耗尽重试)
+                    let backoff_ms = (3000 * (attempt + 1) as u64).min(10_000);
+                    tracing::info!(
+                        "[Retry] Single account 429 without explicit delay: backing off {}ms",
+                        backoff_ms
+                    );
+                    return RetryStrategy::GraceRetry(Duration::from_millis(backoff_ms));
                 }
-            } else {
-                // 否则使用线性退避：起始 5s，逐步增加
-                RetryStrategy::LinearBackoff { base_ms: 5000 }
             }
+
+            // 4. 多账号模式 (pool_size > 1)
+            let is_first_round = attempt < pool_size;
+            if is_first_round {
+                // Round 1 (第一轮)：全池闪电快切，毫秒级逃逸至其他健康账号
+                tracing::info!(
+                    "[Retry] Multi-account Round 1 (attempt {}/{}): fast rotating to next account in pool (50ms)",
+                    attempt + 1, pool_size
+                );
+                return RetryStrategy::FixedDelay(Duration::from_millis(50));
+            }
+
+            // Round 2 (第二轮)：全池在第一轮已全部遭遇 429，进入智能退避与小间隙等待阶段
+            if let Some(delay) = parsed_delay {
+                let actual_ms = delay.actual_wait_ms();
+                // 遇到小间隙 (<= 5s) 时，在当前账号原地小等并重试
+                if actual_ms <= 5000 && allow_grace_retry {
+                    tracing::info!(
+                        "[Retry] Multi-account Round 2 (attempt {}): small reset gap ({}ms <= 5s), applying GraceRetry",
+                        attempt + 1, actual_ms
+                    );
+                    return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
+                }
+
+                // 延迟较大 (> 5s，如 10s 以上) 且可用账号数 > 2：优先继续闪电轮换寻找其他可能到期的账号
+                if pool_size > 2 && attempt + 1 < pool_size * 2 {
+                    tracing::info!(
+                        "[Retry] Multi-account Round 2 (attempt {}): delay is {}ms (> 5s) with pool_size > 2, fast rotating",
+                        attempt + 1, actual_ms
+                    );
+                    return RetryStrategy::FixedDelay(Duration::from_millis(50));
+                }
+
+                // 其余情况 (例如仅 2 账号或第二轮后半段)：等待该延迟 (上限 12s，防止客户端超时)
+                let capped_ms = actual_ms.min(12_000);
+                tracing::info!(
+                    "[Retry] Multi-account Round 2: waiting capped delay {}ms before retry",
+                    capped_ms
+                );
+                return RetryStrategy::FixedDelay(Duration::from_millis(capped_ms));
+            }
+
+            // 第二轮未解析出具体 delay：线性温和退避 2s~4s，让瞬时并发高峰平息
+            let backoff_ms = (2000 * ((attempt.saturating_sub(pool_size)) + 1) as u64).min(5000);
+            RetryStrategy::FixedDelay(Duration::from_millis(backoff_ms))
         }
 
         // 503 服务不可用 / 529 服务器过载
         503 | 529 => {
-            // 指数退避：起始 10s，上限 60s (针对 Google 边缘节点过载)
-            RetryStrategy::ExponentialBackoff {
-                base_ms: 10000,
-                max_ms: 60000,
+            if pool_size > 1 && attempt < pool_size {
+                // 多账号第一轮遭遇 503/529: 快速切向其他健康账号 (50ms)
+                tracing::info!(
+                    "[Retry] 503/529 detected in multi-account pool (attempt {}/{}): fast escaping to other accounts",
+                    attempt + 1, pool_size
+                );
+                RetryStrategy::FixedDelay(Duration::from_millis(50))
+            } else {
+                // 单账号或已遍历全池: 指数退避 (起始 5s，上限 30s)
+                RetryStrategy::ExponentialBackoff {
+                    base_ms: 5000,
+                    max_ms: 30000,
+                }
             }
         }
 
@@ -290,8 +396,7 @@ mod tests {
                 retry_same_account = false;
                 sends.push(attempt);
                 let account_id = format!("account-{}", attempt);
-                let strategy =
-                    state.determine_strategy(&account_id, 429, body, None, false);
+                let strategy = state.determine_strategy(&account_id, 429, body, None, false);
                 if matches!(strategy, RetryStrategy::GraceRetry(_)) {
                     assert!(!should_rotate_account(429, Some(&strategy)));
                     retry_same_account = true;
@@ -418,9 +523,8 @@ pub fn should_rotate_account(status_code: u16, strategy: Option<&RetryStrategy>)
 
     match status_code {
         // 这些错误是账号级别或特定节点配额的，需要轮换
-        429 | 401 | 403 | 404 | 500 => true,
-        // 503/529 通常是后端过载，切号效果有限，暂不轮换
-        503 | 529 => false,
+        // [FIX #3485] 503/529 边缘节点熔断或特定账号负载过高，多账号时支持轮换逃逸，杜绝死锁死等
+        429 | 401 | 403 | 404 | 500 | 503 | 529 => true,
         _ => false,
     }
 }
@@ -516,6 +620,138 @@ pub fn build_token_error_headers<'a>(
     headers
 }
 
+/// 判断是否为模型不存在/不支持的错误
+pub fn is_model_not_found_error(status: u16, body: &str) -> bool {
+    if status == 404 {
+        return true;
+    }
+    let lower = body.to_lowercase();
+    lower.contains("model not found")
+        || lower.contains("unknown model")
+        || lower.contains("does not exist")
+        || lower.contains("is not found")
+        || lower.contains("unsupported model")
+        || lower.contains("not found for api version")
+        || lower.contains("publisher model")
+        || lower.contains("model_not_found")
+        || lower.contains("no such model")
+        || lower.contains("invalid model")
+        || lower.contains("model is not available")
+}
+
+/// 格式化双轨制错误报文（包含原生 upstream_error 与网关诊断 gateway_error）
+pub fn build_dual_track_error(
+    protocol: &str, // "claude" or "openai"
+    status_code: u16,
+    model: &str,
+    error_text: &str,
+) -> serde_json::Value {
+    let lower = error_text.to_lowercase();
+    let is_internal_limited = lower.contains("all accounts limited")
+        || lower.contains("no accounts available")
+        || lower.contains("all accounts failed")
+        || lower.contains("token pool is empty")
+        || lower.contains("all accounts exhausted")
+        || lower.contains("all accounts unhealthy");
+
+    let is_not_found = is_model_not_found_error(status_code, error_text);
+
+    let (readable_prefix, diagnosis, suggestion, err_type, err_code, parsed_upstream) =
+        if is_internal_limited {
+            (
+                "【网关调度受限】".to_string(),
+                format!(
+                    "网关本地账号池当前暂无可用账号或全部可用账号处于限流冷却中。调度详情: {}",
+                    error_text
+                ),
+                "请等待冷却结束（参考等待秒数），或在网关中添加更多正常账号。".to_string(),
+                "rate_limit_error",
+                "all_accounts_limited",
+                serde_json::json!({
+                    "raw": error_text,
+                    "detail": "gateway_local_accounts_throttled"
+                }),
+            )
+        } else if is_not_found {
+            let parsed: serde_json::Value = serde_json::from_str(error_text)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": error_text }));
+            (
+            format!("【模型不存在】[{}]", model),
+            format!("模型 [{}] 在上游端点不存在，或当前绑定的账号暂未开通该模型的访问权限。", model),
+            format!("请核对模型名称，或在网关配置中的「自定义模型映射」将其重定向至可用模型（如 gemini-2.5-flash）。"),
+            "invalid_request_error",
+            "model_not_found",
+            parsed,
+        )
+        } else if status_code == 429 || status_code == 529 {
+            let parsed: serde_json::Value = serde_json::from_str(error_text)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": error_text }));
+            (
+                format!("【上游限流 HTTP {}】", status_code),
+                format!("模型 [{}] 触发上游配额耗尽或频率限制。", model),
+                "请稍候自动恢复，或添加更多账号以分散并发请求。".to_string(),
+                "rate_limit_error",
+                "rate_limit_exceeded",
+                parsed,
+            )
+        } else {
+            let parsed: serde_json::Value = serde_json::from_str(error_text)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": error_text }));
+            (
+                format!("【上游错误 HTTP {}】", status_code),
+                format!("调用上游模型 [{}] 发生错误 (HTTP {})。", model, status_code),
+                "请参考 upstream_error 中的详细字段排查原因。".to_string(),
+                "api_error",
+                "upstream_error",
+                parsed,
+            )
+        };
+
+    let readable_message = format!(
+        "{} 网关诊断: {} 建议: {}",
+        readable_prefix, diagnosis, suggestion
+    );
+
+    if protocol == "claude" {
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": err_type,
+                "code": err_code,
+                "message": readable_message,
+                "gateway_error": {
+                    "error_code": err_code,
+                    "model": model,
+                    "diagnosis": diagnosis,
+                    "suggestion": suggestion
+                },
+                "upstream_error": {
+                    "status": status_code,
+                    "response": parsed_upstream
+                }
+            }
+        })
+    } else {
+        serde_json::json!({
+            "error": {
+                "message": readable_message,
+                "type": err_type,
+                "code": err_code,
+                "gateway_error": {
+                    "error_code": err_code,
+                    "model": model,
+                    "diagnosis": diagnosis,
+                    "suggestion": suggestion
+                },
+                "upstream_error": {
+                    "status": status_code,
+                    "response": parsed_upstream
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod retry_after_tests {
     use super::*;
@@ -530,10 +766,7 @@ mod retry_after_tests {
             extract_retry_after_seconds("Token error: All accounts limited. Wait 5s."),
             Some(5)
         );
-        assert_eq!(
-            extract_retry_after_seconds("Token pool is empty"),
-            None
-        );
+        assert_eq!(extract_retry_after_seconds("Token pool is empty"), None);
         assert_eq!(
             extract_retry_after_seconds("All accounts failed or unhealthy."),
             None
@@ -555,10 +788,7 @@ mod retry_after_tests {
             headers.get("x-account-email").unwrap().to_str().unwrap(),
             "test@example.com"
         );
-        assert_eq!(
-            headers.get("retry-after").unwrap().to_str().unwrap(),
-            "45"
-        );
+        assert_eq!(headers.get("retry-after").unwrap().to_str().unwrap(), "45");
 
         let headers_no_wait = build_token_error_headers(
             Some("gemini-2.5-pro"),
@@ -567,7 +797,11 @@ mod retry_after_tests {
         );
         assert!(headers_no_wait.get("retry-after").is_none());
         assert_eq!(
-            headers_no_wait.get("x-mapped-model").unwrap().to_str().unwrap(),
+            headers_no_wait
+                .get("x-mapped-model")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "gemini-2.5-pro"
         );
     }

@@ -53,9 +53,12 @@ pub fn sanitize_error_for_log(error_text: &str) -> String {
     let re_bearer = regex::Regex::new(r#"(?i)(bearer\s+)[^"'\\\s,}\]]+"#).unwrap();
     let redacted = re_bearer.replace_all(&redacted, "$1<redacted>");
 
-    // 限制长度防止日志炸弹
+    // 限制长度防止日志炸弹 (UTF-8 字符边界安全保护)
     if redacted.len() > 1000 {
-        format!("{}... (truncated)", &redacted[..1000])
+        format!(
+            "{}... (truncated)",
+            crate::proxy::mappers::common_utils::safe_truncate_str(&redacted, 1000)
+        )
     } else {
         redacted.into_owned()
     }
@@ -223,13 +226,13 @@ impl UpstreamClient {
         tracing::debug!("UpstreamClient User-Agent override updated: {:?}", lock);
     }
 
-    /// Get current User-Agent
+    /// Get current User-Agent (sanitized with safety floor >= 4.3.0)
     pub async fn get_user_agent(&self) -> String {
         let ua_override = self.user_agent_override.read().await;
-        ua_override
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| crate::constants::USER_AGENT.clone())
+        match ua_override.as_ref() {
+            Some(ua) => crate::constants::sanitize_egress_user_agent(ua),
+            None => crate::constants::USER_AGENT.clone(),
+        }
     }
 
     /// Get client for a specific account (or default if no proxy bound)
@@ -322,11 +325,26 @@ impl UpstreamClient {
         &self,
         method: &str,
         access_token: &str,
-        body: Value,
+        mut body: Value,
         query_string: Option<&str>,
         extra_headers: std::collections::HashMap<String, String>,
         account_id: Option<&str>, // [NEW] Account ID
     ) -> Result<UpstreamCallResult, String> {
+        // [DEFENSE] 全局终极防御拦截：净化所有发往上游报文中的损坏/空 inlineData 以及触发 Google WAF 拦截的违规计费元数据
+        if let Some(inner) = body.get_mut("request") {
+            crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(inner);
+            crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+                inner,
+            );
+            crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(inner);
+        } else {
+            crate::proxy::mappers::common_utils::sanitize_gemini_payload_inline_data(&mut body);
+            crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
+                &mut body,
+            );
+            crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut body);
+        }
+
         // [NEW] Get client based on account (cached in proxy pool manager)
         let client = self.get_client(account_id).await;
 
@@ -367,8 +385,13 @@ impl UpstreamClient {
                 headers.insert("x-machine-id", mid_val);
             }
         }
-        // Session ID (Per App Launch)
-        if let Ok(sess_val) = header::HeaderValue::from_str(&crate::constants::SESSION_ID) {
+        // Session ID (Per Conversation Isolation)
+        let sess_uuid = if let Some(sid) = extra_headers.get("x-session-id") {
+            derive_session_uuid(sid)
+        } else {
+            crate::constants::SESSION_ID.clone()
+        };
+        if let Ok(sess_val) = header::HeaderValue::from_str(&sess_uuid) {
             headers.insert("x-vscode-sessionid", sess_val);
         }
 
@@ -389,7 +412,11 @@ impl UpstreamClient {
         }
 
         // 注入额外的 Headers (如 anthropic-beta)
+        // 严格禁止透传客户端入站的 user-agent，确保出站指纹始终为受支持的 Antigravity 版本
         for (k, v) in extra_headers {
+            if k.eq_ignore_ascii_case("user-agent") {
+                continue;
+            }
             if let Ok(hk) = header::HeaderName::from_bytes(k.as_bytes()) {
                 if let Ok(hv) = header::HeaderValue::from_str(&v) {
                     headers.insert(hk, hv);
@@ -402,6 +429,16 @@ impl UpstreamClient {
 
         // [DEBUG] Log headers for verification
         tracing::debug!(?headers, "Final Upstream Request Headers");
+
+        let _ = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE.try_with(|holder| {
+            let pairs: Vec<(&str, &str)> = headers
+                .iter()
+                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str(), s)))
+                .collect();
+            holder.set_headers_json(crate::proxy::payload_audit::header_pairs_to_redacted_json(
+                pairs,
+            ));
+        });
 
         let mut has_triggered_downgrade = false;
 
@@ -576,6 +613,23 @@ impl UpstreamClient {
             .map_err(|e| format!("Parse json failed: {}", e))?;
         Ok(json)
     }
+}
+
+/// 派生确定性 UUID 格式的客户端窗口 Session ID (RFC 4122 v4 格式)
+fn derive_session_uuid(seed: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"antigravity-session-v1:");
+    hasher.update(seed.as_bytes());
+    let hash = hasher.finalize();
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3],
+        hash[4], hash[5],
+        hash[6] & 0x0f, hash[7],
+        (hash[8] & 0x3f) | 0x80, hash[9],
+        hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]
+    )
 }
 
 #[cfg(test)]

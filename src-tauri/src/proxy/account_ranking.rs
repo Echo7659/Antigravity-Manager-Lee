@@ -10,18 +10,7 @@ pub struct AccountRank<'a> {
     pub account_id: &'a str,
 }
 
-pub(crate) fn tier_priority(tier: Option<&str>) -> u8 {
-    let tier = tier.unwrap_or_default().to_ascii_lowercase();
-    if tier.contains("ultra") {
-        0
-    } else if tier.contains("pro") {
-        1
-    } else if tier.contains("free") {
-        2
-    } else {
-        3
-    }
-}
+use crate::models::quota::tier_priority;
 
 fn health_score(value: f32) -> f32 {
     if value.is_finite() {

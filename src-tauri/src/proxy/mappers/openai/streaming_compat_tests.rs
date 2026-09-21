@@ -11,6 +11,7 @@ async fn collect(frames: Vec<Bytes>) -> Vec<Value> {
         "compat-stream-test".to_string(),
         1,
         None,
+        true,
     );
     let chunks = tokio::time::timeout(
         std::time::Duration::from_secs(5),

@@ -1,5 +1,24 @@
-# 复用官方 4.7.1 前端及运行环境，仅编译兼容补丁后端。
-FROM lbjlaq/antigravity-manager@sha256:a451e34903a5e8adbd5c0ca6820541f480ce03228fa9ce717433801c9203fb26 AS frontend-builder
+# --- Frontend Build Stage ---
+FROM node:20-slim AS frontend-builder
+ARG USE_MIRROR=auto
+WORKDIR /app
+
+# Use npm mirror if needed
+RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
+    echo "Using npm mirror..."; \
+    npm config set registry https://registry.npmmirror.com; \
+    else \
+    echo "Using default npm registry..."; \
+    fi
+
+COPY package*.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --legacy-peer-deps --prefer-offline --no-audit --no-fund
+COPY tsconfig.json tsconfig.node.json vite.config.ts tailwind.config.js postcss.config.cjs index.html ./
+COPY public ./public
+COPY src ./src
+COPY src-tauri/icons ./src-tauri/icons
+RUN npm run build
 
 # --- Backend Build Stage ---
 FROM rust:1-slim-bookworm@sha256:ebd900bae66fd508b466cef82d64a83a5fb34682e4c8b2797a42908bddc95a57 AS backend-builder
@@ -71,7 +90,8 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 
 FROM lbjlaq/antigravity-manager@sha256:a451e34903a5e8adbd5c0ca6820541f480ce03228fa9ce717433801c9203fb26
 COPY --from=backend-builder /tmp/antigravity-tools /app/antigravity-tools
-LABEL org.opencontainers.image.version="4.7.1-compat-20260914"
-ARG SOURCE_REVISION=734e2bde-gemini-compat
+COPY --from=frontend-builder /app/dist /app/dist
+LABEL org.opencontainers.image.version="4.7.12-lee.1"
+ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
 LABEL org.opencontainers.image.source="https://github.com/Echo7659/Antigravity-Manager-Lee"

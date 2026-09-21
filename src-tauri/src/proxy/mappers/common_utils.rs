@@ -110,7 +110,8 @@ pub fn resolve_request_config(
         || mapped_model.contains("claude-3-opus")
         || mapped_model.contains("claude-sonnet")
         || mapped_model.contains("claude-opus")
-        || mapped_model.contains("claude-4");
+        || mapped_model.contains("claude-4")
+        || crate::proxy::model_specs::is_gemini_v3_or_above(mapped_model);
 
     // Determine if we should enable networking
     // [FIX] 禁用基于模型的自动联网逻辑，防止图像请求被联网搜索结果覆盖。
@@ -131,14 +132,12 @@ pub fn resolve_request_config(
         _ => final_model,
     };
 
-    // [FIX] Check allowlist before forcing downgrade
-    // If networking is enabled but the model doesn't support search, fall back to Flash
+    // [FIX] 不再强行将模型降级为 gemini-2.5-flash，彻底杜绝静默降级
     if enable_networking && !_is_high_quality_model {
-        tracing::info!(
-            "[Common-Utils] Downgrading {} to gemini-2.5-flash for web search (model not in search allowlist)",
+        tracing::debug!(
+            "[Common-Utils] Request enables web search for model {}",
             final_model
         );
-        final_model = "gemini-2.5-flash".to_string();
     }
 
     RequestConfig {
@@ -169,10 +168,7 @@ pub fn try_parse_image_config_with_params(
 ) -> Result<(Value, String), String> {
     let image_size = normalize_image_size(image_size)?;
     Ok(parse_image_config_with_normalized_params(
-        model_name,
-        size,
-        quality,
-        image_size,
+        model_name, size, quality, image_size,
     ))
 }
 
@@ -425,22 +421,24 @@ fn calculate_aspect_ratio_from_size(size: &str) -> &'static str {
     image_aspect_ratio_from_size(size).unwrap_or("1:1")
 }
 
-/// Inject current googleSearch tool and ensure no duplicate legacy search tools
-pub fn inject_google_search_tool(body: &mut Value, mapped_model: Option<&str>) {
+/// Inject current googleSearch tool and ensure no duplicate legacy search tools.
+/// When client-defined function tools are present, skips googleSearch to avoid client-side empty/unknown tool dispatch errors.
+pub fn inject_google_search_tool(body: &mut Value, _mapped_model: Option<&str>) {
     if let Some(obj) = body.as_object_mut() {
         let tools_entry = obj.entry("tools").or_insert_with(|| json!([]));
         if let Some(tools_arr) = tools_entry.as_array_mut() {
             let has_functions = tools_arr.iter().any(|t| {
-                t.as_object()
-                    .map_or(false, |o| o.contains_key("functionDeclarations"))
+                t.as_object().map_or(false, |o| {
+                    o.contains_key("functionDeclarations")
+                        || o.contains_key("function_declarations")
+                })
             });
 
-            // [FIX] v1internal (cloudcode-pa) does NOT support mixing googleSearch
-            // with functionDeclarations — it lacks includeServerSideToolInvocations.
-            // Skip googleSearch injection entirely when function tools are present.
+            // [STABILITY GUARD] 如果客户端自身已经定义了函数工具 (functionDeclarations / function_declarations)，
+            // 不强行注入 googleSearch 工具。防止服务端接地调用导致客户端无法分发、空工具调用或报未知工具错误。
             if has_functions {
                 tracing::debug!(
-                    "Skipping googleSearch injection: functionDeclarations present (v1internal incompatible)"
+                    "Skipping googleSearch injection: functionDeclarations present, avoiding client tool dispatch conflicts"
                 );
                 return;
             }
@@ -448,7 +446,9 @@ pub fn inject_google_search_tool(body: &mut Value, mapped_model: Option<&str>) {
             // 首先清理掉已存在的 googleSearch 或 googleSearchRetrieval，以防重复产生冲突
             tools_arr.retain(|t| {
                 if let Some(o) = t.as_object() {
-                    !(o.contains_key("googleSearch") || o.contains_key("googleSearchRetrieval"))
+                    !(o.contains_key("googleSearch")
+                        || o.contains_key("google_search")
+                        || o.contains_key("googleSearchRetrieval"))
                 } else {
                     true
                 }
@@ -1030,13 +1030,9 @@ mod tests {
             assert_eq!(fallback["imageSize"], "4K");
         }
 
-        let (upstream_default, _) = try_parse_image_config_with_params(
-            "gemini-3.1-flash-image",
-            None,
-            Some("auto"),
-            None,
-        )
-        .expect("auto without suffix uses upstream default");
+        let (upstream_default, _) =
+            try_parse_image_config_with_params("gemini-3.1-flash-image", None, Some("auto"), None)
+                .expect("auto without suffix uses upstream default");
         assert!(upstream_default.get("imageSize").is_none());
 
         assert!(try_parse_image_config_with_params(
@@ -1046,6 +1042,117 @@ mod tests {
             Some("8K"),
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_detect_mime_from_bytes() {
+        assert_eq!(
+            detect_mime_from_bytes(b"\x89PNG\r\n\x1a\n\0\0\0"),
+            Some("image/png")
+        );
+        assert_eq!(
+            detect_mime_from_bytes(b"\xff\xd8\xff\xe0\0\x10JFIF"),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            detect_mime_from_bytes(b"GIF89a\x01\0\x01\0"),
+            Some("image/gif")
+        );
+        assert_eq!(
+            detect_mime_from_bytes(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(
+            detect_mime_from_bytes(b"%PDF-1.7\n%"),
+            Some("application/pdf")
+        );
+        assert_eq!(detect_mime_from_bytes(b"invalid"), None);
+    }
+
+    #[test]
+    fn test_validate_and_sanitize_inline_data() {
+        // 1. Empty data
+        assert_eq!(
+            validate_and_sanitize_inline_data(Some("image/png"), ""),
+            None
+        );
+        assert_eq!(validate_and_sanitize_inline_data(None, "   "), None);
+
+        // 2. Corrupted short data (like the +A== in the incident)
+        assert_eq!(
+            validate_and_sanitize_inline_data(Some("image/png"), "+A=="),
+            None
+        );
+        assert_eq!(validate_and_sanitize_inline_data(None, "AQ=="), None);
+
+        // 3. Invalid base64 characters
+        assert_eq!(
+            validate_and_sanitize_inline_data(Some("image/png"), "not-valid-base64!@#$"),
+            None
+        );
+
+        // 4. Valid PNG base64 (8 bytes magic header)
+        let valid_png_b64 = "iVBORw0KGgo=";
+        let res = validate_and_sanitize_inline_data(Some("image/png"), valid_png_b64);
+        assert!(res.is_some());
+        let (mime, data) = res.unwrap();
+        assert_eq!(mime, "image/png");
+        assert_eq!(data, valid_png_b64);
+
+        // 5. Valid PNG with omitted mime type (should auto-detect from magic bytes)
+        let res_no_mime = validate_and_sanitize_inline_data(None, valid_png_b64);
+        assert!(res_no_mime.is_some());
+        assert_eq!(res_no_mime.unwrap().0, "image/png");
+    }
+
+    #[test]
+    fn test_create_gemini_inline_part() {
+        let valid_png_b64 = "iVBORw0KGgo=";
+        let valid_part = create_gemini_inline_part(Some("image/png"), valid_png_b64, "Image");
+        assert!(valid_part.get("inlineData").is_some());
+        assert_eq!(valid_part["inlineData"]["mimeType"], "image/png");
+
+        let bad_part = create_gemini_inline_part(Some("image/png"), "+A==", "Image");
+        assert!(bad_part.get("inlineData").is_none());
+        assert_eq!(
+            bad_part["text"],
+            "[Image: invalid or corrupted data omitted]"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_gemini_payload_inline_data() {
+        let valid_png_b64 = "iVBORw0KGgo=";
+        let mut payload = json!({
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": "Hello" },
+                        { "inlineData": { "mimeType": "image/png", "data": "+A==" } }, // corrupt
+                        { "inlineData": { "mimeType": "image/png", "data": "" } },     // empty
+                        { "inlineData": { "mimeType": "image/png", "data": valid_png_b64 } } // valid
+                    ]
+                }
+            ]
+        });
+
+        let sanitized_count = sanitize_gemini_payload_inline_data(&mut payload);
+        assert_eq!(sanitized_count, 2);
+
+        let parts = payload["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0]["text"], "Hello");
+        assert_eq!(
+            parts[1]["text"],
+            "[Image/Data: invalid or corrupted inline payload omitted]"
+        );
+        assert_eq!(
+            parts[2]["text"],
+            "[Image/Data: invalid or corrupted inline payload omitted]"
+        );
+        assert!(parts[3].get("inlineData").is_some());
+        assert_eq!(parts[3]["inlineData"]["data"], valid_png_b64);
     }
 }
 
@@ -1122,9 +1229,8 @@ pub fn parse_markdown_images_to_parts(text: &str) -> Vec<Value> {
             // Add inlineData image
             let mime = cap.get(1).unwrap().as_str();
             let b64 = cap.get(2).unwrap().as_str();
-            parts.push(json!({
-                "inlineData": { "mimeType": mime, "data": b64 }
-            }));
+            let part = create_gemini_inline_part(Some(mime), b64, "Markdown Image");
+            parts.push(part);
 
             last_match = m.end();
         }
@@ -1167,4 +1273,528 @@ pub fn enhance_gemini_skills_prompt(text: &str) -> String {
     }
 
     enhanced
+}
+
+/// Detect common MIME types from magic bytes
+pub fn detect_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.starts_with(b"%PDF-") {
+        Some("application/pdf")
+    } else if bytes.len() >= 12
+        && (&bytes[4..12] == b"ftypheic"
+            || &bytes[4..12] == b"ftypmif1"
+            || &bytes[4..12] == b"ftypheix")
+    {
+        Some("image/heic")
+    } else {
+        None
+    }
+}
+
+/// Validates and sanitizes inline base64 data (images/documents) for Gemini upstream.
+/// Returns `Some((mime_type, sanitized_b64))` if valid, or `None` if corrupt/empty/too small.
+pub fn validate_and_sanitize_inline_data(
+    mime_type: Option<&str>,
+    b64_data: &str,
+) -> Option<(String, String)> {
+    let clean_b64 = b64_data.trim();
+    if clean_b64.is_empty() {
+        return None;
+    }
+
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    // Try decoding base64 to check validity and magic bytes
+    let decoded_bytes = match STANDARD.decode(clean_b64) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            use base64::engine::general_purpose::URL_SAFE;
+            match URL_SAFE.decode(clean_b64) {
+                Ok(bytes) => bytes,
+                Err(_) => return None,
+            }
+        }
+    };
+
+    if decoded_bytes.is_empty() {
+        return None;
+    }
+
+    let declared_mime = mime_type.map(str::trim).filter(|m| !m.is_empty());
+
+    let is_audio_or_video = declared_mime
+        .map(|m| m.starts_with("video/") || m.starts_with("audio/"))
+        .unwrap_or(false);
+
+    if !is_audio_or_video {
+        // For images/documents, require at least 5 decoded bytes and 8 base64 chars
+        if clean_b64.len() < 8 || decoded_bytes.len() < 5 {
+            return None;
+        }
+    }
+
+    // Detect MIME from magic bytes if possible
+    let inferred_mime = detect_mime_from_bytes(&decoded_bytes);
+
+    let final_mime = match (mime_type.map(str::trim), inferred_mime) {
+        (Some(m), _)
+            if !m.is_empty()
+                && (m.starts_with("image/")
+                    || m.starts_with("application/")
+                    || m.starts_with("audio/")
+                    || m.starts_with("video/")) =>
+        {
+            m.to_string()
+        }
+        (_, Some(inferred)) => inferred.to_string(),
+        (Some(m), _) if !m.is_empty() => m.to_string(),
+        _ => "image/jpeg".to_string(), // fallback default
+    };
+
+    Some((final_mime, clean_b64.to_string()))
+}
+
+/// Helper to create a Gemini inlineData part or fallback text if invalid
+pub fn create_gemini_inline_part(
+    mime_type: Option<&str>,
+    b64_data: &str,
+    fallback_label: &str,
+) -> Value {
+    if let Some((valid_mime, valid_data)) = validate_and_sanitize_inline_data(mime_type, b64_data) {
+        json!({
+            "inlineData": {
+                "mimeType": valid_mime,
+                "data": valid_data
+            }
+        })
+    } else {
+        tracing::warn!(
+            "[Image-Defense] Omitted invalid or corrupt base64 data (len: {}, mime: {:?})",
+            b64_data.len(),
+            mime_type
+        );
+        json!({
+            "text": format!("[{}: invalid or corrupted data omitted]", fallback_label)
+        })
+    }
+}
+
+/// Sanitizes any inlineData in an entire Gemini JSON request payload in-place.
+/// Replaces invalid inlineData / inline_data parts with placeholder text parts.
+pub fn sanitize_gemini_payload_inline_data(body: &mut Value) -> usize {
+    let mut total_sanitized = 0;
+
+    let mut sanitize_parts = |parts: &mut Vec<Value>| {
+        for part in parts.iter_mut() {
+            if let Some(obj) = part.as_object_mut() {
+                let inline_key = if obj.contains_key("inlineData") {
+                    Some("inlineData")
+                } else if obj.contains_key("inline_data") {
+                    Some("inline_data")
+                } else {
+                    None
+                };
+
+                if let Some(key) = inline_key {
+                    let inline_obj = obj.get(key).and_then(Value::as_object);
+                    let mime = inline_obj
+                        .and_then(|o| o.get("mimeType").or_else(|| o.get("mime_type")))
+                        .and_then(Value::as_str);
+                    let data = inline_obj
+                        .and_then(|o| o.get("data"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+
+                    if let Some((valid_mime, valid_data)) =
+                        validate_and_sanitize_inline_data(mime, data)
+                    {
+                        // Ensure mimeType and data are normalized
+                        obj.insert(
+                            "inlineData".to_string(),
+                            json!({
+                                "mimeType": valid_mime,
+                                "data": valid_data
+                            }),
+                        );
+                        if key == "inline_data" {
+                            obj.remove("inline_data");
+                        }
+                    } else {
+                        total_sanitized += 1;
+                        tracing::warn!(
+                            "[Payload-Defense] Sanitized invalid inlineData part (len: {}, mime: {:?}) into text placeholder",
+                            data.len(),
+                            mime
+                        );
+                        *part = json!({
+                            "text": "[Image/Data: invalid or corrupted inline payload omitted]"
+                        });
+                    }
+                }
+            }
+        }
+    };
+
+    if let Some(contents) = body.get_mut("contents").and_then(Value::as_array_mut) {
+        for content in contents.iter_mut() {
+            if let Some(parts) = content.get_mut("parts").and_then(Value::as_array_mut) {
+                sanitize_parts(parts);
+            }
+        }
+    }
+
+    if let Some(sys) = body
+        .get_mut("systemInstruction")
+        .and_then(Value::as_object_mut)
+    {
+        if let Some(parts) = sys.get_mut("parts").and_then(Value::as_array_mut) {
+            sanitize_parts(parts);
+        }
+    }
+
+    total_sanitized
+}
+
+/// Check if two model strings are compatible (same family)
+pub fn is_model_compatible(cached: &str, target: &str) -> bool {
+    let c = cached.to_lowercase();
+    let t = target.to_lowercase();
+
+    if c == t {
+        return true;
+    }
+
+    // Claude 全系列通用兼容：凡是同属 Claude 家族模型，直接判定签名兼容（面向未来任何 Claude 5/新模型及变体）
+    if c.contains("claude") && t.contains("claude") {
+        return true;
+    }
+
+    // Gemini models: strict family match required for signatures
+    if c.contains("gemini-1.5-pro") && t.contains("gemini-1.5-pro") {
+        return true;
+    }
+    if c.contains("gemini-1.5-flash") && t.contains("gemini-1.5-flash") {
+        return true;
+    }
+    if c.contains("gemini-2.0-flash") && t.contains("gemini-2.0-flash") {
+        return true;
+    }
+    if c.contains("gemini-2.0-pro") && t.contains("gemini-2.0-pro") {
+        return true;
+    }
+    if c.contains("gemini-3") && t.contains("gemini-3") {
+        let c_flash = c.contains("flash");
+        let t_flash = t.contains("flash");
+        let c_pro = c.contains("pro");
+        let t_pro = t.contains("pro");
+        if c_flash == t_flash && c_pro == t_pro {
+            return true;
+        }
+        if c_flash && t_flash {
+            return true;
+        }
+        if c_pro && t_pro {
+            return true;
+        }
+    }
+    if c.contains("gemini-3.7") && t.contains("gemini-3.7") {
+        return true;
+    }
+
+    false
+}
+
+pub fn model_keeps_thinking_without_signature(mapped_model: &str) -> bool {
+    let m = mapped_model.to_lowercase();
+    m.contains("flash") || m.contains("gemini-pro-agent")
+}
+
+/// [JEIKCODE SYNTHETIC USER REMINDER]
+/// 将对话中途动态插入的系统消息就地包装为 `<system-reminder>` 标签块。
+/// 提示词采用英文，明确告知模型：本内容为系统层注入的背景提醒，并非本轮用户输入，
+/// 从而保证用户原始 query 完整透传，同时全局顶层 systemInstruction 保持绝对冻结以稳定 KV Cache。
+pub fn wrap_in_system_reminder(content: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("<system-reminder>") && trimmed.ends_with("</system-reminder>") {
+        return trimmed.to_string();
+    }
+    format!(
+        "<system-reminder>\nBefore the user's request for this turn, the system provides the following reminder for your awareness. Please note that this is from prior system messages, not spoken by the user:\n{}\n</system-reminder>",
+        trimmed
+    )
+}
+
+/// [DEFENSE] 通用中转报文保底文本（温和提示继续分析，避免触发 Agent 误进入修改阶段）
+pub const TRANSIT_DEFENSE_FALLBACK_TEXT: &str = "Please continue your analysis.";
+
+/// [DEFENSE] 通用中转报文保底防御节点（协议无关性）
+/// 确保发给 Google Gemini 的报文末尾轮次严格符合规范：
+/// 1. 自动兼容平铺 payload 或包含 "request" 包装的 payload；
+/// 2. 若 contents 为空，追加 {"role": "user", "parts": [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]}；
+/// 3. 若末尾轮次为 "model"（缺失用户轮次），追加 {"role": "user", "parts": [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]}；
+/// 4. 若末尾轮次为 "user" 且其 parts 为空、或仅含有空文本 / "(no content)" / "·" 且无工具/图片，规范化填充为 [{"text": TRANSIT_DEFENSE_FALLBACK_TEXT}]；
+/// 5. 修复中间轮次中 parts 为空的情况，防止 Google 返回 400 "parts must not be empty"。
+pub fn ensure_gemini_payload_ends_with_user(body: &mut Value) -> bool {
+    let contents = if let Some(contents) = body
+        .get_mut("request")
+        .and_then(|r| r.get_mut("contents"))
+        .and_then(|c| c.as_array_mut())
+    {
+        contents
+    } else if let Some(contents) = body.get_mut("contents").and_then(|c| c.as_array_mut()) {
+        contents
+    } else {
+        return false;
+    };
+
+    let mut modified = false;
+
+    // 防御 1: contents 整体为空
+    if contents.is_empty() {
+        tracing::warn!("[Defense] Gemini contents array is empty, appending fallback user turn");
+        contents.push(json!({
+            "role": "user",
+            "parts": [{ "text": TRANSIT_DEFENSE_FALLBACK_TEXT }]
+        }));
+        return true;
+    }
+
+    // 防御 2: 修复历史/中间轮次中可能存在的 parts 为空
+    for turn in contents.iter_mut() {
+        let is_model = turn
+            .get("role")
+            .and_then(|r| r.as_str())
+            .map(|r| r == "model" || r == "assistant")
+            .unwrap_or(false);
+        if let Some(parts) = turn.get_mut("parts").and_then(|p| p.as_array_mut()) {
+            if parts.is_empty() {
+                modified = true;
+                if is_model {
+                    parts.push(json!({ "text": "..." }));
+                } else {
+                    parts.push(json!({ "text": TRANSIT_DEFENSE_FALLBACK_TEXT }));
+                }
+            }
+        }
+    }
+
+    // 防御 3: 检查末尾轮次
+    let need_append_user = if let Some(last_turn) = contents.last_mut() {
+        let role = last_turn.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role == "model" || role == "assistant" {
+            true
+        } else {
+            if let Some(parts) = last_turn.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                let has_substantive_part = parts.iter().any(|part| {
+                    if part.get("functionCall").is_some()
+                        || part.get("functionResponse").is_some()
+                        || part.get("inlineData").is_some()
+                        || part.get("fileData").is_some()
+                    {
+                        return true;
+                    }
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        let t = text.trim();
+                        !t.is_empty() && t != "(no content)" && t != "·"
+                    } else {
+                        false
+                    }
+                });
+
+                if !has_substantive_part {
+                    tracing::warn!(
+                        "[Defense] Last user turn has no substantive content, normalizing to '{}'",
+                        TRANSIT_DEFENSE_FALLBACK_TEXT
+                    );
+                    *parts = vec![json!({ "text": TRANSIT_DEFENSE_FALLBACK_TEXT })];
+                    modified = true;
+                }
+            }
+            false
+        }
+    } else {
+        false
+    };
+
+    if need_append_user {
+        tracing::warn!(
+            "[Defense] Gemini payload ended with model turn, appending user turn with '{}'",
+            TRANSIT_DEFENSE_FALLBACK_TEXT
+        );
+        contents.push(json!({
+            "role": "user",
+            "parts": [{ "text": TRANSIT_DEFENSE_FALLBACK_TEXT }]
+        }));
+        modified = true;
+    }
+
+    modified
+}
+
+/// 安全地按最大字节数截断字符串切片，保证切片边界严格对齐在 UTF-8 字符边界上。
+/// 若 max_bytes 恰好落在多字节字符中间，会自动向左回退到最近的合法字符边界。
+pub fn safe_truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// 安全地按最大字符数 (Unicode 标量值) 截断字符串切片。
+/// 如果字符总数超过 max_chars，截取前 max_chars 个字符对应的有效切片。
+pub fn safe_truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &s[..byte_idx],
+        None => s,
+    }
+}
+
+#[cfg(test)]
+mod defense_tests {
+    use super::*;
+
+    #[test]
+    fn test_ensure_gemini_payload_ends_with_user_empty() {
+        let mut payload = json!({
+            "contents": []
+        });
+        assert!(ensure_gemini_payload_ends_with_user(&mut payload));
+        let contents = payload["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(
+            contents[0]["parts"][0]["text"],
+            TRANSIT_DEFENSE_FALLBACK_TEXT
+        );
+    }
+
+    #[test]
+    fn test_ensure_gemini_payload_ends_with_user_model_ending() {
+        let mut payload = json!({
+            "request": {
+                "contents": [
+                    { "role": "user", "parts": [{ "text": "hello" }] },
+                    { "role": "model", "parts": [{ "text": "hi there" }] }
+                ]
+            }
+        });
+        assert!(ensure_gemini_payload_ends_with_user(&mut payload));
+        let contents = payload["request"]["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 3);
+        assert_eq!(contents[2]["role"], "user");
+        assert_eq!(
+            contents[2]["parts"][0]["text"],
+            TRANSIT_DEFENSE_FALLBACK_TEXT
+        );
+    }
+
+    #[test]
+    fn test_ensure_gemini_payload_ends_with_user_no_content() {
+        let mut payload = json!({
+            "contents": [
+                { "role": "user", "parts": [{ "text": "(no content)" }] }
+            ]
+        });
+        assert!(ensure_gemini_payload_ends_with_user(&mut payload));
+        let contents = payload["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(
+            contents[0]["parts"][0]["text"],
+            TRANSIT_DEFENSE_FALLBACK_TEXT
+        );
+    }
+
+    #[test]
+    fn test_ensure_gemini_payload_ends_with_user_valid_untouched() {
+        let mut payload = json!({
+            "contents": [
+                { "role": "user", "parts": [{ "text": "valid message" }] }
+            ]
+        });
+        assert!(!ensure_gemini_payload_ends_with_user(&mut payload));
+        let contents = payload["contents"].as_array().unwrap();
+        assert_eq!(contents[0]["parts"][0]["text"], "valid message");
+    }
+
+    #[test]
+    fn test_wrap_in_system_reminder() {
+        use super::wrap_in_system_reminder;
+
+        // Empty content returns empty string
+        assert_eq!(wrap_in_system_reminder("   "), "");
+
+        // Raw text gets wrapped with English reminder header
+        let wrapped = wrap_in_system_reminder("Current date: 2026-09-19");
+        assert!(wrapped.starts_with("<system-reminder>\nBefore the user's request for this turn"));
+        assert!(wrapped.contains("Current date: 2026-09-19"));
+        assert!(wrapped.ends_with("</system-reminder>"));
+
+        // Already wrapped content is untouched (no double wrapping)
+        let already = "<system-reminder>\nsome text\n</system-reminder>";
+        assert_eq!(wrap_in_system_reminder(already), already);
+    }
+
+    #[test]
+    fn test_safe_truncate_str_utf8_boundaries() {
+        // "你好世界" 每个汉字 3 字节，共 12 字节:
+        // '你': 0..3, '好': 3..6, '世': 6..9, '界': 9..12
+        let text = "你好世界";
+        assert_eq!(safe_truncate_str(text, 0), "");
+        assert_eq!(safe_truncate_str(text, 1), ""); // 落在 '你' 中间，回退到 0
+        assert_eq!(safe_truncate_str(text, 2), ""); // 落在 '你' 中间，回退到 0
+        assert_eq!(safe_truncate_str(text, 3), "你");
+        assert_eq!(safe_truncate_str(text, 4), "你"); // 落在 '好' 中间，回退到 3
+        assert_eq!(safe_truncate_str(text, 5), "你");
+        assert_eq!(safe_truncate_str(text, 6), "你好");
+        assert_eq!(safe_truncate_str(text, 12), "你好世界");
+        assert_eq!(safe_truncate_str(text, 100), "你好世界");
+
+        // 验证 Issue #3493 场景：第 57 字节落在 3 字节中文字符内部
+        // 构造 55 字节 ASCII + "中文测试"（每个 3 字节）
+        // "中文测试" 从索引 55 开始: '中' (55..58)
+        // 索引 57 正好落在 '中' 的中间 (55..58)
+        let mut s3493 = "a".repeat(55);
+        s3493.push_str("中文测试");
+        assert!(!s3493.is_char_boundary(57));
+        let truncated = safe_truncate_str(&s3493, 57);
+        assert_eq!(truncated.len(), 55);
+        assert_eq!(truncated, "a".repeat(55));
+
+        // Emoji 测试 (4 字节: 🦀 0..4)
+        let emoji = "🦀🦀";
+        assert_eq!(safe_truncate_str(emoji, 2), "");
+        assert_eq!(safe_truncate_str(emoji, 4), "🦀");
+        assert_eq!(safe_truncate_str(emoji, 6), "🦀");
+        assert_eq!(safe_truncate_str(emoji, 8), "🦀🦀");
+    }
+
+    #[test]
+    fn test_safe_truncate_chars_utf8() {
+        let text = "你好世界，Rust编程！";
+        assert_eq!(safe_truncate_chars(text, 0), "");
+        assert_eq!(safe_truncate_chars(text, 2), "你好");
+        assert_eq!(safe_truncate_chars(text, 4), "你好世界");
+        assert_eq!(safe_truncate_chars(text, 5), "你好世界，");
+        assert_eq!(safe_truncate_chars(text, 100), text);
+
+        let emoji_text = "🎉Hello世界🦀";
+        assert_eq!(safe_truncate_chars(emoji_text, 1), "🎉");
+        assert_eq!(safe_truncate_chars(emoji_text, 6), "🎉Hello");
+        assert_eq!(safe_truncate_chars(emoji_text, 8), "🎉Hello世界");
+        assert_eq!(safe_truncate_chars(emoji_text, 9), "🎉Hello世界🦀");
+    }
 }

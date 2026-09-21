@@ -1,12 +1,12 @@
 # 排序稳定性与额度保护
 
-`v4.7.1-lee.3` 修复账号排序 panic，并改进模型档位兼容和额度保护。
+`v4.7.1-lee.3` 修复账号排序 panic，并改进模型档位兼容和额度保护。4.7.12 合并后的取舍见 [同步说明](UPSTREAM_4_7_12.md)。
 
 ## 错误原因
 
 原排序将两个重置时间相差不足十分钟视为相等，这种相等关系不满足传递性，可能触发 Rust 的排序 panic。HTTP 连接因此断开，下游 New API 将 EOF 包装为 HTTP 500 和 `do request failed`。现在使用固定十分钟时间分组、可全序比较的健康度和稳定账号 ID，避免排序崩溃。
 
-New API 可能将 `gemini-3.8-flash-high` 拆为 `gemini-3.8-flash` 与 `reasoning_effort=high`。实测基础型号返回 429，而完整型号正常。OpenAI 入口现在会根据独立 effort 恢复具体 Flash 型号，但仅使用账号额度列表实际提供的候选；显式型号和 tiered 型号不改写。
+New API 可能将 `gemini-3.8-flash-high` 拆为 `gemini-3.8-flash` 与 `reasoning_effort=high`。实测基础型号返回 429，而完整型号正常。4.7.1 Lee 的 OpenAI 入口曾根据独立 effort 恢复账号实际提供的 Flash 型号。4.7.12 起采用官方模型档位路由及统一思考流水线，不再保留该旧 helper；显式型号仍交由官方规则处理。
 
 ## 额度保护
 

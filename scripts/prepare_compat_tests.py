@@ -28,9 +28,19 @@ assert 'fn extract_apply_patch_input' in response
 
 
 common = (source / 'handlers/common.rs').read_text()
-common = common.split('/// Detects model capabilities and configuration', 1)[0]
+common_prefix = common.split('/// Detects model capabilities and configuration', 1)[0]
+start = common.index('pub fn is_model_not_found_error(')
+end = common.index('\n}', start) + 2
+common = common_prefix + '\n' + common[start:end]
+
 common = common.replace('use crate::proxy::server::AppState;\n', '')
 (destination / 'retry_common.rs').write_text(common)
+
+
+utils = (source / 'mappers/common_utils.rs').read_text()
+start = utils.index('pub fn safe_truncate_chars(')
+end = utils.index('\n}', start) + 2
+(destination / 'common_utils_excerpt.rs').write_text(utils[start:end])
 
 
 def module(path):
@@ -53,6 +63,26 @@ pub mod models {{
 #[path = {module(destination / 'retry_common.rs')}]
 mod retry_common;
 pub mod proxy {{
+    pub mod pipeline {{
+        #[path = {module(source / 'pipeline/usage.rs')}] pub mod usage;
+        #[path = {module(source / 'pipeline/policy.rs')}] pub mod policy;
+        pub use usage::CanonicalUsage;
+        pub use policy::UpstreamClassification;
+    }}
+    pub mod adapters {{
+        #[path = {module(source / 'adapters/apply_patch_preflight.rs')}] pub mod apply_patch_preflight;
+    }}
+    pub mod thinking_store {{
+        pub struct TurnAccumulator;
+        impl TurnAccumulator {{
+            pub fn new() -> Self {{ Self }}
+            pub fn ingest_part(&mut self, _: &serde_json::Value) {{}}
+            pub fn record_tool_id(&mut self, _: &str, _: &str) {{}}
+            pub fn commit(self, _: &str) {{}}
+        }}
+        pub fn capture_gemini_parts(_: &str, _: &[serde_json::Value]) {{}}
+        pub fn capture_gemini_parts_with_anchor(_: &str, _: &[serde_json::Value], _: &str) {{}}
+    }}
     pub mod token_manager {{
         #[derive(Default)]
         pub struct TokenManager {{ pub refreshes: std::sync::atomic::AtomicUsize }}
@@ -74,10 +104,12 @@ pub mod proxy {{
     pub struct SignatureCache;
     impl SignatureCache {{
         pub fn global() -> &'static Self {{ &Self }}
+        pub fn cache_tool_signature(&self, _: &str, _: String) {{}}
         pub fn cache_session_signature(&self, _: &str, _: String, _: usize) {{}}
     }}
     pub mod audio {{ pub fn normalize_audio_mime(value: &str) -> String {{ value.to_string() }} }}
     pub mod mappers {{
+        #[path = {module(destination / "common_utils_excerpt.rs")}] pub mod common_utils;
         #[path = {module(source / 'mappers/usage.rs')}] pub mod usage;
         #[path = {module(source / 'mappers/error_classifier.rs')}] pub mod error_classifier;
         pub mod gemini {{
@@ -138,7 +170,7 @@ path = "lib.rs"
 [dependencies]
 '''
 features = {'serde': ['derive'], 'serde_json': ['preserve_order'], 'uuid': ['v4'], 'tokio': ['macros', 'rt', 'time']}
-for name in ['serde', 'serde_json', 'bytes', 'futures', 'chrono', 'rand', 'uuid', 'tracing', 'async-stream', 'tokio', 'axum', 'once_cell', 'regex']:
+for name in ['serde', 'serde_json', 'bytes', 'futures', 'chrono', 'rand', 'uuid', 'tracing', 'async-stream', 'tokio', 'axum', 'once_cell', 'regex', 'tempfile']:
     prefix = '0.8.' if name == 'rand' else '1.' if name in ['uuid', 'bytes'] else ''
     dependency = '=' + version(name, prefix)
     if name in features:
