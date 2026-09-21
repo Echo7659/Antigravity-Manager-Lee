@@ -397,53 +397,56 @@ pub fn init_db() -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
 
-    // 高效复合索引：状态与时间戳倒序（针对错误筛选与分页排序，极大提升大数据量下的响应速度）
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_status_timestamp ON request_logs (status, timestamp DESC)",
-        [],
-    );
+    // 大型历史日志可在维护窗口创建附加索引，避免升级启动等待全表扫描。
+    if std::env::var("ABV_DEFER_LOG_INDEX_MIGRATIONS").as_deref() != Ok("true") {
+        // 高效复合索引：状态与时间戳倒序（针对错误筛选与分页排序，极大提升大数据量下的响应速度）
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_status_timestamp ON request_logs (status, timestamp DESC)",
+            [],
+        );
 
-    // 复合索引：模型与时间戳倒序（针对模型级日志过滤与排序）
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_model_timestamp ON request_logs (model, timestamp DESC)",
-        [],
-    );
+        // 复合索引：模型与时间戳倒序（针对模型级日志过滤与排序）
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_timestamp ON request_logs (model, timestamp DESC)",
+            [],
+        );
 
-    // 复合索引：账号邮箱与时间戳倒序（针对多用户/多账号过滤）
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_account_timestamp ON request_logs (account_email, timestamp DESC)",
-        [],
-    );
+        // 复合索引：账号邮箱与时间戳倒序（针对多用户/多账号过滤）
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_account_timestamp ON request_logs (account_email, timestamp DESC)",
+            [],
+        );
 
-    // 复合索引：客户端IP与时间戳倒序（针对安全审计与IP过滤）
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_client_ip_timestamp ON request_logs (client_ip, timestamp DESC)",
-        [],
-    );
+        // 复合索引：客户端IP与时间戳倒序（针对安全审计与IP过滤）
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_client_ip_timestamp ON request_logs (client_ip, timestamp DESC)",
+            [],
+        );
 
-    // 复合索引：用户名与时间戳倒序
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_username_timestamp ON request_logs (username, timestamp DESC)",
-        [],
-    );
+        // 复合索引：用户名与时间戳倒序
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_username_timestamp ON request_logs (username, timestamp DESC)",
+            [],
+        );
 
-    // 复合索引：会话与时间戳倒序（针对会话粒度运维分析）
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_timestamp ON request_logs (session_id, timestamp DESC)",
-        [],
-    );
+        // 复合索引：会话与时间戳倒序（针对会话粒度运维分析）
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_timestamp ON request_logs (session_id, timestamp DESC)",
+            [],
+        );
 
-    // 单列索引：协议类型
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_protocol ON request_logs (protocol)",
-        [],
-    );
+        // 单列索引：协议类型
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_protocol ON request_logs (protocol)",
+            [],
+        );
 
-    // 单列索引：请求方法
-    let _ = conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_method ON request_logs (method)",
-        [],
-    );
+        // 单列索引：请求方法
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_method ON request_logs (method)",
+            [],
+        );
+    }
 
     // 持久化工具签名表 (支持代理重启后根据 tool_id 秒级恢复真实加密签名)
     conn.execute(
@@ -1118,10 +1121,8 @@ fn reclaim_space(conn: &Connection) -> Result<(), String> {
             while pages.next().map_err(|e| e.to_string())?.is_some() {}
             drop(pages);
         }
-    } else {
-        // Non-incremental or legacy database: full VACUUM to shrink disk size
-        let _ = conn.execute("VACUUM", []);
     }
+    // 旧日志库的整库 VACUUM 由显式维护执行，自动清理只回收支持增量回收的数据库。
 
     checkpoint()
 }
@@ -1216,7 +1217,7 @@ fn projected_bytes(conn: &Connection, log_bytes: u64) -> Result<u64, String> {
 
 fn make_room(conn: &Connection, budget: u64, log_bytes: u64) -> Result<(), String> {
     if budget == 0 {
-        return Err("proxy log disk budget is 0".to_string());
+        return Ok(());
     }
     if projected_bytes(conn, log_bytes)? <= budget {
         return Ok(());
@@ -1331,7 +1332,7 @@ fn save_log_with_connection(
     .map(|s| s.len() as u64)
     .sum::<u64>();
     let mut log_bytes = summary_bytes.saturating_add(body_bytes);
-    if log_bytes.saturating_mul(3).saturating_add(64 * 1024) > budget / 5 * 4 {
+    if budget > 0 && log_bytes.saturating_mul(3).saturating_add(64 * 1024) > budget / 5 * 4 {
         log.request_body = None;
         log.upstream_request_body = None;
         log.response_body = None;
@@ -1340,7 +1341,7 @@ fn save_log_with_connection(
         log.response_headers = None;
         log_bytes = summary_bytes;
     }
-    if log_bytes.saturating_mul(3).saturating_add(64 * 1024) > budget {
+    if budget > 0 && log_bytes.saturating_mul(3).saturating_add(64 * 1024) > budget {
         return Err("proxy log summary exceeds disk budget".to_string());
     }
     make_room(conn, budget, log_bytes)?;
@@ -1656,6 +1657,47 @@ mod retention_tests {
     use rusqlite::Connection;
 
     #[test]
+    fn compat_legacy_log_upgrade_preserves_rows_bodies_and_unlimited_writes() {
+        use crate::proxy::monitor::prompt_log_tests::{sample_log, TestDataDir};
+        let _dir = TestDataDir::new();
+        let conn = Connection::open(get_proxy_db_path().unwrap()).unwrap();
+        conn.execute_batch("CREATE TABLE request_logs (id TEXT PRIMARY KEY, timestamp INTEGER, method TEXT, url TEXT, status INTEGER, duration INTEGER, model TEXT, error TEXT, response_body TEXT)").unwrap();
+        conn.execute("INSERT INTO request_logs (id, timestamp, method, url, status, duration, response_body) VALUES ('legacy', 1, 'POST', '/v1/chat/completions', 200, 1, 'historical body')", []).unwrap();
+        drop(conn);
+        init_db().unwrap();
+        let conn = connect_db().unwrap();
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "auto_vacuum", |r| r.get(0))
+                .unwrap(),
+            0
+        );
+        let policy = LogRetentionConfig {
+            max_rows: 0,
+            max_disk_mb: 0,
+            max_storage_gb: 0.0,
+            ..LogRetentionConfig::default()
+        };
+        save_log_with_connection(&conn, sample_log("new-unlimited", 1024), &policy).unwrap();
+        assert_eq!(
+            apply_retention_with_connection(&conn, &policy).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            get_log_detail("legacy").unwrap().response_body.as_deref(),
+            Some("historical body")
+        );
+        assert_eq!(
+            get_log_detail("new-unlimited").unwrap().response_body,
+            Some("错".repeat(1024))
+        );
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "auto_vacuum", |r| r.get(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
     fn prompt_log_disk_budget_cleanup_and_live_config_reload() {
         use crate::proxy::monitor::prompt_log_tests::{sample_log, TestDataDir};
         let _dir = TestDataDir::new();
@@ -1691,11 +1733,11 @@ mod retention_tests {
             max_storage_gb: 0.0,
             ..config.proxy.log_retention
         };
-        assert!(
-            save_log_with_connection(&conn, sample_log("no-room", 100), &zero_budget_policy)
-                .is_err()
+        save_log_with_connection(&conn, sample_log("unlimited", 100), &zero_budget_policy).unwrap();
+        assert_eq!(
+            get_log_detail("unlimited").unwrap().response_body,
+            Some("错".repeat(100))
         );
-        assert!(get_log_detail("no-room").is_err());
     }
 
     #[test]

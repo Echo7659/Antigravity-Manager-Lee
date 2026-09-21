@@ -838,7 +838,7 @@
       "log_retention_title": "请求日志保留",
       "log_retention_body_hours": "请求体保留小时数",
       "log_retention_storage_gb": "日志保留空间上限 (GB)",
-      "log_retention_storage_gb_desc": "达到上限后自动触发滑动窗口，淘汰最尾部 30% 日志记录以容纳新日志入库",
+      "log_retention_storage_gb_desc": "0 表示不限制容量；设置上限后，达到上限会清理最旧的 30% 日志。",
       "log_retention_current_usage": "当前数据库空间",
       "log_retention_rows": "最大日志行数",
       "upstream_proxy": {

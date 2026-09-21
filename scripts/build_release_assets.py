@@ -53,6 +53,8 @@ Account failover now tries the initial account plus up to five different account
 
 Fixes account sorting panics that disconnected HTTP requests, uses upstream model/effort routing, and checks inclusive model quota thresholds before account selection. Used-account quotas refresh after responses, selection samples the full eligible subscription tier, and quota reloads preserve cooldowns. See `docs/QUOTA_AND_STABILITY.md` for limits and behavior.
 
+Preserves existing unlimited log retention during upgrade. Automatic cleanup does not rewrite legacy log databases with full VACUUM; large deployments may defer secondary-index creation to a maintenance window.
+
 The attached deployment bundle pins the tested image digest and contains no credentials. Existing deployments must retain their data mounts and secrets.
 ''')
 print(archive)

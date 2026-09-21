@@ -847,7 +847,7 @@
       "log_retention_title": "Request log retention",
       "log_retention_body_hours": "Request body age (hours)",
       "log_retention_storage_gb": "Log storage limit (GB)",
-      "log_retention_storage_gb_desc": "When reaching limit, sliding window evicts oldest 30% logs to accommodate new entries",
+      "log_retention_storage_gb_desc": "0 means no storage limit. When a positive limit is reached, the oldest 30% of logs are removed.",
       "log_retention_current_usage": "Current database disk usage",
       "log_retention_rows": "Maximum log rows",
       "upstream_proxy": {

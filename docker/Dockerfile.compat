@@ -86,12 +86,14 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/app/src-tauri/target \
     cargo build --locked --release --bin antigravity-tools && \
+    ABV_DATA_DIR=/tmp/antigravity-ci-tests cargo test --locked --release --lib compat_ -- --test-threads=1 && \
+    ABV_DATA_DIR=/tmp/antigravity-ci-tests cargo test --locked --release --lib modules::proxy_db:: -- --test-threads=1 && \
     cp target/release/antigravity-tools /tmp/antigravity-tools
 
 FROM lbjlaq/antigravity-manager@sha256:a451e34903a5e8adbd5c0ca6820541f480ce03228fa9ce717433801c9203fb26
 COPY --from=backend-builder /tmp/antigravity-tools /app/antigravity-tools
 COPY --from=frontend-builder /app/dist /app/dist
-LABEL org.opencontainers.image.version="4.7.12-lee.1"
+LABEL org.opencontainers.image.version="4.7.12-lee.2"
 ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
 LABEL org.opencontainers.image.source="https://github.com/Echo7659/Antigravity-Manager-Lee"

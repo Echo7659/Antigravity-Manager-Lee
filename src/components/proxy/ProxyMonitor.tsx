@@ -1608,11 +1608,12 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
         if (!appConfig) return;
         const currentRetention = appConfig.proxy?.log_retention || { max_body_age_hours: 24, max_storage_gb: 0.5, max_rows: 100000 };
         const safeVal = field === 'max_storage_gb'
-            ? Math.max(0.1, isNaN(value) ? 0.5 : value)
+            ? Math.max(0, isNaN(value) ? 1.0 : value)
             : Math.max(1, isNaN(value) ? 1 : value);
         const updated = {
             ...currentRetention,
             [field]: safeVal,
+            ...(field === 'max_storage_gb' ? { max_disk_mb: 0 } : {}),
         };
         const currentExp: ExperimentalConfig = appConfig.proxy?.experimental || {
             enable_usage_scaling: true,
@@ -1836,8 +1837,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                                         </div>
                                         <input
                                             type="number"
-                                            min={0.1}
-                                            max={100}
+                                            min={0}
                                             step={0.1}
                                             value={appConfig.proxy.log_retention?.max_storage_gb ?? 1.0}
                                             onChange={(e) => updateLogRetentionField('max_storage_gb', parseFloat(e.target.value))}

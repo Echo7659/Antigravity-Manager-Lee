@@ -12,7 +12,7 @@ This release merges upstream `v4.7.12` into the Lee branch. Upstream implementat
 | Account ordering | Lee comparator with upstream subscription classification | Fixed reset-time buckets preserve transitivity and avoid sorting panics. |
 | Quota protection | Lee inclusive boundary and exact-model checks | A model at the configured threshold is excluded even when a sibling model has more quota. Both weekly and short-window limits apply; used-account snapshots refresh after responses. |
 | Stream boundaries | Lee supplemental handling | Fragmented UTF-8, a final frame without newline, partial cumulative usage, explicit upstream errors and thinking-only empty answers remain covered. Upstream `include_usage` behavior is preserved. |
-| Existing log database startup | Supplemental migration safeguard | New databases enable incremental vacuum. Existing databases are not fully rewritten with `VACUUM` during startup; large historical logs require a separate maintenance window for that conversion. Official additive schema/index migrations still apply. |
+| Existing log database startup | Supplemental migration safeguard | New databases enable incremental vacuum. Existing databases are not fully rewritten with `VACUUM` during startup; large historical logs require a separate maintenance window for that conversion. Official additive schema migrations still apply. `ABV_DEFER_LOG_INDEX_MIGRATIONS=true` defers new secondary indexes for an existing large log database until a maintenance window; the original timestamp/status indexes remain usable. |
 | Native Gemini normalization | Lee supplemental normalization | Role inference and root `top_p` compatibility remain covered. |
 
 Docker builds the frontend and backend from this same checkout. The pinned runtime supplies OS libraries only; its old frontend and executable are overwritten. CI keeps the Lee image/release workflow and adds the upstream formatting gate. No desktop release workflow is activated.
@@ -22,3 +22,5 @@ Targeted compatibility tests use actual converter and policy sources. Only unrel
 Existing deployments must preserve their Compose ports, credential environment, persistent data mount, account records, custom model mapping, quota settings, and log retention. The deployment package is a digest-pinned Compose bundle, not an offline image archive.
 
 Thanks to the contributors of `lbjlaq/Antigravity-Manager`, including @jeikl, for the upstream pipeline and release improvements.
+
+Legacy configurations with `max_rows=0` and no disk-budget fields retain unlimited log storage after migration. Both capacity fields set to zero now mean unlimited; new installations still default to the official 1 GiB budget. Automatic retention never runs a full VACUUM on legacy databases.

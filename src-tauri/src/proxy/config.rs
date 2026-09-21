@@ -989,10 +989,10 @@ pub struct LogRetentionConfig {
     pub max_age_days: u64,
     #[serde(default = "default_max_rows")]
     pub max_rows: u64,
-    /// Application disk budget in MiB, including the database and WAL.
+    /// 兼容旧配置的磁盘预算；两个容量字段均为零时不限制容量。
     #[serde(default = "default_max_disk_mb")]
     pub max_disk_mb: u64,
-    /// Max log storage limit in GB (supports decimals, e.g. 0.5)
+    /// 日志容量上限（GB），正数优先于 MiB 字段；两个字段均为零时不限制容量。
     #[serde(default = "default_max_storage_gb")]
     pub max_storage_gb: f64,
 }
@@ -1014,6 +1014,19 @@ fn default_max_storage_gb() -> f64 {
 }
 
 impl LogRetentionConfig {
+    /// 旧版未限制日志条数且没有容量配置时，升级后保留不按容量淘汰的语义。
+    pub fn migrate_legacy_unlimited(raw: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+        if raw.get("max_rows").and_then(serde_json::Value::as_u64) == Some(0)
+            && !raw.contains_key("max_disk_mb")
+            && !raw.contains_key("max_storage_gb")
+        {
+            raw.insert("max_disk_mb".into(), serde_json::json!(0));
+            raw.insert("max_storage_gb".into(), serde_json::json!(0.0));
+            return true;
+        }
+        false
+    }
+
     pub fn budget_bytes(&self) -> u64 {
         if self.max_storage_gb > 0.0 {
             (self.max_storage_gb * 1024.0 * 1024.0 * 1024.0) as u64
@@ -1242,5 +1255,39 @@ mod tests {
         // 测试边缘情况
         assert_eq!(normalize_proxy_url(""), "");
         assert_eq!(normalize_proxy_url("   "), "");
+    }
+}
+
+#[cfg(test)]
+mod lee_log_retention_tests {
+    use super::LogRetentionConfig;
+    use serde_json::json;
+
+    #[test]
+    fn compat_legacy_unlimited_logs_do_not_acquire_a_one_gib_cap() {
+        let mut raw = json!({"max_rows": 0, "max_body_age_hours": 876000, "max_age_days": 36500});
+        assert!(LogRetentionConfig::migrate_legacy_unlimited(
+            raw.as_object_mut().unwrap()
+        ));
+        let policy: LogRetentionConfig = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(policy.budget_bytes(), 0);
+        assert!(!LogRetentionConfig::migrate_legacy_unlimited(
+            raw.as_object_mut().unwrap()
+        ));
+        for mut explicit in [
+            json!({"max_rows": 0, "max_storage_gb": 2.0}),
+            json!({"max_rows": 0, "max_disk_mb": 2048}),
+            json!({"max_rows": 100000}),
+        ] {
+            let before = explicit.clone();
+            assert!(!LogRetentionConfig::migrate_legacy_unlimited(
+                explicit.as_object_mut().unwrap()
+            ));
+            assert_eq!(explicit, before);
+        }
+        assert_eq!(
+            LogRetentionConfig::default().budget_bytes(),
+            1024 * 1024 * 1024
+        );
     }
 }
