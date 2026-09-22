@@ -2,5 +2,6 @@
 // 对应上游通讯接口
 
 pub mod client;
+pub mod header_timeout;
 pub mod models;
 pub mod retry;

@@ -236,7 +236,7 @@ impl UpstreamClient {
     }
 
     /// Get client for a specific account (or default if no proxy bound)
-    pub async fn get_client(&self, account_id: Option<&str>) -> Client {
+    async fn get_client(&self, account_id: Option<&str>) -> (Client, Option<String>) {
         if let Some(pool) = &self.proxy_pool {
             if let Some(acc_id) = account_id {
                 // Try to get per-account proxy
@@ -244,7 +244,7 @@ impl UpstreamClient {
                     Ok(Some(proxy_cfg)) => {
                         // Check cache
                         if let Some(client) = self.client_cache.get(&proxy_cfg.entry_id) {
-                            return client.clone();
+                            return (client.clone(), Some(proxy_cfg.entry_id));
                         }
                         // Build new client and cache it
                         match self.build_client_with_proxy(proxy_cfg.clone()) {
@@ -256,7 +256,7 @@ impl UpstreamClient {
                                     proxy_cfg.entry_id,
                                     acc_id
                                 );
-                                return client;
+                                return (client, Some(proxy_cfg.entry_id));
                             }
                             Err(e) => {
                                 tracing::error!("Failed to build client for proxy {}: {}, falling back to default", proxy_cfg.entry_id, e);
@@ -277,7 +277,7 @@ impl UpstreamClient {
             }
         }
         // Fallback to default client
-        self.default_client.read().await.clone()
+        (self.default_client.read().await.clone(), None)
     }
 
     /// Build v1internal URL
@@ -346,7 +346,9 @@ impl UpstreamClient {
         }
 
         // [NEW] Get client based on account (cached in proxy pool manager)
-        let client = self.get_client(account_id).await;
+        let (client, proxy_cache_key) = self.get_client(account_id).await;
+        let header_timeout =
+            super::header_timeout::duration(body.get("model").and_then(Value::as_str));
 
         // 构建 Headers (所有端点复用)
         let mut headers = header::HeaderMap::new();
@@ -470,7 +472,21 @@ impl UpstreamClient {
                     req_builder = req_builder.body(body_bytes.clone());
                 }
 
-                let response = req_builder.send().await;
+                let response = match super::header_timeout::wait(req_builder.send(), header_timeout)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(_) => {
+                        if let Some(ref key) = proxy_cache_key {
+                            self.client_cache.remove(key);
+                        }
+                        tracing::warn!(endpoint = %base_url, timeout_secs = header_timeout.as_secs(), "Upstream response headers timed out; yielding to account failover");
+                        return Err(format!(
+                            "Upstream response headers timed out after {} seconds",
+                            header_timeout.as_secs()
+                        ));
+                    }
+                };
 
                 match response {
                     Ok(resp) => {
@@ -536,6 +552,9 @@ impl UpstreamClient {
                         });
                     }
                     Err(e) => {
+                        if let Some(ref key) = proxy_cache_key {
+                            self.client_cache.remove(key);
+                        }
                         let msg = format!("HTTP request failed at {}: {}", base_url, e);
                         tracing::debug!("{}", msg);
                         // [NEW] 记录网络错误的降级尝试

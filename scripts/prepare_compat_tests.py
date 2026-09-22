@@ -97,9 +97,11 @@ pub mod proxy {{
         pub struct AppState {{ pub token_manager: std::sync::Arc<super::token_manager::TokenManager> }}
     }}
     #[path = {module(source / 'middleware/quota_refresh.rs')}] pub mod quota_refresh;
+    #[path = {module(source / 'middleware/response_deadline.rs')}] pub mod response_deadline;
 
     pub mod upstream {{
         #[path = {module(source / 'upstream/retry.rs')}] pub mod retry;
+        #[path = {module(source / 'upstream/header_timeout.rs')}] pub mod header_timeout;
     }}
     pub struct SignatureCache;
     impl SignatureCache {{

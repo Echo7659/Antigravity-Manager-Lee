@@ -781,9 +781,17 @@ pub async fn monitor_middleware(
     let mut request = request;
     request.extensions_mut().insert(upstream_holder.clone());
 
-    let response = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
-        .scope(upstream_holder.clone(), next.run(request))
-        .await;
+    let response_future = crate::proxy::monitor::CURRENT_UPSTREAM_CAPTURE
+        .scope(upstream_holder.clone(), next.run(request));
+    let response = if super::response_deadline::applies(&method, &uri, model.as_deref()) {
+        super::response_deadline::run(
+            response_future,
+            std::time::Duration::from_secs(state.request_timeout.max(1)),
+        )
+        .await
+    } else {
+        response_future.await
+    };
     let upstream_request_body = upstream_holder.take();
     let upstream_request_headers = upstream_holder.take_headers();
     let response_headers_json =

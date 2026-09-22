@@ -1833,6 +1833,12 @@ async fn admin_save_config(
         let mut pool = state.proxy_pool_state.write().await;
         *pool = new_config.clone().proxy.proxy_pool;
     }
+    state.proxy_pool_manager.sync_bindings_from_config().await;
+    state
+        .upstream
+        .rebuild_default_client(Some(new_config.proxy.upstream_proxy.clone()))
+        .await;
+    state.upstream.clear_client_cache();
 
     // [FIX Web Mode] 同步全局内存配置（热更新思考预算、系统提示词、图像思考模式、压缩等级、阈值与审计策略）
     crate::proxy::update_thinking_budget_config(new_config.proxy.thinking_budget.clone());

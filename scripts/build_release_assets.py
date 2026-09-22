@@ -57,6 +57,8 @@ Preserves existing unlimited log retention during upgrade. Automatic cleanup doe
 
 Dashboard quota values now distinguish five-hour, weekly and effective balances. Gemini and Claude recommendations switch independently, with pending, success and failure feedback. See `docs/DASHBOARD_QUOTA.md`.
 
+Text generation now bounds upstream response-header waits and pre-response processing, while delivered streams and image generation retain their existing lifetime behavior. Docker/Web configuration saves synchronize account proxy bindings and discard stale connection caches. See `docs/UPSTREAM_TIMEOUTS.md` for timeout and retry boundaries.
+
 The attached deployment bundle pins the tested image digest and contains no credentials. Existing deployments must retain their data mounts and secrets.
 ''')
 print(archive)
