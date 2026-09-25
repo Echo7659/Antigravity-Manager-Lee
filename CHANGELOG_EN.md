@@ -1,4 +1,4 @@
-## v4.8.1-lee.1
+## v4.8.1-lee.2
 
 Merge official v4.8.1; preserve six-account failover, quota guards, usage accounting, timeouts and dashboard fixes. Thanks to @jeikl, @Avlaak and upstream contributors (PR #3518).
 

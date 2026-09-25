@@ -33,6 +33,8 @@ import { isTauri } from "../utils/env";
 import { request as invoke } from "../utils/request";
 import { useTranslation } from "react-i18next";
 
+import { matchesAccountStatus, type AccountStatusFilter } from '../utils/accountStatus';
+
 type FilterType = "all" | "pro" | "ultra" | "free";
 type ViewMode = "list" | "grid";
 export type QuotaWindow = "5h" | "weekly";
@@ -60,6 +62,9 @@ function Accounts() {
 
   const [searchQuery, setSearchQuery] = useState('');
   const [filter, setFilter] = useState<FilterType>('all');
+  const [statusFilter, setStatusFilter] = useState<AccountStatusFilter>('all');
+  const [isDeleting, setIsDeleting] = useState(false);
+  const deletingRef = useRef(false);
   const [isSearchExpanded, setIsSearchExpanded] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
@@ -253,21 +258,26 @@ function Accounts() {
     return accounts.filter((a) => a.email.toLowerCase().includes(lowQuery));
   }, [accounts, searchQuery]);
 
-  // 计算各筛选状态下的数量 (基于搜索结果)
+  const statusAccounts = useMemo(
+    () => searchedAccounts.filter(account => matchesAccountStatus(account, statusFilter)),
+    [searchedAccounts, statusFilter],
+  );
+
+  // 计算各筛选状态下的数量 (基于搜索结果及账号状态)
   const filterCounts = useMemo(() => {
     return {
-      all: searchedAccounts.length,
-      pro: searchedAccounts.filter((a) => getAccountTier(a) === "pro").length,
-      ultra: searchedAccounts.filter((a) => getAccountTier(a) === "ultra").length,
-      free: searchedAccounts.filter((a) => getAccountTier(a) === "free").length,
+      all: statusAccounts.length,
+      pro: statusAccounts.filter((a) => getAccountTier(a) === "pro").length,
+      ultra: statusAccounts.filter((a) => getAccountTier(a) === "ultra").length,
+      free: statusAccounts.filter((a) => getAccountTier(a) === "free").length,
     };
-  }, [searchedAccounts]);
+  }, [statusAccounts]);
 
   // 过滤和搜索最终结果
   const filteredAccounts = useMemo(() => {
-    if (filter === "all") return searchedAccounts;
-    return searchedAccounts.filter((a) => getAccountTier(a) === filter);
-  }, [searchedAccounts, filter]);
+    if (filter === "all") return statusAccounts;
+    return statusAccounts.filter((a) => getAccountTier(a) === filter);
+  }, [statusAccounts, filter]);
 
   // Pagination Logic
   const paginatedAccounts = useMemo(() => {
@@ -283,7 +293,11 @@ function Accounts() {
   useEffect(() => {
     setSelectedIds(new Set());
     setCurrentPage(1);
-  }, [filter, searchQuery]);
+  }, [filter, searchQuery, statusFilter]);
+
+  useEffect(() => {
+    setCurrentPage(page => Math.min(page, Math.max(1, Math.ceil(filteredAccounts.length / ITEMS_PER_PAGE))));
+  }, [filteredAccounts.length, ITEMS_PER_PAGE]);
 
   const handleToggleSelect = (id: string) => {
     const newSet = new Set(selectedIds);
@@ -364,38 +378,41 @@ function Accounts() {
   };
 
   const executeBatchDelete = async () => {
-    setIsBatchDelete(false);
+    if (deletingRef.current || selectedIds.size === 0) return;
+    deletingRef.current = true;
+    setIsDeleting(true);
     try {
-      const ids = Array.from(selectedIds);
-      console.log("[Accounts] Batch deleting:", ids);
-      await deleteAccounts(ids);
+      await deleteAccounts(Array.from(selectedIds));
       setSelectedIds(new Set());
-      console.log("[Accounts] Batch delete success");
+      setIsBatchDelete(false);
       showToast(t("common.success"), "success");
     } catch (error) {
-      console.error("[Accounts] Batch delete failed:", error);
       showToast(`${t("common.error")}: ${error}`, "error");
+    } finally {
+      deletingRef.current = false;
+      setIsDeleting(false);
     }
   };
 
   const handleDelete = (accountId: string) => {
-    console.log("[Accounts] Request to delete:", accountId);
     setDeleteConfirmId(accountId);
   };
 
   const executeDelete = async () => {
-    if (!deleteConfirmId) return;
-
+    if (!deleteConfirmId || deletingRef.current) return;
+    deletingRef.current = true;
+    setIsDeleting(true);
+    const id = deleteConfirmId;
     try {
-      console.log("[Accounts] Executing delete for:", deleteConfirmId);
-      await deleteAccount(deleteConfirmId);
-      console.log("[Accounts] Delete success");
+      await deleteAccount(id);
+      setSelectedIds(previous => new Set([...previous].filter(selected => selected !== id)));
+      setDeleteConfirmId(null);
       showToast(t("common.success"), "success");
     } catch (error) {
-      console.error("[Accounts] Delete failed:", error);
       showToast(`${t("common.error")}: ${error}`, "error");
     } finally {
-      setDeleteConfirmId(null);
+      deletingRef.current = false;
+      setIsDeleting(false);
     }
   };
 
@@ -737,7 +754,7 @@ function Accounts() {
       />
 
       {/* 顶部工具栏:搜索、过滤和操作按钮 */}
-      <div className="flex-none flex items-center gap-2">
+      <div className="flex-none flex flex-wrap items-center gap-2">
         {/* 搜索框 - 响应式:大屏显示输入框,小屏显示图标 */}
         <div className="hidden lg:block flex-none w-40 relative transition-all focus-within:w-48">
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
@@ -929,6 +946,17 @@ function Accounts() {
             </span>
           </button>
         </div>
+
+        <select
+          aria-label={t('accounts.status_filter.label')}
+          value={statusFilter}
+          onChange={event => setStatusFilter(event.target.value as AccountStatusFilter)}
+          className="px-2 py-2 text-xs rounded-lg border border-gray-200 dark:border-base-300 bg-white dark:bg-base-100 text-gray-700 dark:text-base-content"
+        >
+          {(['all', 'forbidden', 'disabled', 'unavailable'] as const).map(status => (
+            <option key={status} value={status}>{t(`accounts.status_filter.${status}`)}</option>
+          ))}
+        </select>
 
         <div className="flex-1 min-w-[8px]"></div>
 
@@ -1171,7 +1199,8 @@ function Accounts() {
             : t("accounts.dialog.delete_msg")
         }
         type="confirm"
-        confirmText={t("common.delete")}
+        confirmText={isDeleting ? t("accounts.deleting") : t("common.delete")}
+        isLoading={isDeleting}
         isDestructive={true}
         onConfirm={isBatchDelete ? executeBatchDelete : executeDelete}
         onCancel={() => {

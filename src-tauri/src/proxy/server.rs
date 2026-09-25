@@ -1490,9 +1490,18 @@ async fn admin_delete_account(
     State(state): State<AppState>,
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .account_service
-        .delete_account(&account_id)
+    let service = state.account_service.clone();
+    let deleted_id = account_id.clone();
+    tokio::task::spawn_blocking(move || service.delete_account(&deleted_id))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1500,13 +1509,8 @@ async fn admin_delete_account(
             )
         })?;
 
-    // [FIX #1166] 账号变动后立即重新加载 TokenManager
-    if let Err(e) = state.token_manager.load_accounts().await {
-        logger::log_error(&format!(
-            "[API] Failed to reload accounts after deletion: {}",
-            e
-        ));
-    }
+    // Deleting one account must not reload or temporarily empty the remaining pool.
+    state.token_manager.remove_account(&account_id);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2920,14 +2924,29 @@ struct BulkDeleteRequest {
 }
 
 async fn admin_delete_accounts(
+    State(state): State<AppState>,
     Json(payload): Json<BulkDeleteRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::modules::account::delete_accounts(&payload.account_ids).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
+    let ids = payload.account_ids.clone();
+    tokio::task::spawn_blocking(move || crate::modules::account::delete_accounts(&ids))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
+    for id in &payload.account_ids {
+        state.token_manager.remove_account(id);
+    }
     Ok(StatusCode::OK)
 }
 

@@ -176,6 +176,8 @@
     "effective_quota_short": "Effective"
   },
   "accounts": {
+    "status_filter": {"label": "Account status", "all": "All statuses", "forbidden": "Forbidden / 403", "disabled": "Disabled (including proxy)", "unavailable": "Forbidden or disabled"},
+    "deleting": "Deleting…",
     "account": "Account",
     "search_placeholder": "Search email...",
     "all": "All",

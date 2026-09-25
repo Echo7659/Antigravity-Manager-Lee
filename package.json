@@ -11,7 +11,7 @@
     "bump": "node scripts/bump-version.mjs",
     "tauri": "tauri",
     "tauri:debug": "RUST_LOG=debug npm run tauri dev",
-    "test:dashboard": "tsx tests/dashboard/dashboardQuota.test.ts && tsx src/config/__tests__/modelConfig.test.ts && tsx tests/dashboard/accountSwitch.test.ts"
+    "test:dashboard": "tsx tests/dashboard/dashboardQuota.test.ts && tsx src/config/__tests__/modelConfig.test.ts && tsx tests/dashboard/accountSwitch.test.ts && tsx tests/dashboard/accountManagement.test.ts"
   },
   "dependencies": {
     "@ant-design/icons": "^5.6.1",

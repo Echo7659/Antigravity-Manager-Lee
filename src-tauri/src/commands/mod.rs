@@ -97,8 +97,9 @@ pub async fn delete_account(
     );
     service.delete_account(&account_id)?;
 
-    // Reload token pool
-    let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
+    if let Some(instance) = proxy_state.instance.read().await.as_ref() {
+        instance.token_manager.remove_account(&account_id);
+    }
 
     Ok(())
 }
@@ -122,8 +123,11 @@ pub async fn delete_accounts(
     // 强制同步托盘
     crate::modules::tray::update_tray_menus(&app);
 
-    // Reload token pool
-    let _ = crate::commands::proxy::reload_proxy_accounts(proxy_state).await;
+    if let Some(instance) = proxy_state.instance.read().await.as_ref() {
+        for id in &account_ids {
+            instance.token_manager.remove_account(id);
+        }
+    }
 
     Ok(())
 }

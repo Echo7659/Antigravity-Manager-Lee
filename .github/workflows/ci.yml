@@ -28,6 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned compiler required by yaml-rt
         with:
           toolchain: 1.96.0
+          components: rustfmt
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - name: Prepare tests from current source

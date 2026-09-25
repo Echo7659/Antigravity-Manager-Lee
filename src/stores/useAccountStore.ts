@@ -35,6 +35,7 @@ interface AccountState {
 }
 
 let currentRequestSequence = 0;
+let accountListSequence = 0;
 
 export const useAccountStore = create<AccountState>((set, get) => ({
     accounts: [],
@@ -43,16 +44,19 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     error: null,
 
     fetchAccounts: async () => {
+        const sequence = ++accountListSequence;
         set({ loading: true, error: null });
         try {
             console.log('[Store] Fetching accounts...');
             const accounts = await accountService.listAccounts();
+            if (sequence !== accountListSequence) return;
             const current = get().currentAccount;
             const latest = accounts.find(account => account.id === current?.id);
             const currentAccount = current && latest && (latest.quota?.last_updated ?? 0) >= (current.quota?.last_updated ?? 0)
                 ? { ...latest, last_used: Math.max(current.last_used, latest.last_used) } : current;
             set({ accounts, currentAccount, loading: false });
         } catch (error) {
+            if (sequence !== accountListSequence) return;
             console.error('[Store] Fetch accounts failed:', error);
             set({ error: String(error), loading: false });
         }
@@ -82,31 +86,23 @@ export const useAccountStore = create<AccountState>((set, get) => ({
     },
 
     deleteAccount: async (accountId: string) => {
-        set({ loading: true, error: null });
+        set({ error: null });
         try {
             await accountService.deleteAccount(accountId);
-            await Promise.all([
-                get().fetchAccounts(),
-                get().fetchCurrentAccount()
-            ]);
-            set({ loading: false });
+            await applyDeletedAccounts([accountId]);
         } catch (error) {
-            set({ error: String(error), loading: false });
+            set({ error: String(error) });
             throw error;
         }
     },
 
     deleteAccounts: async (accountIds: string[]) => {
-        set({ loading: true, error: null });
+        set({ error: null });
         try {
             await accountService.deleteAccounts(accountIds);
-            await Promise.all([
-                get().fetchAccounts(),
-                get().fetchCurrentAccount()
-            ]);
-            set({ loading: false });
+            await applyDeletedAccounts(accountIds);
         } catch (error) {
-            set({ error: String(error), loading: false });
+            set({ error: String(error) });
             throw error;
         }
     },
@@ -324,3 +320,16 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         }
     },
 }));
+
+async function applyDeletedAccounts(accountIds: string[]): Promise<void> {
+    const deleted = new Set(accountIds);
+    ++accountListSequence;
+    ++currentRequestSequence;
+    const currentDeleted = deleted.has(useAccountStore.getState().currentAccount?.id ?? '');
+    useAccountStore.setState(state => ({
+        accounts: state.accounts.filter(account => !deleted.has(account.id)),
+        currentAccount: currentDeleted ? null : state.currentAccount,
+        loading: false,
+    }));
+    if (currentDeleted) await useAccountStore.getState().fetchCurrentAccount();
+}

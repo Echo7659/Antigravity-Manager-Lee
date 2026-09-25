@@ -448,7 +448,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-- **v4.8.1-lee.1**: Official 4.8.1 with retained reliability and dashboard fixes. [Reconciliation](docs/UPSTREAM_4_8_1.md). Thanks to @jeikl, @Avlaak and upstream contributors.
+- **v4.8.1-lee.2**: Official 4.8.1 with retained reliability and dashboard fixes. [Reconciliation](docs/UPSTREAM_4_8_1.md). Thanks to @jeikl, @Avlaak and upstream contributors.
 
 > Latest version **v4.8.1** (2026-09-25): Completely reconstructed egress message serialization across all 4 protocols with deterministic key ordering and canonical structure alignment, ensuring 100% byte consistency across protocol switching and universal Prefix Caching invariance; resolved thought signature drift during Claude <-> Gemini migration with bi-directional `<think>` embedding and causal signature recovery; discarded client tool IDs in favor of context-causal deterministic pseudo-hash IDs for unified bidirectional lookup; bridged agent tool multimodal vision loop with native conversion of Base64 tool images into Gemini visual payloads; eliminated legacy adapter-level `web_search` tool filtering and hardcoded dead code, unifying all tool handling into the inbound pipeline; fixed client budget mode thinking disable failures; introduced one-click CLI synchronization cards and modern edge-to-edge square app avatars for JeikCode, Hermes, OpenClaw, and Grok Build; added multilingual adaptive thinking cache cleanup prompt on major updates.
 
