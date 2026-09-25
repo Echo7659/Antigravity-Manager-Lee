@@ -1,8 +1,85 @@
+## v4.8.1-lee.1
+
+Merge official v4.8.1; preserve six-account failover, quota guards, usage accounting, timeouts and dashboard fixes. Thanks to @jeikl, @Avlaak and upstream contributors (PR #3518).
+
 # 📝 Changelog
 
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
 *   **Version History**:
+    *   **v4.8.1 (2026-09-25)**:
+        -   **[Unified 4-Protocol Egress & 100% Prefix Caching Invariance] Reconstruct egress payloads across 4 protocols, preventing prefix collapse and thought signature mismatch**:
+            -   **Deterministic Key Ordering & Topological Alignment**: Completely reconstructed egress payload serialization across OpenAI Chat, OpenAI Responses, Anthropic Claude, and Google Gemini using deterministic field sorting and canonical structure alignment. Payloads remain 100% byte-consistent when switching between protocols, ensuring universal, rock-solid Prefix Caching hits.
+            -   **Lossless Gemini <-> Claude Thinking Fusion & Signature Recovery**:
+                - For Claude protocol, upstream Gemini thinking is gracefully wrapped in `<think>` tags and embedded into message content;
+                - When migrating back to Gemini, `<think>` content is precisely lifted back into native thinking blocks and resolves real upstream signatures from causal stores (with compliant sentinel fallback if missing), completely eliminating prefix thrashing and signature validation errors.
+        -   **[Context Causal Pseudo-Hash IDs Over Client tool_id] Completely eliminate topological mismatch caused by missing or disparate tool IDs**:
+            -   **Causal Deterministic Pseudo-Hash ID**: Fully discarded dependence on client-generated random or missing `tool_id`s across all 4 protocols. Synthesize deterministic pseudo-IDs in the pipeline based on context causal hashes, unifying bidirectional retrieval for tool invocations, result backfilling, and thinking signatures.
+        -   **[Tool Result Images Direct to Google Vision Payloads] Complete multimodal visual loop for Agent tools**:
+            -   **Base64 Tool Image Ingestion**: Fully supports Base64 images returned by client tools, automatically extracting and structuring them into native Google Gemini `inlineData` image payloads, enabling Gemini to natively perceive and analyze tool-generated charts, screenshots, and visual outputs.
+        -   **[Pipeline Convergence & Dead Code Elimination] Remove adapter tool filtering and hardcoded prompts**:
+            -   **Lift Tool Handling to Pipeline**: Completely removed legacy filtering of `web_search` and hardcoded prompt rewriting scattered across protocol adapters; eliminated dead code and converged tool governance into the unified InboundThinkingPipeline.
+        -   **[Client Thinking Budget Control & Thinking Disable Fixes] (Fixes #3516, #3515)**:
+            -   **Budget Mode Thinking Disable Fix**: Fixed failures when disabling thinking (Budget = 0 / `disabled`) under client budget mode; recommended using un-suffixed models or tiered models for granular thinking intensity control.
+            -   **Complete Alias Resolution**: Enhanced full-chain alias mappings for `max_completion_tokens`, `max_output_tokens`, and `reasoning.max_tokens` / `budget_tokens`.
+        -   **[Agent CLI Ecosystem Expansion & Brand App Icons] (PR #3518, Thanks to @avlaaak)**:
+            -   **One-Click Agent Sync**: Added CLI synchronization support for JeikCode, Hermes, OpenClaw, and Grok Build (supporting lossless YAML config backups, safe restore, and automatic deactivation upon cleanup).
+            -   **App Icon Unification**: Unified CLI sync card visual language with edge-to-edge square app avatars, integrating JeikCode and official `@lobehub/icons` brand assets.
+        -   **[Thinking Cache Invalidation Modal on Upgrade]**:
+            -   **Adaptive Thinking Cache Cleanup Prompt**: Added multilingual `SuggestionDeleteThinkingModal` (12 languages) to guide existing users through a one-time thinking cache cleanup when updating across architectural changes.
+
+    *   **v4.8.1-beta.1 (2026-09-25)**:
+        -   **[OpenAI Responses Protocol Enhancement] Add max_output_tokens Alias Support & Precise Thinking Budget/Level Mapping**:
+            -   **Support max_output_tokens Deserialization Alias**: Added `max_output_tokens` and `maxOutputTokens` field aliases to top-level `OpenAIRequest`, ensuring standard client outputs are properly mapped to upstream `maxOutputTokens`.
+            -   **Unit Tests & Edge-Case Coverage**: Enhanced test suites to cover `max_completion_tokens`, `max_output_tokens`, and `reasoning.max_tokens` thinking budget alias resolution paths.
+
+    *   **v4.8.0 (2026-09-23)**:
+        -   **[Full-Protocol Tool & Argument 100% Pure Passthrough] Eliminate Agent-Client Tool Call Failures Caused by Legacy Truncation and Opaque Rewriting (PR #3504)**:
+            -   **Lossless Tool & Argument Egress**: Removed tool-name mapping, argument alias rewriting, and error command injection across OpenAI, Anthropic Claude, and Google Gemini adapters, allowing tool names and arguments to reach upstream with the client's original semantics intact — resolving tool call errors in OpenClaw and other agent clients.
+            -   **Zero-Intrusion Descriptions & Verbatim Outputs**: Removed write-based injection into `description` during schema validation and eliminated the tool output compressor; descriptions and execution results now pass through 100% unmodified.
+            -   **System Instruction Freeze & Dead Code Excised**: Replaced aggressive System Prompt freezing with `<system-reminder>` user turns; excised `ToolAdapter`, `PencilAdapter`, and 700+ lines of legacy `apply_patch` diagnostics, netting 3,300+ lines of cleaned code.
+        -   **[Vendor Attribution Statement Normalization] Prevent False 429 Upstream Cool-down Deadlocks (Fixes #3508, Thanks to @oliverhe202018-ctrl)**:
+            -   **Dynamic Prompt Normalization**: Sanitizes foreign vendor statements in client prompts to prevent upstream security policies from misclassifying requests as abusive, completely eliminating entire pool cooldowns triggered by false rate-limiting.
+        -   **[Seamless IDE Hot-Switching] Restart language_server Worker Process Only Without Terminating Main Window**:
+            -   **Targeted Hot-Restart**: Automatically restarts only the internal language server engine on account rotation instead of killing the main IDE application window, preserving active developer context.
+        -   **[Proxy Pipeline Clarification & Audit Telemetry Optimization]**:
+            -   **Inbound vs Outbound Boundary**: Excised inactive outbound pipeline stages, establishing unified inbound convergence and divergent outbound handling; converged risky prompt sanitization into `PromptSanitizer`.
+            -   **Audit Field Priority Reordering**: Reordered telemetry fields by developer priority (Model → Thought → Context → Usage → Tools), and extended the simple audit whitelist for OpenAI Responses instructions and inputs.
+            -   **GET Request Log Suppression**: Suppresses successful GET request persistence when traffic capture is disabled, drastically reducing database bloat.
+        -   **[Dual-Track Release Pipelines & Strict Channel Gates]**:
+            -   **Strict Channel Isolation**: Established `main` for stable releases and `beta` for isolated preview builds; introduced `verify-release-target` CI/CD gate to intercept cross-branch misplacements.
+            -   **Zero Production Intrusion**: Pre-releases are marked as non-latest and completely isolated from the automatic update channel and Docker `latest` tags.
+            -   **Branch-Aware Bump Tooling**: Upgraded `bump-version.mjs` with branch auto-detection, directional guidance, and misplacement safeguards.
+
+    *   **v4.7.14-beta (2026-09-22)**:
+        -   **[Full-Protocol Tool & Argument 100% Pure Passthrough] Eliminate Agent-Client Tool Call Failures Caused by Legacy Truncation and Opaque Rewriting (PR #3504)**:
+            -   **Lossless Tool & Argument Egress**: Removed tool-name mapping, argument alias rewriting, and erroneous command injection across the OpenAI, Anthropic Claude, and Google Gemini adapters, so tool names and arguments reach the upstream with the client's original semantics intact — resolving the erratic tool call errors reported by OpenClaw and other agent clients due to legacy truncation and rewriting.
+            -   **Zero-Intrusion Tool Descriptions**: Removed write-based injection into `description` during tool schema validation; description fields now pass through 100% unmodified.
+            -   **Uncompressed Tool Results**: Removed the tool output compressor and patch error folding, so tool execution results are returned verbatim and in full.
+            -   **System Instruction Absolute Freeze**: Removed aggressive regex freezing of dates, timezones, working paths, and UUIDs in the System Prompt; mid-stream dynamic messages are now faithfully demoted into user turns via `<system-reminder>`.
+            -   **Security Guardrails Preserved**: Retained Codex identity normalization and high-risk pseudo-header stripping, so WAF mitigation remains intact.
+            -   **Dead Code Excised**: Removed the unreferenced `ToolAdapter` / `PencilAdapter` architecture and 700+ lines of `apply_patch` diagnostics, netting 3,300+ lines of redundant code.
+        -   **[Release & CI Discipline Codified] End-to-End Safe Pre-release Pipeline (PR #3504)**:
+            -   **Automatic Pre-release Isolation**: `release.yml` now detects pre-release tags; any tag containing `-` (`-beta` / `-cleaned` / `-alpha` / `-rc`) is marked as a Pre-release and excluded from Latest, so pre-release builds are never delivered to stable users via `releases/latest/download/updater.json`.
+            -   **CI Gates & Release Pre-flight**: `AGENTS.md` now documents the CI-parity pre-flight command list and the pre-tag check requirement; `docs/RELEASE_GUIDE.md` was condensed and extended with pre-release and branch-tagging guidance.
+
+    *   **v4.7.13 (2026-09-22)**:
+        -   **[Support "Lightweight Mode" for Minimized Background RAM Footprint] Destroy & Release WebView Renderer on Close/Minimize to Tray (Fixes #3502)**:
+            -   **On-Demand Destruction & Drastic RAM Reduction**: Supports explicitly destroying the webview rendering process upon closing or minimizing to the tray (`enter_lightweight_mode`), while core Rust services (reverse proxy gateway, 7-day smart warmup, quota monitor, circuit breaker) remain 100% active in Tokio runtime. Background RAM drops from ~160MB-250MB down to ~30MB-35MB.
+            -   **Seamless Self-Healing & Dynamic Reconstruction**: Rebuilding and awakening the main window (`exit_lightweight_mode`) seamlessly on tray icon left-click, tray menu "Show Main Window", or duplicate application launcher invocations (`tauri_plugin_single_instance`), restoring saved window geometry and native Win32 taskbar icons.
+            -   **Dual-End Toggle & i18n Synchronization**: Exposed directly as an interactive `CheckMenuItem` in the system tray menu and as a configuration toggle card in "Settings -> General", localized for all supported languages.
+        -   **[Client Process Management & Auto-Relaunch Hardening] Eliminate Intermittent "open: unrecognized option '--standalone'" Dialogs and Relaunch Failures on Account Switching (Fixes #3499, #3501, Thanks to @Terryli246)**:
+            -   **Engine Process Snapshot Exclusion & Source Isolation**: Explicitly filters out internal language server engine processes (`language_server`) and engine arguments (`--standalone`, `--override_ide_name`, `--subclient_type`) in `get_process_info` and `is_helper_process`, preventing hash-map process iteration from inadvertently latching onto backend worker processes.
+            -   **Cross-Platform Startup Argument Sanitization**: Introduced `sanitize_restart_args` pipeline to strip engine-internal parameters, preventing GUI client launch failures or accidental headless worker spawning on Windows and Linux.
+            -   **macOS `open` Standard Argument Conformance**: Normalized macOS `open` command invocation by strictly passing application arguments behind the `--args` flag, eliminating command parsing failures (`Startup failed: open: unrecognized option ...`) caused by unrecognized options.
+        -   **[Account Quota Smart Warmup & Countdown Fix] Fix Gemini Warmup Omission, Traffic Logs Missing Gemini Requests, and Stalled Countdown Timers (Fixes #3500)**:
+            -   **Uninitialized Weekly Window Cold-Start Unlocked**: Resolved the deadlock where unactivated Gemini weekly quota buckets (having `remaining_fraction >= 1.0` but empty `reset_time` before the first weekly request) were silently skipped by the scheduler; added automatic cold-start warmup to activate Google's upstream 7-day quota timer.
+            -   **Multi-Window Identifier Support & Monitored Model Linking**: Extended weekly bucket recognition to support `7d` window identifiers, and dynamically linked model selection with user-configured `monitored_models` in settings.
+        -   **[Traffic Log & Monitoring Optimization] Filter High-Frequency Health Checks by Default to Prevent Log Flooding and Database Bloat (Fixes #3498)**:
+            -   **Intelligent Suppression for Successful Health Probes**: Intercepts `/health`, `/healthz`, and `/api/health` probes in `monitor_middleware`. When probes return successful statuses (2xx), `ProxyRequestLog` generation and SQLite disk persistence are bypassed by default, eliminating thousands of 200 GET `/health` entries generated every 15-30s in Docker, K8s, or cloud monitoring environments.
+            -   **Preserved Diagnostic Telemetry**: Any non-2xx responses (e.g. 503 Service Unavailable, 500) continue to be recorded normally in the traffic logs for rapid fault isolation.
+            -   **Flexible Environment Override**: Added `ABV_LOG_HEALTH_CHECKS=true/1` environment variable flag to allow full probe telemetry logging when strict auditing is needed.
+
     *   **v4.7.12 (2026-09-21)**:
         -   **[Cross-Model Thinking Signature Fallback & Retroactive Cache Purification] Eliminate 400 Validation Interceptions & 503 Deadlocks on Model Switching (PR #3496, Fixes #3494)**:
             -   **Inbound Pipeline Heterogeneous Signature Guard**: Enforces protocol-agnostic signature verification in `InboundThinkingPipeline`. When detecting incompatible foreign thinking signatures across model switches (e.g. Claude to Gemini), automatically down-ranks them to standard sentinels (`skip_thought_signature_validator`) and purges dirty signatures from `functionCall` parts, stopping HTTP 400 validation failures before egress.

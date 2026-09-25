@@ -22,9 +22,9 @@ def version(name, prefix=''):
 streaming = (source / 'mappers/openai/streaming.rs').read_text()
 response = (source / 'mappers/openai/response.rs').read_text()
 assert 'pub fn create_legacy_sse_stream' in streaming
-assert 'fn extract_apply_patch_input' in response
+assert '#[cfg(test)]' in response
 (destination / 'streaming_excerpt.rs').write_text(streaming.split('pub fn create_legacy_sse_stream', 1)[0])
-(destination / 'response_excerpt.rs').write_text(response.split('fn extract_apply_patch_input', 1)[0])
+(destination / 'response_excerpt.rs').write_text(response.split('#[cfg(test)]', 1)[0])
 
 
 common = (source / 'handlers/common.rs').read_text()
@@ -76,6 +76,7 @@ pub mod proxy {{
         pub struct TurnAccumulator;
         impl TurnAccumulator {{
             pub fn new() -> Self {{ Self }}
+            pub fn with_anchor(_: &str) -> Self {{ Self }}
             pub fn ingest_part(&mut self, _: &serde_json::Value) {{}}
             pub fn record_tool_id(&mut self, _: &str, _: &str) {{}}
             pub fn commit(self, _: &str) {{}}

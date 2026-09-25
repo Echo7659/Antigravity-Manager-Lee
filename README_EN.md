@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v4.7.12)
+> Professional Account Management & Protocol Proxy System for AI Services (v4.8.1)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.7.12-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.8.1-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -448,7 +448,9 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 ## 📝 Changelog
 
-> Latest version **v4.7.5** (2026-09-18): Resolved Agent client 404/429/503 errors and purged billing headers to eliminate upstream Google WAF false positives; eliminated the 1,000 thinking budget defect causing zero-token thought collapse and unlocked up to 24,576/32,768 deep reasoning budgets; rebuilt traffic log virtualization and in-memory search with 30% sliding window physical disk eviction; resolved Balance mode 429 failover delays and session sticky deadlocks; enabled native Windows COM shortcut healing and fixed installer conflicts; automatically healed legacy PRO tier statuses.
+- **v4.8.1-lee.1**: Official 4.8.1 with retained reliability and dashboard fixes. [Reconciliation](docs/UPSTREAM_4_8_1.md). Thanks to @jeikl, @Avlaak and upstream contributors.
+
+> Latest version **v4.8.1** (2026-09-25): Completely reconstructed egress message serialization across all 4 protocols with deterministic key ordering and canonical structure alignment, ensuring 100% byte consistency across protocol switching and universal Prefix Caching invariance; resolved thought signature drift during Claude <-> Gemini migration with bi-directional `<think>` embedding and causal signature recovery; discarded client tool IDs in favor of context-causal deterministic pseudo-hash IDs for unified bidirectional lookup; bridged agent tool multimodal vision loop with native conversion of Base64 tool images into Gemini visual payloads; eliminated legacy adapter-level `web_search` tool filtering and hardcoded dead code, unifying all tool handling into the inbound pipeline; fixed client budget mode thinking disable failures; introduced one-click CLI synchronization cards and modern edge-to-edge square app avatars for JeikCode, Hermes, OpenClaw, and Grok Build; added multilingual adaptive thinking cache cleanup prompt on major updates.
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

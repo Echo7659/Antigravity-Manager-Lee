@@ -12,7 +12,7 @@
 ---
 
 # Antigravity Tools 🚀
-> 专业级 AI 账号管理与协议代理系统 (v4.7.12)
+> 专业级 AI 账号管理与协议代理系统 (v4.8.1)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -24,7 +24,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.7.12-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.8.1-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Frontend-React-61DAFB?style=flat-square" alt="React">
     <img src="https://img.shields.io/badge/License-CC--BY--NC--SA--4.0-lightgrey?style=flat-square" alt="License">
@@ -471,7 +471,9 @@ response = client.chat.completions.create(
 
 ## 📝 更新日志
 
-> 最新版本 **v4.7.5**（2026-09-18）：完美修复 Agent 客户端 404/429/503 报错，清洗 billing 头杜绝 Google WAF 误判；解除 1000 毒药预算导致思维链归零缺陷并开放至 24576/32768 大预算；重构日志大报文虚拟滚动渲染与内存解耦搜索，建立 30% 滑动窗口容量平滑淘汰；根治 Balance 负载均衡模式 429 故障转移与粘性会话死锁；支持 Windows 原生快捷方式自愈与覆盖安装冲突修复；自动补齐历史 PRO 账号标识。
+- **v4.8.1-lee.1**：同步官方 4.8.1，保留现有稳定性与仪表盘修复。[合并说明](docs/UPSTREAM_4_8_1.md)。感谢 @jeikl、@Avlaak 及上游贡献者。
+
+> 最新版本 **v4.8.1**（2026-09-25）：全面重构四大协议中转报文，引入确定性键序排序与拓扑拉齐，实现跨协议来回切换转出报文 100% 字节级一致，长上下文前缀缓存（Prefix Caching）通用不崩塌；彻底解决 Claude 与 Gemini 协议切换思考签名不同引发的异常，支持 `<think>` 标签包装及原生思考块无损提升与签名因果召回；全面抛弃客户端随机 tool_id，改用上下文因果确定性伪哈希 ID 统一双向检索；全面打通 Agent 视觉链路，支持工具结果中 Base64 图片原生转换为 Gemini 视觉输入载荷；全面拔除适配器层历史遗留的 `web_search` 工具过滤与硬编码死代码，统一收敛至 Pipeline 集中治理；修复客户端预算模式下关闭思考偶发失效的问题；新增 JeikCode、Hermes、OpenClaw、Grok Build 等 Agent 客户端一键配置卡片与无边框正方形 App 图标生态；新增全语言自适应版本升级清理思考块缓存建议弹窗。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

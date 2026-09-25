@@ -13,5 +13,4 @@ pub mod openai;
 pub mod prompt_sanitizer;
 pub mod rtk_cleaner;
 pub mod signature_store;
-pub mod tool_result_compressor;
 pub(crate) mod usage;

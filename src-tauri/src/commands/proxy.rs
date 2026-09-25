@@ -142,6 +142,7 @@ pub async fn internal_start_proxy_service(
         // Sync enabled state from config
         if let Some(monitor) = monitor_lock.as_ref() {
             monitor.set_enabled(config.enable_logging);
+            monitor.set_capture_health_logs(config.capture_health_logs);
         }
     }
 
@@ -444,6 +445,19 @@ pub async fn set_proxy_monitor_enabled(
     Ok(())
 }
 
+/// 设置捕获健康检查日志状态
+#[tauri::command]
+pub async fn set_proxy_capture_health_logs(
+    state: State<'_, ProxyServiceState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let monitor_lock = state.monitor.read().await;
+    if let Some(monitor) = monitor_lock.as_ref() {
+        monitor.set_capture_health_logs(enabled);
+    }
+    Ok(())
+}
+
 /// 清除反代请求日志
 #[tauri::command]
 pub async fn clear_proxy_logs(state: State<'_, ProxyServiceState>) -> Result<(), String> {
@@ -471,6 +485,14 @@ pub async fn clear_thinking_store() -> Result<usize, String> {
 
     // 2. 清空 SQLite 数据库中所有的 thinking_records 与 thinking_sessions
     tokio::task::spawn_blocking(crate::modules::proxy_db::clear_all_thinking_data)
+        .await
+        .map_err(|e| format!("Spawn blocking failed: {}", e))?
+}
+
+/// 获取当前思考块存储的记录总数
+#[tauri::command]
+pub async fn get_thinking_store_count() -> Result<usize, String> {
+    tokio::task::spawn_blocking(crate::modules::proxy_db::get_thinking_records_count)
         .await
         .map_err(|e| format!("Spawn blocking failed: {}", e))?
 }

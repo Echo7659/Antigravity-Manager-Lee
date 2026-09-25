@@ -436,13 +436,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = app.get_webview_window("main").map(|window| {
-                let _ = window.show();
-                let _ = window.set_focus();
-                #[cfg(target_os = "macos")]
-                app.set_activation_policy(tauri::ActivationPolicy::Regular)
-                    .unwrap_or(());
-            });
+            let _ = modules::lightweight::exit_lightweight_mode(app);
         }))
         .manage(commands::proxy::ProxyServiceState::new())
         .manage(commands::cloudflared::CloudflaredState::new())
@@ -580,16 +574,25 @@ pub fn run() {
                     .unwrap_or(true);
 
                 if tray_enabled {
-                    let _ = window.hide();
-                    #[cfg(target_os = "macos")]
-                    {
-                        use tauri::Manager;
-                        window
-                            .app_handle()
-                            .set_activation_policy(tauri::ActivationPolicy::Accessory)
-                            .unwrap_or(());
-                    }
                     api.prevent_close();
+
+                    let is_lightweight = modules::load_app_config()
+                        .map(|c| c.lightweight_mode)
+                        .unwrap_or(false);
+
+                    if is_lightweight {
+                        let _ = modules::lightweight::enter_lightweight_mode(window.app_handle());
+                    } else {
+                        let _ = window.hide();
+                        #[cfg(target_os = "macos")]
+                        {
+                            use tauri::Manager;
+                            window
+                                .app_handle()
+                                .set_activation_policy(tauri::ActivationPolicy::Accessory)
+                                .unwrap_or(());
+                        }
+                    }
                 }
             }
         })
@@ -672,8 +675,10 @@ pub fn run() {
             commands::proxy::get_proxy_logs_count_filtered,
             commands::proxy::get_proxy_logs_filtered,
             commands::proxy::set_proxy_monitor_enabled,
+            commands::proxy::set_proxy_capture_health_logs,
             commands::proxy::clear_proxy_logs,
             commands::proxy::clear_thinking_store,
+            commands::proxy::get_thinking_store_count,
             commands::proxy::get_proxy_db_disk_size,
             commands::proxy::generate_api_key,
             commands::proxy::reload_proxy_accounts,
@@ -727,6 +732,16 @@ pub fn run() {
             proxy::opencode_sync::execute_opencode_restore,
             proxy::opencode_sync::get_opencode_config_content,
             proxy::opencode_sync::execute_opencode_clear,
+            proxy::hermes_sync::get_hermes_sync_status,
+            proxy::hermes_sync::execute_hermes_sync,
+            proxy::hermes_sync::execute_hermes_restore,
+            proxy::hermes_sync::execute_hermes_clear,
+            proxy::hermes_sync::get_hermes_config_content,
+            proxy::openclaw_sync::get_openclaw_sync_status,
+            proxy::openclaw_sync::execute_openclaw_sync,
+            proxy::openclaw_sync::execute_openclaw_restore,
+            proxy::openclaw_sync::execute_openclaw_clear,
+            proxy::openclaw_sync::get_openclaw_config_content,
             proxy::droid_sync::get_droid_sync_status,
             proxy::droid_sync::execute_droid_sync,
             proxy::droid_sync::execute_droid_restore,
@@ -776,6 +791,17 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             match event {
+                // Prevent app from exiting when window is destroyed in lightweight mode
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    let tray_enabled = app_handle
+                        .try_state::<AppRuntimeFlags>()
+                        .map(|flags| flags.tray_enabled)
+                        .unwrap_or(true);
+
+                    if tray_enabled {
+                        api.prevent_exit();
+                    }
+                }
                 // Handle app exit - cleanup background tasks and release ports
                 tauri::RunEvent::Exit => {
                     tracing::info!("Application exiting, cleaning up background tasks and releasing ports...");
@@ -813,14 +839,7 @@ pub fn run() {
                 // Handle macOS dock icon click to reopen window
                 #[cfg(target_os = "macos")]
                 tauri::RunEvent::Reopen { .. } => {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
-                        app_handle
-                            .set_activation_policy(tauri::ActivationPolicy::Regular)
-                            .unwrap_or(());
-                    }
+                    let _ = modules::lightweight::exit_lightweight_mode(app_handle);
                 }
                 _ => {}
             }

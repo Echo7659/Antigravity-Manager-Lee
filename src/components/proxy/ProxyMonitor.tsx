@@ -592,6 +592,36 @@ function extractConcisePayload(
         return res;
     };
 
+    /**
+     * 递归深度反转义并反序列化嵌套在 JSON 字符串属性中的 JSON 内容
+     * 例如将 "response": "{\"error\":{\"code\":400...}}" 自动展开为真实的嵌套对象
+     */
+    const deepUnescapeJsonValue = (val: any): any => {
+        if (typeof val === 'string') {
+            const trimmed = val.trim();
+            if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                try {
+                    const parsed = JSON.parse(trimmed);
+                    return deepUnescapeJsonValue(parsed);
+                } catch {
+                    return val;
+                }
+            }
+            return val;
+        }
+        if (Array.isArray(val)) {
+            return val.map(deepUnescapeJsonValue);
+        }
+        if (val && typeof val === 'object') {
+            const res: Record<string, any> = {};
+            for (const [k, v] of Object.entries(val)) {
+                res[k] = deepUnescapeJsonValue(v);
+            }
+            return res;
+        }
+        return val;
+    };
+
     const concise: any = {};
 
     // 保留用于标识思考块/会话的单行标识 (支持 requestId, sessionId, trace_id 等)
@@ -835,6 +865,20 @@ function extractConcisePayload(
         concise.tool_calls = simplifyToolCalls(obj.tool_calls);
     }
 
+    // 错误响应提纯：不阉割双层报错，完整呈现网关诊断与上游原始错误
+    if (obj.type !== undefined && !obj.messages && !obj.choices) concise.type = obj.type;
+    if (obj.code !== undefined && !obj.messages && !obj.choices) concise.code = obj.code;
+    if (obj.status !== undefined && !obj.messages && !obj.choices) concise.status = obj.status;
+    if (obj.error !== undefined) {
+        concise.error = deepUnescapeJsonValue(obj.error);
+    }
+    if (obj.gateway_error !== undefined) {
+        concise.gateway_error = deepUnescapeJsonValue(obj.gateway_error);
+    }
+    if (obj.upstream_error !== undefined) {
+        concise.upstream_error = deepUnescapeJsonValue(obj.upstream_error);
+    }
+
     // 用量与缓存
     const usage = simplifyUsage(obj.usage || obj.usageMetadata);
     if (usage) {
@@ -856,7 +900,17 @@ function extractConcisePayload(
 
     const substantiveKeys = Object.keys(concise).filter(k => k !== '_session_thinking_id');
     if (substantiveKeys.length === 0) {
-        return rawStr;
+        try {
+            let parsed = JSON.parse(rawStr);
+            if (typeof parsed === 'string') {
+                try {
+                    parsed = JSON.parse(parsed);
+                } catch {}
+            }
+            return JSON.stringify(deepUnescapeJsonValue(parsed), null, 2);
+        } catch {
+            return rawStr;
+        }
     }
 
     return JSON.stringify(concise, null, 2);
@@ -1228,6 +1282,7 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     const globalFilterInputRef = useRef<HTMLInputElement>(null);
     const [selectedLog, setSelectedLog] = useState<ProxyRequestLog | null>(null);
     const [isLoggingEnabled, setIsLoggingEnabled] = useState(false);
+    const [captureHealthLogs, setCaptureHealthLogs] = useState(false);
     const [isClearConfirmOpen, setIsClearConfirmOpen] = useState(false);
     const [payloadViewMode, setPayloadViewMode] = useState<'concise' | 'full'>('concise');
     const [showMetadata, setShowMetadata] = useState(true);
@@ -1364,7 +1419,10 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             if (config && config.proxy) {
                 setAppConfig(config);
                 setIsLoggingEnabled(config.proxy.enable_logging);
+                const healthLogsEnabled = !!config.proxy.capture_health_logs;
+                setCaptureHealthLogs(healthLogsEnabled);
                 await invoke('set_proxy_monitor_enabled', { enabled: config.proxy.enable_logging });
+                await invoke('set_proxy_capture_health_logs', { enabled: healthLogsEnabled });
             }
 
             const errorsOnly = searchFilter === '__ERROR__';
@@ -1442,6 +1500,22 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
             }
         } catch (e) {
             console.error("Failed to toggle logging", e);
+        }
+    };
+
+    const toggleCaptureHealthLogs = async () => {
+        const newState = !captureHealthLogs;
+        try {
+            const config = await invoke<AppConfig>('load_config');
+            if (config && config.proxy) {
+                config.proxy.capture_health_logs = newState;
+                await invoke('save_config', { config });
+                await invoke('set_proxy_capture_health_logs', { enabled: newState });
+                setCaptureHealthLogs(newState);
+                loadData(1, filter, accountFilter);
+            }
+        } catch (e) {
+            console.error("Failed to toggle capture health logs", e);
         }
     };
 
@@ -1569,11 +1643,22 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
     }, [filter, accountFilter]);
 
     // Logs are already filtered and sorted by backend
-    // Apply account filter on frontend
+    // Apply account filter and noise filter on frontend (与后端 should_skip_request_log 语义保持一致)
     const filteredLogs = useMemo(() => {
-        if (!accountFilter) return logs;
-        return logs.filter(log => log.account_email === accountFilter);
-    }, [logs, accountFilter]);
+        let result = logs;
+        if (!captureHealthLogs) {
+            result = result.filter(log => {
+                const isGetSuccess = log.method?.toUpperCase() === 'GET'
+                    && typeof log.status === 'number'
+                    && log.status >= 200 && log.status < 300;
+                return !isGetSuccess;
+            });
+        }
+        if (accountFilter) {
+            result = result.filter(log => log.account_email === accountFilter);
+        }
+        return result;
+    }, [logs, accountFilter, captureHealthLogs]);
 
     const quickFilters = [
         { label: t('monitor.filters.all'), value: '' },
@@ -1767,6 +1852,18 @@ export const ProxyMonitor: React.FC<ProxyMonitorProps> = ({ className }) => {
                             {q.label}
                         </button>
                     ))}
+                    <button
+                        onClick={toggleCaptureHealthLogs}
+                        className={`px-3 py-0.5 rounded-full text-xs font-semibold border transition-all flex items-center gap-1.5 ${
+                            captureHealthLogs
+                                ? 'bg-emerald-600 text-white border-emerald-600 shadow-xs'
+                                : 'bg-white dark:bg-base-200 text-gray-700 dark:text-gray-200 border-gray-300 dark:border-base-300 hover:bg-gray-100 dark:hover:bg-base-300/80 hover:text-gray-900 dark:hover:text-white shadow-2xs'
+                        }`}
+                        title={t('monitor.filters.capture_health_tip', { defaultValue: '默认关闭：过滤全部 GET 成功请求（含 /v1/models 模型列表轮询与 /health 探针）且不入库；失败请求始终记录；开启后才全部记录并落库' })}
+                    >
+                        <span className={`w-1.5 h-1.5 rounded-full ${captureHealthLogs ? 'bg-white animate-pulse' : 'bg-gray-400 dark:bg-gray-500'}`} />
+                        {t('monitor.filters.capture_health', { defaultValue: '捕获健康检查' })}
+                    </button>
                     {(filter || accountFilter) && (
                         <button
                             onClick={() => { setFilter(''); setAccountFilter(''); }}

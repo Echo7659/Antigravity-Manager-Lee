@@ -3,13 +3,14 @@
 
 use super::models::*;
 use crate::proxy::mappers::signature_store::get_thought_signature; // Deprecated, kept for fallback
-use crate::proxy::mappers::tool_result_compressor;
 use crate::proxy::session_manager::SessionManager;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
+#[cfg(test)]
 const CLAUDE_AGENT_SDK_IDENTITY: &str =
     "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+#[cfg(test)]
 const CLAUDE_CODE_CLI_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Normalize the standalone identity block injected by Claude Agent SDK clients.
@@ -19,11 +20,7 @@ const CLAUDE_CODE_CLI_IDENTITY: &str = "You are Claude Code, Anthropic's officia
 /// RESOURCE_EXHAUSTED. Keep the match exact so user-authored text that merely
 /// mentions the SDK identity is not rewritten.
 fn normalize_claude_client_identity(text: &str) -> &str {
-    if text == CLAUDE_AGENT_SDK_IDENTITY {
-        CLAUDE_CODE_CLI_IDENTITY
-    } else {
-        text
-    }
+    crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::normalize_client_identity(text)
 }
 
 // ===== Safety Settings Configuration =====
@@ -566,6 +563,29 @@ pub fn transform_claude_request_in_timed(
     let allow_dummy_thought = false;
 
     // Check if thinking is enabled in the request
+    let client_switch = crate::proxy::pipeline::extract_client_thinking_switch(
+        claude_req.thinking.as_ref().map(|t| t.type_.as_str()),
+        claude_req
+            .thinking
+            .as_ref()
+            .and_then(|t| t.budget_tokens.map(|b| b as u64)),
+        claude_req
+            .output_config
+            .as_ref()
+            .and_then(|c| c.effort.as_deref())
+            .or_else(|| {
+                claude_req
+                    .thinking
+                    .as_ref()
+                    .and_then(|t| t.effort.as_deref())
+            }),
+    );
+
+    let tb_config = crate::proxy::config::get_thinking_budget_config();
+    let is_client_control =
+        tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
+    let is_client_disabled = is_client_control && client_switch.is_disabled();
+
     let thinking_type = claude_req.thinking.as_ref().map(|t| t.type_.as_str());
     let force_server_thinking = crate::proxy::thinking_store::any_model_forces_server_thinking(&[
         claude_req.model.as_str(),
@@ -574,7 +594,8 @@ pub fn transform_claude_request_in_timed(
     let target_model_supports_thinking = model_supports_thinking(&mapped_model);
     let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(&mapped_model)
         || crate::proxy::model_specs::is_gemini_under_v3(&claude_req.model);
-    let mut is_thinking_enabled = !is_under_v3
+    let mut is_thinking_enabled = !is_client_disabled
+        && !is_under_v3
         && (target_model_supports_thinking
             || force_server_thinking
             || thinking_type == Some("enabled")
@@ -679,10 +700,7 @@ pub fn transform_claude_request_in_timed(
         });
     }
 
-    // 深度清理 [undefined] 字符串 (Cherry Studio 等客户端常见注入)
-    crate::proxy::mappers::common_utils::deep_clean_undefined(&mut inner_request, 0);
-
-    // [PIPELINE] 统一清洗提示词与风控伪 Header
+    // [PIPELINE] 统一清洗提示词与风控伪 Header（含 [undefined] 深度清理，见 PromptSanitizer）
     crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::sanitize_gemini_payload(
         &mut inner_request,
     );
@@ -747,32 +765,41 @@ pub fn transform_claude_request_in_timed(
         message_count
     );
 
+    // [CACHE] 统一委托进站流水线进行前缀拓扑规范化与对齐（Pipeline First 核心归一）
+    crate::proxy::pipeline::InboundThinkingPipeline::align_google_request_prefix_topology(
+        &mut inner_request,
+    );
+    let reordered_inner = inner_request;
+
     // [NEW] 动态检测是否需要标记为 agent 请求
-    let has_tools = inner_request
+    let has_tools = reordered_inner
         .get("tools")
         .and_then(|t| t.as_array())
         .map(|arr| !arr.is_empty())
         .unwrap_or(false);
-    let has_tool_interactions = inner_request
+    let has_tool_interactions = reordered_inner
         .get("contents")
         .map(super::super::common_utils::contents_has_tool_interactions)
         .unwrap_or(false);
     let is_agent_request =
         config.request_type != "image_gen" && (has_tools || has_tool_interactions);
 
-    // 构建最终请求体
+    // 构建最终请求体 (顶层键序稳定: project -> request -> model -> userAgent -> requestId)
     let mut body = json!({
         "project": project_id,
-        "requestId": request_id,
-        "request": inner_request,
+        "request": reordered_inner,
         "model": config.final_model,
         "userAgent": "antigravity",
+        "requestId": request_id,
     });
 
     if config.request_type == "image_gen" {
         body["requestType"] = json!("image_gen");
     } else if is_agent_request {
         body["requestType"] = json!("agent");
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("enabledCreditTypes".to_string(), json!(["GOOGLE_ONE_AI"]));
+        }
     }
 
     // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
@@ -940,28 +967,11 @@ fn has_valid_signature_for_function_calls(
 }
 
 fn clean_system_prompt_text(text: &str) -> String {
-    let mut s = crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::clean_text(text);
-    if s.contains("--- [SYSTEM_PROMPT_END] ---") {
-        s = s.replace("--- [SYSTEM_PROMPT_END] ---", "");
-    }
-    if s.contains("[SYSTEM_PROMPT_END]") {
-        s = s.replace("[SYSTEM_PROMPT_END]", "");
-    }
-    if s.contains("You are Antigravity, a powerful agentic AI coding assistant") {
-        s = s.replace(
-            "You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding.\nYou are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question.\n**Absolute paths only**\n**Proactiveness**",
-            "",
-        );
-    }
-    s.trim().to_string()
+    crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::strip_pipeline_markers(text)
 }
 
-fn is_gemini_client_billing_metadata(model: &str, text: &str) -> bool {
-    let text = text.trim();
-    model.starts_with("gemini-")
-        && text.starts_with("x-anthropic-billing-header:")
-        && !text.contains('\n')
-        && !text.contains('\r')
+fn is_gemini_client_billing_metadata(_model: &str, text: &str) -> bool {
+    crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::is_billing_metadata(text)
 }
 
 /// 构建 System Instruction (支持动态身份映射与 Prompt 隔离)
@@ -1445,19 +1455,16 @@ fn build_contents(
                             .cloned()
                             .unwrap_or_else(|| tool_use_id.clone());
 
-                        // [FIX #593] 工具输出压缩: 处理超大工具输出
-                        // 使用智能压缩策略(浏览器快照、大文件提示等)
-                        let mut compacted_content = content.clone();
-                        if let Some(blocks) = compacted_content.as_array_mut() {
-                            tool_result_compressor::sanitize_tool_result_blocks(blocks);
-                        }
-
-                        // Smart Truncation: No longer stripping images from Tool Results
                         // Tool results should pass transparency. If images are present, map them to inlineData.
                         let mut extra_parts = Vec::new();
 
-                        let mut merged_content = match &compacted_content {
-                            serde_json::Value::String(s) => s.clone(),
+                        let mut merged_content = match content {
+                            serde_json::Value::String(s) => {
+                                crate::proxy::mappers::common_utils::extract_multimodal_from_tool_text(
+                                    s,
+                                    &mut extra_parts,
+                                )
+                            }
                             serde_json::Value::Array(arr) => {
                                 let mut texts = Vec::new();
                                 for block in arr {
@@ -1592,26 +1599,8 @@ fn build_contents(
                 parts.insert(0, thought_part);
             }
             None => {
-                let is_claude_model = mapped_model.to_lowercase().contains("claude");
-                if is_claude_model && turn_signature.is_none() {
-                    // Claude 模型：若本轮无签名，绝不强行凭空插入无签名的 thinking 占位块！
-                    // Anthropic 官方规范要求有 thinking 块必须有 signature，否则报 Field required
-                } else {
-                    // Gemini 原生模型：允许使用哨兵占位块保证思考模型格式一致
-                    let sig_to_use = turn_signature.as_deref().unwrap_or(SENTINEL_SIGNATURE);
-                    let mut thought_part = json!({
-                        "text": "...",
-                        "thought": true,
-                    });
-                    if !is_google_cloud || sig_to_use != SENTINEL_SIGNATURE {
-                        thought_part["thoughtSignature"] = json!(sig_to_use);
-                    }
-                    parts.insert(0, thought_part);
-                    tracing::debug!(
-                        "Injected placeholder thinking block for assistant message at turn {}",
-                        msg_index
-                    );
-                }
+                // 纯净线缆原则：客户端若原本无思考块，适配器严禁凭空伪造 "..." 占位块！
+                // 缺失思考块的判定与状态机复活统一委托给进站流水线（InboundThinkingPipeline）
             }
         }
     }
@@ -1786,17 +1775,13 @@ fn build_google_contents(
     // Corrupted signature issues proved we cannot fake thinking blocks.
     // Instead we rely on should_disable_thinking_due_to_history to prevent this state.
 
-    // [FIX P3-3] Strict Role Alternation (Message Merging)
-    // Merge adjacent messages with the same role to satisfy Gemini's strict alternation rule
-    let mut merged_contents = merge_adjacent_roles(contents);
-
     // 思考回填：仅在开启思考且非 Gemini < 3 模型时恢复思维块与签名
     let should_finalize_thinking =
         is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model);
 
     let think_start = std::time::Instant::now();
     crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
-        &mut merged_contents,
+        &mut contents,
         crate::proxy::pipeline::ProxyProtocol::AnthropicClaude,
         mapped_model,
         should_finalize_thinking,
@@ -1805,7 +1790,7 @@ fn build_google_contents(
     );
     timing.think_fill_micros = think_start.elapsed().as_micros() as u64;
 
-    Ok(json!(merged_contents))
+    Ok(json!(contents))
 }
 
 /// Merge adjacent messages with the same role
@@ -1854,57 +1839,24 @@ fn build_tools(
         let mut has_google_search = has_web_search;
 
         for tool in tools_list {
-            // 1. Detect server tools / built-in tools like web_search
-            if tool.is_web_search() {
-                has_google_search = true;
-                continue;
-            }
+            let name = tool
+                .name
+                .as_deref()
+                .or(tool.type_.as_deref())
+                .unwrap_or("tool");
 
-            if let Some(t_type) = &tool.type_ {
-                if t_type == "web_search_20250305" {
-                    has_google_search = true;
-                    continue;
-                }
-            }
+            let mut input_schema = tool.input_schema.clone().unwrap_or(json!({
+                "type": "object",
+                "properties": {}
+            }));
+            crate::proxy::common::json_schema::clean_json_schema(&mut input_schema);
+            crate::proxy::mappers::openai::request::enforce_uppercase_types(&mut input_schema);
 
-            // 2. Detect by name
-            if let Some(name) = &tool.name {
-                if name == "web_search" || name == "google_search" || name == "builtin_web_search" {
-                    has_google_search = true;
-                    continue;
-                }
-
-                // 3. Client tools require input_schema
-                let mut input_schema = tool.input_schema.clone().unwrap_or(json!({
-                    "type": "object",
-                    "properties": {}
-                }));
-                crate::proxy::common::json_schema::clean_json_schema(&mut input_schema);
-
-                // [FIX] 针对 Shell / Terminal 类工具彻底从 parameters.properties 中剔除 description 字段
-                if crate::proxy::mappers::openai::response::is_shell_or_terminal_tool(name) {
-                    if let Some(params_obj) = input_schema.as_object_mut() {
-                        if let Some(props) = params_obj
-                            .get_mut("properties")
-                            .and_then(|p| p.as_object_mut())
-                        {
-                            props.remove("description");
-                        }
-                        if let Some(req_arr) = params_obj
-                            .get_mut("required")
-                            .and_then(|r| r.as_array_mut())
-                        {
-                            req_arr.retain(|v| v.as_str() != Some("description"));
-                        }
-                    }
-                }
-
-                function_declarations.push(json!({
-                    "name": name,
-                    "description": tool.description,
-                    "parameters": input_schema
-                }));
-            }
+            function_declarations.push(json!({
+                "name": name,
+                "description": tool.description,
+                "parameters": input_schema
+            }));
         }
 
         let mut tool_list = Vec::new();
@@ -1915,6 +1867,12 @@ fn build_tools(
         let supports_mixed_tools = false;
 
         if !function_declarations.is_empty() {
+            // [CACHE] 按 function name 稳定字典序排序，确保全协议 tool schema 字节完全一致
+            function_declarations.sort_by(|a, b| {
+                let name_a = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let name_b = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                name_a.cmp(name_b)
+            });
             let mut func_obj = serde_json::Map::new();
             func_obj.insert(
                 "functionDeclarations".to_string(),
@@ -1964,10 +1922,54 @@ fn build_generation_config(
     let mut config = json!({});
 
     // Thinking 配置
-    if is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model) {
+    let client_switch = crate::proxy::pipeline::extract_client_thinking_switch(
+        claude_req.thinking.as_ref().map(|t| t.type_.as_str()),
+        claude_req
+            .thinking
+            .as_ref()
+            .and_then(|t| t.budget_tokens.map(|b| b as u64)),
+        claude_req
+            .output_config
+            .as_ref()
+            .and_then(|c| c.effort.as_deref())
+            .or_else(|| {
+                claude_req
+                    .thinking
+                    .as_ref()
+                    .and_then(|t| t.effort.as_deref())
+            }),
+    );
+
+    let tb_config = crate::proxy::config::get_thinking_budget_config();
+    let is_client_control =
+        tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
+    let is_client_disabled = is_client_control && client_switch.is_disabled();
+
+    let effort = claude_req
+        .output_config
+        .as_ref()
+        .and_then(|c| c.effort.as_ref())
+        .or_else(|| claude_req.thinking.as_ref().and_then(|t| t.effort.as_ref()))
+        .or_else(|| tb_config.effort.as_ref());
+
+    let client_effort = effort.map(|s| s.as_str());
+    let client_budget = claude_req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.budget_tokens.map(|b| b as u64));
+
+    if is_client_disabled {
+        crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
+            mapped_model,
+            &mut config,
+            client_switch,
+            None,
+            None,
+            token,
+        );
+    } else if is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model) {
         let mut thinking_config = json!({"includeThoughts": true});
 
-        let tb_config = crate::proxy::config::get_thinking_budget_config();
         let global_mode_is_adaptive = matches!(
             tb_config.mode,
             crate::proxy::config::ThinkingBudgetMode::Adaptive
@@ -1979,19 +1981,6 @@ fn build_generation_config(
             .unwrap_or(false);
         let should_use_adaptive = (user_is_adaptive || global_mode_is_adaptive)
             && mapped_model.to_lowercase().contains("claude");
-
-        let effort = claude_req
-            .output_config
-            .as_ref()
-            .and_then(|c| c.effort.as_ref())
-            .or_else(|| claude_req.thinking.as_ref().and_then(|t| t.effort.as_ref()))
-            .or_else(|| tb_config.effort.as_ref());
-
-        let client_effort = effort.map(|s| s.as_str());
-        let client_budget = claude_req
-            .thinking
-            .as_ref()
-            .and_then(|t| t.budget_tokens.map(|b| b as u64));
 
         if should_use_adaptive {
             let mapped_level = match effort.map(|e| e.to_lowercase()).as_deref() {
@@ -2008,30 +1997,14 @@ fn build_generation_config(
             config["thinkingConfig"] = thinking_config;
         } else {
             // 协议无关：思考预算与 thinkingConfig 统一由进站流水线节点治理
-            let _budget_opt =
-                crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
-                    mapped_model,
-                    &mut config,
-                    client_effort,
-                    client_budget,
-                    token,
-                );
-            if tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client {
-                if let Some(eff_str) = client_effort {
-                    if let Some(norm_level) =
-                        crate::proxy::model_specs::normalize_client_thinking_level(eff_str)
-                    {
-                        let target_level = if mapped_model.to_lowercase().contains("pro")
-                            && norm_level == "MEDIUM"
-                        {
-                            "HIGH"
-                        } else {
-                            norm_level
-                        };
-                        config["thinkingConfig"]["thinkingLevel"] = json!(target_level);
-                    }
-                }
-            }
+            crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
+                mapped_model,
+                &mut config,
+                client_switch,
+                client_effort,
+                client_budget,
+                token,
+            );
         }
     }
 
@@ -3775,8 +3748,9 @@ mod tests {
             "  x-anthropic-billing-header: cc_entrypoint=desktop; \n"
         ));
 
-        // Non-Gemini model (e.g. claude-sonnet-4-6) should NOT filter
-        assert!(!is_gemini_client_billing_metadata(
+        // 风险清洗不分 model：非 Gemini 模型同样必须过滤
+        // （任何客户端注入的计费元数据都是风险，与当前模型无关）
+        assert!(is_gemini_client_billing_metadata(
             "claude-sonnet-4-6",
             "x-anthropic-billing-header: cc_version=2.1.270.ffc;"
         ));
@@ -3829,5 +3803,69 @@ mod tests {
             .any(|t| t.contains("x-anthropic-billing-header:")));
         // Normal prompt must be preserved
         assert!(system_texts.contains(&"You are a helpful assistant."));
+    }
+
+    #[test]
+    fn test_claude_tool_result_multimodal_string_extraction() {
+        let fake_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let tool_content = format!(
+            "Here is the screenshot: ![screen](data:image/png;base64,{}) and log text",
+            fake_b64
+        );
+
+        let req: ClaudeRequest = serde_json::from_value(json!({
+            "model": "gemini-2.5-flash",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Take screenshot"
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_shot_1",
+                            "name": "screenshot",
+                            "input": {}
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_shot_1",
+                            "content": tool_content
+                        }
+                    ]
+                }
+            ]
+        }))
+        .expect("ClaudeRequest should deserialize");
+
+        let body =
+            transform_claude_request_in(&req, "test-project", false, None, "test-session", None)
+                .expect("Request should transform");
+        let contents = body["request"]["contents"]
+            .as_array()
+            .expect("contents array");
+        let tool_parts = contents[2]["parts"].as_array().expect("tool turn parts");
+
+        // 验证同时存在 functionResponse 和 inlineData 两个 parts
+        assert_eq!(tool_parts.len(), 2);
+        assert!(tool_parts[0].get("functionResponse").is_some());
+        assert!(tool_parts[1].get("inlineData").is_some());
+
+        let inline_data = &tool_parts[1]["inlineData"];
+        assert_eq!(inline_data["mimeType"], "image/png");
+        assert_eq!(inline_data["data"], fake_b64);
+
+        let res_str = tool_parts[0]["functionResponse"]["response"]["result"]
+            .as_str()
+            .unwrap();
+        assert!(!res_str.contains(fake_b64));
+        assert!(res_str.contains("[Image: forwarded to visual input (image/png)]"));
     }
 }

@@ -45,7 +45,7 @@ with tarfile.open(archive, 'w:gz') as bundle:
 - Platform: `linux/amd64`
 - Image: `{reference}`
 
-Synchronizes official v4.7.12, including the protocol pipeline, signature recovery, model routing, quota dashboard and UTF-8 safety fixes. Thanks to upstream lbjlaq/Antigravity-Manager contributors, including @jeikl. See `docs/UPSTREAM_4_7_12.md` for reconciliation details.
+Synchronizes official v4.8.1: deterministic protocol payloads and tool IDs, thinking/signature recovery, multimodal tool results, client budget controls and CLI synchronization. Thanks to lbjlaq/Antigravity-Manager contributors, @jeikl and @Avlaak (PR #3518). See `docs/UPSTREAM_4_8_1.md` for reconciliation details.
 
 Retains uncovered Gemini request compatibility, cumulative/reasoning token accounting and explicit empty-stream error handling. See `docs/GEMINI_COMPAT_DEPLOYMENT.md` for behavior and deployment details.
 

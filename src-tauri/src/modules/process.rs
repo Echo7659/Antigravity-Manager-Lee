@@ -66,19 +66,47 @@ pub fn is_process_running_by_name(target_name: &str) -> bool {
 
 /// Helper process discriminator to filter out sub-processes, audio/gpu/renderers, crashpads, and language servers
 pub(crate) fn is_helper_process(name: &str, args_str: &str, exe_path: &str) -> bool {
-    args_str.contains("--type=")
-        || name.contains("helper")
-        || name.contains("plugin")
-        || name.contains("renderer")
-        || name.contains("gpu")
-        || name.contains("crashpad")
-        || name.contains("utility")
-        || name.contains("audio")
-        || name.contains("sandbox")
-        || name.contains("language_server")
-        || args_str.contains("language_server")
-        || exe_path.contains("crashpad")
-        || exe_path.contains("helper")
+    let name_lower = name.to_lowercase();
+    let args_lower = args_str.to_lowercase();
+    let exe_lower = exe_path.to_lowercase();
+
+    args_lower.contains("--type=")
+        || args_lower.contains("node-ipc")
+        || args_lower.contains("nodeipc")
+        || args_lower.contains("max-old-space-size")
+        || args_lower.contains("node_modules")
+        || args_lower.contains("--standalone")
+        || args_lower.contains("--subclient_type")
+        || args_lower.contains("--override_ide_name")
+        || name_lower.contains("helper")
+        || name_lower.contains("plugin")
+        || name_lower.contains("renderer")
+        || name_lower.contains("gpu")
+        || name_lower.contains("crashpad")
+        || name_lower.contains("utility")
+        || name_lower.contains("audio")
+        || name_lower.contains("sandbox")
+        || name_lower.contains("language_server")
+        || args_lower.contains("language_server")
+        || exe_lower.contains("crashpad")
+        || exe_lower.contains("helper")
+        || exe_lower.contains("language_server")
+}
+
+/// Sanitize restart arguments to prevent internal engine/language_server arguments
+/// (such as --standalone or --override_ide_name) from leaking into IDE relaunch commands.
+pub(crate) fn sanitize_restart_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| {
+            let lower = arg.trim().to_lowercase();
+            !lower.is_empty()
+                && !lower.starts_with("--standalone")
+                && !lower.starts_with("--override_ide_name")
+                && !lower.starts_with("--subclient_type")
+                && !lower.contains("language_server")
+        })
+        .cloned()
+        .collect()
 }
 
 /// Check if Antigravity is running
@@ -494,6 +522,157 @@ pub fn sweep_orphan_language_servers() {
     }
 }
 
+/// `language_server` 子进程判定。
+///
+/// 覆盖面：Windows/Linux 为 `language_server` / `language_server.exe`，macOS 为
+/// `language_server_macos` / `language_server_macos_arm`（macOS 上进程名可能被系统截断，
+/// 因此名字与可执行路径任一命中即视为目标）。
+///
+/// 注意：这是**窄**判定（仅语言服务），与 [`is_helper_process`] 的"广义 helper"判定区分开 ——
+/// 热切号只允许终止语言服务，绝不触碰 renderer / gpu / crashpad 等其它 helper。
+pub(crate) fn is_language_server_process(name: &str, exe_path: &str) -> bool {
+    name.to_lowercase().contains("language_server")
+        || exe_path.to_lowercase().contains("language_server")
+}
+
+/// 强制终止单个进程（Windows 用 `taskkill /F`，其余平台用 `kill -9`）。
+fn force_kill_pid(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .creation_flags(0x08000000)
+            .output();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
+}
+
+/// 收集 `target_ide` 对应 Antigravity 的 `language_server` 子进程 PID（issue #3503 方案 A 的定位器）。
+///
+/// 定位策略 = 「主进程 → 后代 → 名字/路径命中 language_server」，而**不是** issue 建议的
+/// `exe.contains("antigravity")` 路径模糊匹配。原因：
+/// 1. IDE 形态下语言服务位于 `Antigravity IDE` 安装根（含空格，且可能在用户自定义目录），
+///    纯路径匹配会漏杀 → 表现是"切号看似成功、实际仍是旧账号"这种最危险的静默失败；
+/// 2. 以**主进程为根**展开后代，天然按 target 隔离 —— IDE 与经典版各自独立，不会互相误杀，
+///    也不会误伤其它 IDE / 语言服务器进程。
+///
+/// `get_antigravity_pids` 同时返回主进程与 helper，故这里先用 [`is_helper_process`] 过滤出
+/// **非 helper 的主进程**作为根：若把 helper 也当根，`language_server` 自身会变成"根"而不是
+/// "后代"，就永远定位不到了。
+fn language_server_subprocess_pids(system: &System, target_ide: Option<&str>) -> Vec<u32> {
+    let roots: Vec<u32> = get_antigravity_pids(target_ide)
+        .into_iter()
+        .filter(|pid| {
+            system
+                .process(sysinfo::Pid::from_u32(*pid))
+                .map(|process| {
+                    let name = process.name().to_string_lossy().to_string();
+                    let args = process
+                        .cmd()
+                        .iter()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let exe = process
+                        .exe()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    !is_helper_process(&name, &args, &exe)
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if roots.is_empty() {
+        return Vec::new();
+    }
+
+    // 广度优先展开全部后代（Antigravity.exe → … → language_server.exe，可能多层嵌套）
+    let mut descendants: Vec<u32> = Vec::new();
+    let mut frontier: Vec<u32> = roots.clone();
+    let mut visited: std::collections::HashSet<u32> = roots.into_iter().collect();
+
+    while let Some(parent) = frontier.pop() {
+        for (pid, process) in system.processes() {
+            if process.parent().map(|p| p.as_u32()) != Some(parent) {
+                continue;
+            }
+            let pid_u32 = pid.as_u32();
+            if visited.insert(pid_u32) {
+                descendants.push(pid_u32);
+                frontier.push(pid_u32);
+            }
+        }
+    }
+
+    descendants
+        .into_iter()
+        .filter(|pid_u32| {
+            system
+                .process(sysinfo::Pid::from_u32(*pid_u32))
+                .map(|process| {
+                    let name = process.name().to_string_lossy().to_string();
+                    let exe = process
+                        .exe()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    is_language_server_process(&name, &exe)
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// 热切号：仅终止 `target_ide` 对应 Antigravity 主进程**后代**中的 `language_server` 子进程，
+/// 保留主窗口进程。
+///
+/// 机理（issue #3503 方案 A）：VS Code/Electron 内核自带 supervisor，主窗口检测到语言服务断开后
+/// 会在约 2 秒内原地重新拉起子进程并重载 Webview，重新读取最新凭据 —— 因此切号时用户的
+/// 未保存缓冲区、终端任务、断点、文件树全部保留，不再被强杀主进程打断。
+///
+/// 返回实际终止的进程数。**`Ok(0)` 表示未定位到子进程，调用方必须回退到完整重启**
+/// （`close_antigravity`），否则会出现"凭据已写入、IDE 仍在使用旧账号"的不一致状态 ——
+/// 那比强制重启严重得多。
+pub fn kill_language_server_subprocesses(target_ide: Option<&str>) -> Result<usize, String> {
+    let mut system = System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+
+    let pids = language_server_subprocess_pids(&system, target_ide);
+    for pid_u32 in &pids {
+        crate::modules::logger::log_info(&format!(
+            "[HotSwitch] Terminating language_server subprocess (PID: {}, target: {:?})",
+            pid_u32, target_ide
+        ));
+        force_kill_pid(*pid_u32);
+    }
+
+    Ok(pids.len())
+}
+
+/// 等待 `target_ide` 的 `language_server` 子进程被 supervisor 重新拉起（有界轮询）。
+///
+/// 用于热切号后的确认：只有子进程确实回来了，才说明主窗口仍具备 AI 能力、可以跳过完整重启；
+/// 超时未恢复则调用方应降级为完整重启，避免留下"窗口活着但引擎已死"的残状态。
+pub fn wait_for_language_server_respawn(target_ide: Option<&str>, timeout_secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+    while std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(500));
+
+        let mut system = System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+        if !language_server_subprocess_pids(&system, target_ide).is_empty() {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Close Antigravity processes
 pub fn close_antigravity(timeout_secs: u64, target_ide: Option<&str>) -> Result<(), String> {
     crate::modules::logger::log_info(&format!("Closing Antigravity ({:?})...", target_ide));
@@ -873,9 +1052,10 @@ pub fn start_antigravity_with_fallback_path(
             .as_ref()
             .and_then(|c| c.antigravity_executable.clone())
     };
-    let args = config
+    let raw_args = config
         .and_then(|c| c.antigravity_args.clone())
         .or_else(|| preferred_args.map(|a| a.to_vec()));
+    let args = raw_args.map(|a| sanitize_restart_args(&a));
 
     if let Some(mut path_str) = manual_path {
         let mut path = std::path::PathBuf::from(&path_str);
@@ -909,10 +1089,15 @@ pub fn start_antigravity_with_fallback_path(
                     let mut cmd = Command::new("open");
                     cmd.arg("-a").arg(&path_str);
 
-                    // Add startup arguments
+                    // Add startup arguments (must be after --args for macOS open)
                     if let Some(ref args) = args {
-                        for arg in args {
-                            cmd.arg(arg);
+                        let valid_args: Vec<_> =
+                            args.iter().filter(|a| !a.trim().is_empty()).collect();
+                        if !valid_args.is_empty() {
+                            cmd.arg("--args");
+                            for arg in valid_args {
+                                cmd.arg(arg);
+                            }
                         }
                     }
 
@@ -985,8 +1170,12 @@ pub fn start_antigravity_with_fallback_path(
                     cmd.arg("-a").arg(&*path_str);
                 }
                 if let Some(ref args) = args {
-                    for arg in args {
-                        cmd.arg(arg);
+                    let valid_args: Vec<_> = args.iter().filter(|a| !a.trim().is_empty()).collect();
+                    if !valid_args.is_empty() {
+                        cmd.arg("--args");
+                        for arg in valid_args {
+                            cmd.arg(arg);
+                        }
                     }
                 }
                 let output = cmd
@@ -1044,10 +1233,14 @@ pub fn start_antigravity_with_fallback_path(
         };
         cmd.args(["-a", app_name]);
 
-        // Add startup arguments
+        // Add startup arguments (must be after --args for macOS open)
         if let Some(ref args) = args {
-            for arg in args {
-                cmd.arg(arg);
+            let valid_args: Vec<_> = args.iter().filter(|a| !a.trim().is_empty()).collect();
+            if !valid_args.is_empty() {
+                cmd.arg("--args");
+                for arg in valid_args {
+                    cmd.arg(arg);
+                }
             }
         }
 
@@ -1142,24 +1335,13 @@ fn get_process_info(target_ide: Option<&str>) -> (Option<std::path::PathBuf>, Op
 
             let args_str = args.join(" ");
 
-            // Common helper process exclusion logic
-            let is_helper = args_str.contains("--type=")
-                || args_str.contains("node-ipc")
-                || args_str.contains("nodeipc")
-                || args_str.contains("max-old-space-size")
-                || args_str.contains("node_modules")
-                || name.contains("helper")
-                || name.contains("plugin")
-                || name.contains("renderer")
-                || name.contains("gpu")
-                || name.contains("crashpad")
-                || name.contains("utility")
-                || name.contains("audio")
-                || name.contains("sandbox")
-                || exe_path.contains("crashpad");
+            // Common helper process exclusion logic (strictly excludes language_server and sub-processes)
+            let is_helper = is_helper_process(&name, &args_str, &exe_path);
 
+            // Sanitize snapshot arguments to prevent engine parameters like --standalone from leaking into relaunch
+            let clean_args = sanitize_restart_args(&args);
             let path = Some(exe.to_path_buf());
-            let args = Some(args);
+            let args = Some(clean_args);
 
             // Is the process a match for target_ide?
             let is_ide_match = if target_ide == Some("ide") {
@@ -1455,4 +1637,121 @@ pub fn get_antigravity_cli_executable_path() -> Option<std::path::PathBuf> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_helper_process_detection() {
+        // Normal main processes
+        assert!(!is_helper_process(
+            "Antigravity",
+            "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            "/Applications/Antigravity.app/Contents/MacOS/Antigravity"
+        ));
+        assert!(!is_helper_process(
+            "Antigravity.exe",
+            "C:\\Program Files\\Antigravity\\Antigravity.exe",
+            "C:\\Program Files\\Antigravity\\Antigravity.exe"
+        ));
+
+        // Language server / engine processes (must be detected as helper)
+        assert!(is_helper_process(
+            "language_server",
+            "--standalone --override_ide_name antigravity --subclient_type hub",
+            "/Applications/Antigravity.app/Contents/Resources/bin/language_server"
+        ));
+        assert!(is_helper_process(
+            "language_server.exe",
+            "--standalone",
+            "C:\\Antigravity\\resources\\bin\\language_server.exe"
+        ));
+        assert!(is_helper_process(
+            "Antigravity",
+            "--type=utility --utility-sub-type=audio.mojom.AudioService",
+            "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper"
+        ));
+        assert!(is_helper_process(
+            "Antigravity",
+            "--type=renderer",
+            "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Renderer).app"
+        ));
+        assert!(is_helper_process(
+            "crashpad_handler",
+            "",
+            "/Applications/Antigravity.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler"
+        ));
+    }
+
+    #[test]
+    fn test_is_language_server_process_narrow_detection() {
+        // 热切号的定位器必须"窄"：只认语言服务，绝不把 renderer / gpu / crashpad 等 helper 当目标
+        assert!(is_language_server_process(
+            "language_server.exe",
+            "C:\\Users\\me\\AppData\\Local\\Programs\\Antigravity IDE\\resources\\bin\\language_server.exe"
+        ));
+        assert!(is_language_server_process(
+            "language_server",
+            "/Applications/Antigravity.app/Contents/Resources/bin/language_server"
+        ));
+        // macOS 进程名可能被截断 → 路径命中即可
+        assert!(is_language_server_process(
+            "language_server",
+            "/Applications/Antigravity IDE.app/Contents/Resources/bin/language_server_macos_arm"
+        ));
+        // 大小写不敏感
+        assert!(is_language_server_process(
+            "LANGUAGE_SERVER.EXE",
+            "C:\\Antigravity\\bin\\Language_Server.exe"
+        ));
+
+        // 反例：其它 Antigravity 进程一律不得命中（否则热切会误杀渲染/GPU/崩溃处理器）
+        for (name, exe) in [
+            ("Antigravity.exe", "C:\\Antigravity\\Antigravity.exe"),
+            (
+                "Antigravity",
+                "/Applications/Antigravity.app/Contents/MacOS/Antigravity",
+            ),
+            (
+                "Antigravity Helper",
+                "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper",
+            ),
+            (
+                "Antigravity Helper (Renderer)",
+                "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Renderer).app",
+            ),
+            (
+                "crashpad_handler",
+                "/Applications/Antigravity.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler",
+            ),
+            ("node", "/usr/local/bin/node"),
+        ] {
+            assert!(
+                !is_language_server_process(name, exe),
+                "{name} 不应被判为 language_server"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_restart_args() {
+        let dirty_args = vec![
+            "--standalone".to_string(),
+            "--override_ide_name".to_string(),
+            "antigravity".to_string(),
+            "--subclient_type".to_string(),
+            "hub".to_string(),
+            "--user-data-dir=/tmp/test".to_string(),
+            "/path/to/project".to_string(),
+        ];
+
+        let cleaned = sanitize_restart_args(&dirty_args);
+        assert!(!cleaned.contains(&"--standalone".to_string()));
+        assert!(!cleaned.contains(&"--override_ide_name".to_string()));
+        assert!(!cleaned.contains(&"--subclient_type".to_string()));
+        assert!(cleaned.contains(&"--user-data-dir=/tmp/test".to_string()));
+        assert!(cleaned.contains(&"/path/to/project".to_string()));
+    }
 }
