@@ -19,3 +19,9 @@ Existing data mounts, credentials, proxy bindings, model mappings, unlimited his
 ## Validation and build
 
 Rust 1.96 is pinned for the new yaml-rt dependency. Frontend tests/build, portable protocol regressions, full application compilation and focused compatibility/database tests gate image publication. Runtime checks must use the published image and inspect real JSON/SSE output and usage before deployment.
+
+## Large historical thinking stores
+
+Official 4.8.1 log decoration attempted leading-wildcard searches over thought text and session keys while holding the shared thinking database mutex. On a 12 GB store, a cache miss caused a full scan and blocked Tokio workers, including health requests. This is separate from protocol-level signature recovery.
+
+Lee.3 keeps log decoration in memory: preserve upstream signatures, otherwise consult the existing tool/session signature cache. A missing diagnostic signature remains absent; no unrelated historical signature is guessed. The official protocol pipeline and its indexed causal/fingerprint lookups remain intact, and historical caches are preserved. Removing byte slicing also avoids panics on multibyte thinking text. Regression coverage holds the SQLite mutex while formatting Chinese thinking text to ensure response logging does not wait for the database.

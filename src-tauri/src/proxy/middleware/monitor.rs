@@ -363,13 +363,15 @@ fn build_canonical_consolidated_response(
     timing_obj: serde_json::Map<String, Value>,
     usage_obj: Option<serde_json::Map<String, Value>>,
 ) -> Value {
-    // 权威网关签名回填：若当前签名为空，尝试通过工具调用ID或会话ID从网关状态机(内存 L1 / SQLite L2 DB 思考持久化)恢复
+    // Log decoration must remain memory-only. Historical fuzzy SQLite lookups can
+    // scan multi-GB stores while holding their shared mutex and stall all workers.
+    // Protocol-level signature recovery remains in the pipeline/ThinkingStore.
     if thinking_signature.is_empty() {
         for tc in &tool_calls {
             if let Some(call_id) = tc.get("id").and_then(|v| v.as_str()) {
                 if !call_id.is_empty() {
                     if let Some(sig) =
-                        crate::proxy::SignatureCache::global().get_tool_signature(call_id)
+                        crate::proxy::SignatureCache::global().get_cached_tool_signature(call_id)
                     {
                         thinking_signature = sig;
                         break;
@@ -378,33 +380,10 @@ fn build_canonical_consolidated_response(
             }
         }
         if thinking_signature.is_empty() {
-            // 1. 优先按当前轮次的思考文本片段精准直捞专属签名
-            if !thinking_content.is_empty() {
-                let trimmed = thinking_content.trim();
-                let snippet = if trimmed.len() > 32 {
-                    &trimmed[..32]
-                } else {
-                    trimmed
-                };
-                if let Some(sig) =
-                    crate::modules::proxy_db::lookup_signature_by_thought_snippet(snippet)
+            if let Some(sid) = session_id {
+                if let Some(sig) = crate::proxy::SignatureCache::global().get_session_signature(sid)
                 {
                     thinking_signature = sig;
-                }
-            }
-
-            // 2. 兜底按会话状态机与会话数据库查找最新签名
-            if thinking_signature.is_empty() {
-                if let Some(sid) = session_id {
-                    if let Some(sig) =
-                        crate::proxy::SignatureCache::global().get_session_signature(sid)
-                    {
-                        thinking_signature = sig;
-                    } else if let Some(sig) =
-                        crate::modules::proxy_db::lookup_latest_thinking_signature(sid)
-                    {
-                        thinking_signature = sig;
-                    }
                 }
             }
         }
@@ -1731,6 +1710,47 @@ mod tests {
             .expect("forwarder did not stop after receiver closed")
             .expect("forwarder task panicked");
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn compat_monitor_log_decoration_does_not_wait_for_thinking_database() {
+        let _database_guard = crate::modules::proxy_db::hold_thinking_db_for_test();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thought = "这是用于验证多字节字符边界与历史思考数据库锁竞争的测试内容。";
+        let worker = std::thread::spawn(move || {
+            let result = super::build_canonical_consolidated_response(
+                thought.to_string(),
+                String::new(),
+                "OK".to_string(),
+                vec![serde_json::json!({"id":"compat-uncached-log-tool"})],
+                Some("compat-log-no-history-match"),
+                "compat-log",
+                serde_json::Map::new(),
+                None,
+            );
+            sender.send(result).unwrap();
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("log formatting must not access the locked thinking database");
+        assert_eq!(result["thinking"], thought);
+        assert!(result.get("thinking_signature").is_none());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn compat_monitor_log_decoration_preserves_upstream_signature() {
+        let result = super::build_canonical_consolidated_response(
+            "thought".to_string(),
+            "upstream-signature".to_string(),
+            "OK".to_string(),
+            vec![],
+            None,
+            "compat-log",
+            serde_json::Map::new(),
+            None,
+        );
+        assert_eq!(result["thinking_signature"], "upstream-signature");
     }
 
     #[test]

@@ -94,7 +94,7 @@ RUN --mount=type=cache,target=/root/.cargo/registry \
 FROM lbjlaq/antigravity-manager@sha256:a451e34903a5e8adbd5c0ca6820541f480ce03228fa9ce717433801c9203fb26
 COPY --from=backend-builder /tmp/antigravity-tools /app/antigravity-tools
 COPY --from=frontend-builder /app/dist /app/dist
-LABEL org.opencontainers.image.version="4.8.1-lee.2"
+LABEL org.opencontainers.image.version="4.8.1-lee.3"
 ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
 LABEL org.opencontainers.image.source="https://github.com/Echo7659/Antigravity-Manager-Lee"

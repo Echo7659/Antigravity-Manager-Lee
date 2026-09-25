@@ -61,6 +61,8 @@ Text generation now bounds upstream response-header waits and pre-response proce
 
 Account deletion removes only the selected account caches instead of rebuilding the whole pool. List updates are immediate after confirmation, ignore stale reads and preserve failed deletions. Status filters can combine forbidden/403 or disabled accounts with search and subscription filters. See `docs/ACCOUNT_MANAGEMENT.md`.
 
+Response log decoration no longer scans historical thinking text or uses suffix session searches. It preserves upstream signatures and uses only in-memory fallback, preventing large thinking stores from blocking request workers. Historical caches and protocol-level recovery are retained.
+
 The attached deployment bundle pins the tested image digest and contains no credentials. Existing deployments must retain their data mounts and secrets.
 ''')
 print(archive)

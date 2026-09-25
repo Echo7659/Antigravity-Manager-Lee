@@ -114,19 +114,20 @@ impl SignatureCache {
         }
     }
 
-    /// Retrieve a signature for a tool_use_id
+    /// Read only the in-memory cache for optional diagnostics; never access SQLite.
+    pub(crate) fn get_cached_tool_signature(&self, tool_use_id: &str) -> Option<String> {
+        let cache = self.tool_signatures.lock().ok()?;
+        let entry = cache.get(tool_use_id)?;
+        if entry.is_expired() {
+            return None;
+        }
+        Some(entry.data.clone())
+    }
+
+    /// Retrieve a signature for protocol recovery, including the persistent fallback.
     pub fn get_tool_signature(&self, tool_use_id: &str) -> Option<String> {
-        // 1. 先查内存 L1 缓存
-        if let Ok(cache) = self.tool_signatures.lock() {
-            if let Some(entry) = cache.get(tool_use_id) {
-                if !entry.is_expired() {
-                    tracing::debug!(
-                        "[SignatureCache] Hit tool signature for id: {}",
-                        tool_use_id
-                    );
-                    return Some(entry.data.clone());
-                }
-            }
+        if let Some(signature) = self.get_cached_tool_signature(tool_use_id) {
+            return Some(signature);
         }
 
         // 2. 内存未命中（如代理重启过），从 SQLite L2 数据库恢复
