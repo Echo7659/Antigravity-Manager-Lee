@@ -2452,6 +2452,15 @@ impl Drop for QuotaRefreshGuard {
 
 /// Core logic to batch refresh all account quotas (decoupled from Tauri status)
 pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
+    refresh_quotas_logic(false).await
+}
+
+/// Refresh only accounts currently held by weekly quota protection.
+pub async fn refresh_protected_quotas_logic() -> Result<RefreshStats, String> {
+    refresh_quotas_logic(true).await
+}
+
+async fn refresh_quotas_logic(protected_only: bool) -> Result<RefreshStats, String> {
     use futures::future::join_all;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
@@ -2472,7 +2481,8 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     let start = std::time::Instant::now();
 
     crate::modules::logger::log_info(&format!(
-        "Starting batch refresh of all account quotas (Concurrent mode, max: {})",
+        "Starting batch refresh of {} account quotas (Concurrent mode, max: {})",
+        if protected_only { "protected" } else { "all" },
         MAX_CONCURRENT
     ));
     let accounts = list_accounts()?;
@@ -2482,6 +2492,9 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     let tasks: Vec<_> = accounts
         .into_iter()
         .filter(|account| {
+            if protected_only && account.protected_models.is_empty() {
+                return false;
+            }
             // [MOD] Now we allow refreshing disabled and proxy_disabled accounts
             // to support forced re-sync from UI.
             // Only strictly skip forbidden accounts if necessary, but even those
@@ -2544,16 +2557,19 @@ pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
 
     let elapsed = start.elapsed();
     crate::modules::logger::log_info(&format!(
-        "Batch refresh completed: {} success, {} failed, took: {}ms",
+        "Batch refresh completed ({}): {} success, {} failed, took: {}ms",
+        if protected_only { "protected" } else { "all" },
         success,
         failed,
         elapsed.as_millis()
     ));
 
     // After quota refresh, immediately check and trigger warmup for weekly recovered models
-    tokio::spawn(async {
-        check_and_trigger_warmup_for_recovered_models().await;
-    });
+    if !protected_only {
+        tokio::spawn(async {
+            check_and_trigger_warmup_for_recovered_models().await;
+        });
+    }
 
     Ok(RefreshStats {
         total,

@@ -122,7 +122,7 @@ pub fn start_scheduler(
                     last_protection_refresh.is_none_or(|last| last.elapsed() >= refresh_interval);
                 if refresh_due {
                     last_protection_refresh = Some(time::Instant::now());
-                    match crate::commands::refresh_all_quotas_internal(
+                    match crate::commands::refresh_protected_quotas_internal(
                         &proxy_state,
                         app_handle.clone(),
                     )

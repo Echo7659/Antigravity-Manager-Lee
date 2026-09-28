@@ -286,25 +286,39 @@ pub async fn fetch_account_quota(
 
 pub use modules::account::RefreshStats;
 
+async fn synchronize_quota_refresh(
+    proxy_state: &crate::commands::proxy::ProxyServiceState,
+    app_handle: Option<tauri::AppHandle>,
+) {
+    let instance_lock = proxy_state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        let _ = instance.token_manager.reload_all_accounts().await;
+    }
+    drop(instance_lock);
+
+    if let Some(handle) = app_handle {
+        use tauri::Emitter;
+        let _ = handle.emit("accounts://refreshed", ());
+    }
+}
+
 /// 刷新所有账号配额 (内部实现)
 pub async fn refresh_all_quotas_internal(
     proxy_state: &crate::commands::proxy::ProxyServiceState,
     app_handle: Option<tauri::AppHandle>,
 ) -> Result<RefreshStats, String> {
     let stats = modules::account::refresh_all_quotas_logic().await?;
+    synchronize_quota_refresh(proxy_state, app_handle).await;
+    Ok(stats)
+}
 
-    // 同步到运行中的反代服务（如果已启动）
-    let instance_lock = proxy_state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
-        let _ = instance.token_manager.reload_all_accounts().await;
-    }
-
-    // 发送全局刷新事件给 UI (如果需要)
-    if let Some(handle) = app_handle {
-        use tauri::Emitter;
-        let _ = handle.emit("accounts://refreshed", ());
-    }
-
+/// 后台仅刷新周额度保护中的账号，避免周期性扫描整个账号池。
+pub async fn refresh_protected_quotas_internal(
+    proxy_state: &crate::commands::proxy::ProxyServiceState,
+    app_handle: Option<tauri::AppHandle>,
+) -> Result<RefreshStats, String> {
+    let stats = modules::account::refresh_protected_quotas_logic().await?;
+    synchronize_quota_refresh(proxy_state, app_handle).await;
     Ok(stats)
 }
 
