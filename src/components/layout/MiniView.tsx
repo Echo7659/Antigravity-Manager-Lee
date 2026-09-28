@@ -79,7 +79,10 @@ export default function MiniView() {
 
     // Auto-refresh logic based on config
     useEffect(() => {
-        if (!config?.auto_refresh || !config?.refresh_interval || config.refresh_interval <= 0) return;
+        if (!config?.auto_refresh
+            || config.quota_protection?.enabled
+            || !config.refresh_interval
+            || config.refresh_interval <= 0) return;
 
         console.log(`[MiniView] Starting auto-refresh timer: ${config.refresh_interval} mins`);
 
@@ -91,7 +94,7 @@ export default function MiniView() {
         }, config.refresh_interval * 60 * 1000);
 
         return () => clearInterval(intervalId);
-    }, [config?.auto_refresh, config?.refresh_interval, currentAccount, isRefreshing]);
+    }, [config?.auto_refresh, config?.quota_protection?.enabled, config?.refresh_interval, currentAccount, isRefreshing]);
 
     // Enter mini mode & Auto-resize based on content
     useEffect(() => {

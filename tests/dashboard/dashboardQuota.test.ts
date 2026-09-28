@@ -40,8 +40,11 @@ for (const state of [{ validation_blocked: true }, { disabled: true }, { proxy_d
 }
 assert.equal(recommendAccount([account('boundary', 1, .1)], 'gemini', undefined, protection), undefined);
 assert.equal(recommendAccount([account('allowed', 1, .11)], 'gemini', undefined, protection)?.account.id, 'allowed');
+assert.equal(recommendAccount([account('short-window-low', .1, .11)], 'gemini', undefined, protection)?.account.id, 'short-window-low');
+assert.equal(recommendAccount([account('raw-boundary', 1, .10001)], 'gemini', undefined, protection)?.account.id, 'raw-boundary');
 assert.equal(recommendAccount([healthy, account('tie', .95, .95)], 'gemini', 'tie', protection)?.account.id, 'tie');
 assert.equal(recommendAccount([{...healthy, quota:{...healthy.quota!, is_forbidden: true}}], 'gemini'), undefined);
 console.log('Dashboard quota, unknown data, recommendation eligibility and stable selection passed.');
 
-assert.equal(recommendAccount([{ ...account('image-only-protection', 1, 1), protected_models: ['gemini-3.1-flash-image'] }, healthy], 'gemini', undefined, protection)?.account.id, 'image-only-protection');
+assert.equal(recommendAccount([{ ...account('image-only-protection', 1, 1), protected_models: ['gemini-3.1-flash-image'] }, healthy], 'gemini', undefined, protection)?.account.id, 'healthy');
+assert.equal(recommendAccount([{ ...account('claude-protection', 1, 1), protected_models: ['claude'] }, healthy], 'gemini', undefined, protection)?.account.id, 'healthy');

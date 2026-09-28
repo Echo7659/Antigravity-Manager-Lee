@@ -75,7 +75,7 @@ export default function AccountDetailsDialog({ account, onClose }: AccountDetail
 
                 {/* Content */}
                 <div className="p-6 max-h-[60vh] overflow-y-auto">
-                    {/* Protected Models Section */}
+                    {/* Weekly quota groups that triggered account-wide protection */}
                     {account.protected_models && account.protected_models.length > 0 && (
                         <div className="mb-6">
                             <h4 className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-widest mb-3 flex items-center gap-2">

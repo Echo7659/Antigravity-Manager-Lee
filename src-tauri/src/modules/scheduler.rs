@@ -99,8 +99,10 @@ pub fn start_scheduler(
             "[Scheduler] Weekly Reset Warmup Scheduler started. Monitoring 7-day quota windows...",
         );
 
-        // Scan every 5 minutes (300s) to check for accounts reaching weekly reset time
-        let mut interval = time::interval(Duration::from_secs(300));
+        // Tick every minute for configurable quota refresh; warmup remains on a 5-minute cadence.
+        let mut interval = time::interval(Duration::from_secs(60));
+        let mut last_protection_refresh: Option<time::Instant> = None;
+        let mut last_warmup_scan: Option<time::Instant> = None;
 
         loop {
             interval.tick().await;
@@ -109,6 +111,41 @@ pub fn start_scheduler(
             let Ok(app_config) = config::load_app_config() else {
                 continue;
             };
+
+            // 配额保护必须在无 WebView / headless 模式下也能取得新周额度并自动恢复。
+            // 该刷新由后端统一负责，周期沿用用户的自动刷新间隔。
+            if app_config.quota_protection.enabled {
+                let refresh_interval = Duration::from_secs(
+                    (app_config.refresh_interval.max(1) as u64).saturating_mul(60),
+                );
+                let refresh_due =
+                    last_protection_refresh.is_none_or(|last| last.elapsed() >= refresh_interval);
+                if refresh_due {
+                    last_protection_refresh = Some(time::Instant::now());
+                    match crate::commands::refresh_all_quotas_internal(
+                        &proxy_state,
+                        app_handle.clone(),
+                    )
+                    .await
+                    {
+                        Ok(stats) => logger::log_info(&format!(
+                            "[Scheduler] Weekly reserve refresh completed: {} success, {} failed",
+                            stats.success, stats.failed
+                        )),
+                        Err(error) => logger::log_warn(&format!(
+                            "[Scheduler] Weekly reserve refresh failed: {}",
+                            error
+                        )),
+                    }
+                }
+            } else {
+                last_protection_refresh = None;
+            }
+
+            if last_warmup_scan.is_some_and(|last| last.elapsed() < Duration::from_secs(300)) {
+                continue;
+            }
+            last_warmup_scan = Some(time::Instant::now());
 
             // Must be enabled by user in Settings
             if !app_config.scheduled_warmup.enabled {

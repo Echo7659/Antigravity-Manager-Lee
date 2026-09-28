@@ -1,4 +1,29 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+fn is_third_party_group(group: &crate::models::quota::QuotaGroup) -> bool {
+    let name = group.display_name.to_ascii_lowercase();
+    name.contains("claude")
+        || name.contains("gpt")
+        || name.contains("3p")
+        || group
+            .buckets
+            .iter()
+            .any(|bucket| bucket.bucket_id.to_ascii_lowercase().contains("3p"))
+}
+
+fn group_matches_model(group: &crate::models::quota::QuotaGroup, model: &str) -> bool {
+    let third_party = is_third_party_group(group);
+    if model.starts_with("claude") || model.starts_with("gpt") {
+        third_party
+    } else {
+        model.starts_with("gemini") && !third_party
+    }
+}
+
+fn is_weekly_bucket(bucket: &crate::models::quota::QuotaBucket) -> bool {
+    let key = format!("{} {}", bucket.window, bucket.bucket_id).to_ascii_lowercase();
+    key.contains("week") || key.contains("7d")
+}
 
 /// 所有匹配额度窗口都构成上限，包括周额度和五小时额度。
 pub fn limiting_bucket<'a>(
@@ -8,19 +33,64 @@ pub fn limiting_bucket<'a>(
     let model = model.to_ascii_lowercase();
     groups
         .iter()
-        .filter(|group| {
-            let name = group.display_name.to_ascii_lowercase();
-            let third_party =
-                name.contains("claude") || name.contains("gpt") || name.contains("3p");
-            if model.starts_with("claude") || model.starts_with("gpt") {
-                third_party
-            } else {
-                model.starts_with("gemini") && (name.contains("gemini") || !third_party)
-            }
-        })
+        .filter(|group| group_matches_model(group, &model))
         .flat_map(|group| &group.buckets)
-        .filter(|bucket| bucket.remaining_fraction.is_finite() && bucket.remaining_fraction >= 0.0)
+        .filter(|bucket| {
+            bucket.remaining_fraction.is_finite()
+                && (0.0..=1.0).contains(&bucket.remaining_fraction)
+        })
         .min_by(|a, b| a.remaining_fraction.total_cmp(&b.remaining_fraction))
+}
+
+/// 返回目标模型组最新快照中的原始周额度比例，不混入 5 小时或模型额度。
+pub fn weekly_remaining_fraction(
+    model: &str,
+    groups: &[crate::models::quota::QuotaGroup],
+) -> Option<f64> {
+    let model = model.to_ascii_lowercase();
+    groups
+        .iter()
+        .filter(|group| group_matches_model(group, &model))
+        .flat_map(|group| &group.buckets)
+        .filter(|bucket| {
+            is_weekly_bucket(bucket)
+                && bucket.remaining_fraction.is_finite()
+                && (0.0..=1.0).contains(&bucket.remaining_fraction)
+        })
+        .map(|bucket| bucket.remaining_fraction)
+        .min_by(f64::total_cmp)
+}
+
+/// 根据原始周额度快照更新保护键。缺失或无效的周额度不是恢复证据，因此保留旧状态。
+pub fn reconcile_weekly_protection(
+    existing: &HashSet<String>,
+    quota: &crate::models::quota::QuotaData,
+    monitored_models: &[String],
+    threshold_percentage: u32,
+) -> HashSet<String> {
+    let monitored: HashSet<String> = monitored_models
+        .iter()
+        .map(|model| {
+            crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+                .unwrap_or_else(|| model.clone())
+        })
+        .collect();
+    let mut protected: HashSet<String> = existing.intersection(&monitored).cloned().collect();
+    let Some(groups) = quota.quota_groups.as_deref() else {
+        return protected;
+    };
+    let threshold = f64::from(threshold_percentage.min(100)) / 100.0;
+    for model in monitored {
+        let Some(remaining) = weekly_remaining_fraction(&model, groups) else {
+            continue;
+        };
+        if remaining <= threshold {
+            protected.insert(model);
+        } else {
+            protected.remove(&model);
+        }
+    }
+    protected
 }
 
 /// 将供应商的多个窗口合并为模型可使用额度的上限。
@@ -93,11 +163,6 @@ pub fn model_percentage(
         .copied()
 }
 
-/// 保护边界包含阈值本身；未知额度不由百分比规则直接判为耗尽。
-pub fn is_protected(percentage: Option<i32>, threshold: i32) -> bool {
-    percentage.is_some_and(|remaining| remaining <= threshold)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,13 +203,55 @@ mod tests {
         assert_eq!(account["quota"]["models"][0]["extra"], "keep");
         assert_eq!(account["quota"]["models"][1]["percentage"], 80);
     }
+
     #[test]
-    fn compat_quota_boundary_includes_ten_percent() {
-        assert!(is_protected(Some(0), 10));
-        assert!(is_protected(Some(9), 10));
-        assert!(is_protected(Some(10), 10));
-        assert!(!is_protected(Some(11), 10));
-        assert!(!is_protected(None, 10));
+    fn weekly_reserve_uses_raw_weekly_fraction_only() {
+        let quota = |five_hour, weekly| {
+            serde_json::from_value::<crate::models::quota::QuotaData>(serde_json::json!({
+                "last_updated": 1,
+                "models": [{"name":"gemini-3.8-flash-high","percentage":5,"reset_time":"short"}],
+                "quota_groups": [{"display_name":"Gemini Models","buckets":[
+                    {"bucket_id":"gemini-5h","window":"5h","remaining_fraction":five_hour,"reset_time":"short"},
+                    {"bucket_id":"gemini-weekly","window":"weekly","remaining_fraction":weekly,"reset_time":"weekly"}
+                ]}]
+            }))
+            .unwrap()
+        };
+        let monitored = vec!["gemini-3-flash".to_string()];
+        let empty = HashSet::new();
+
+        assert!(
+            reconcile_weekly_protection(&empty, &quota(0.05, 0.10001), &monitored, 10).is_empty()
+        );
+        assert!(
+            reconcile_weekly_protection(&empty, &quota(1.0, 0.10), &monitored, 10)
+                .contains("gemini-3-flash")
+        );
+    }
+
+    #[test]
+    fn weekly_reserve_requires_fresh_recovery_evidence() {
+        let monitored = vec!["claude".to_string()];
+        let existing = HashSet::from(["claude".to_string()]);
+        let missing: crate::models::quota::QuotaData = serde_json::from_value(serde_json::json!({
+            "last_updated": 2,
+            "models": [{"name":"claude-sonnet-4-6","percentage":100,"reset_time":""}]
+        }))
+        .unwrap();
+        assert_eq!(
+            reconcile_weekly_protection(&existing, &missing, &monitored, 10),
+            existing
+        );
+
+        let recovered: crate::models::quota::QuotaData = serde_json::from_value(serde_json::json!({
+            "last_updated": 3,
+            "models": [{"name":"claude-sonnet-4-6","percentage":100,"reset_time":""}],
+            "quota_groups": [{"display_name":"Claude and GPT models","buckets":[
+                {"bucket_id":"3p-weekly","window":"7d","remaining_fraction":0.11,"reset_time":"next"}
+            ]}]
+        }))
+        .unwrap();
+        assert!(reconcile_weekly_protection(&existing, &recovered, &monitored, 10).is_empty());
     }
     #[test]
     fn compat_quota_other_model_cannot_hide_low_target() {

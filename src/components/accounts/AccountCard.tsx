@@ -157,7 +157,7 @@ function AccountCard({ account, selected, onSelect, isCurrent: propIsCurrent, is
     const isModelProtected = (key?: string) => {
         if (!config?.quota_protection?.enabled) return false;
         if (!key) return false;
-        return account.protected_models?.includes(key);
+        return Boolean(account.protected_models?.length);
     };
 
     return (

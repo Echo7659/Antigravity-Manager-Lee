@@ -83,7 +83,7 @@ pub struct QuotaProtectionConfig {
     /// Whether quota protection is enabled
     pub enabled: bool,
 
-    /// Reserved quota percentage (1-99)
+    /// Reserved weekly quota percentage (1-99)
     pub threshold_percentage: u32,
 
     /// List of monitored models (e.g. gemini-3-flash, gemini-3-pro-high, gemini-3.1-pro-high, claude-sonnet-4-6)

@@ -32,6 +32,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
 
     const geminiImageModel = findImageQuotaModel(account.quota?.models);
     const imageProtectionKey = getModelProtectionKey(geminiImageModel?.name || '');
+    const isAccountProtected = Boolean(account.protected_models?.length);
     const liveImageLimit = getLiveLimitForModel(account, geminiImageModel?.name, imageProtectionKey ?? undefined);
     const liveImageState = getLiveLimitState(liveImageLimit);
     const isImageLiveLimited = liveImageState.shouldShow;
@@ -183,7 +184,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             )}
                             <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
                                 <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Gemini 3.1 Pro">
-                                    {(account.protected_models?.includes('gemini-3-pro-high') || account.protected_models?.includes('gemini-3.1-pro-high')) && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                    {isAccountProtected && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
                                     <span className="truncate">G3.1 Pro</span>
                                 </span>
                                 <div className="flex-1 flex justify-center">
@@ -215,7 +216,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             )}
                             <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
                                 <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Gemini 3 Flash">
-                                    {account.protected_models?.includes('gemini-3-flash') && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                    {isAccountProtected && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
                                     <span className="truncate">G3 Flash</span>
                                 </span>
                                 <div className="flex-1 flex justify-center">
@@ -248,7 +249,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
                                 <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title={imageLimitTitle}>
                                     {isImageLiveLimited && <Clock className={cn("w-2.5 h-2.5 shrink-0 z-10", liveImageState.isActive ? "text-rose-500" : "text-amber-500")} />}
-                                    {(imageProtectionKey && account.protected_models?.includes(imageProtectionKey)) && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                    {isAccountProtected && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
                                     <span className="truncate">G3 Image</span>
                                 </span>
                                 <div className="flex-1 flex justify-center">
@@ -281,7 +282,7 @@ function AccountRow({ account, selected, onSelect, isCurrent, isRefreshing, isSw
                             )}
                             <div className="relative z-10 w-full flex items-center text-[10px] font-mono leading-none">
                                 <span className="w-[64px] text-gray-500 dark:text-gray-400 font-bold pr-1 flex items-center gap-1" title="Claude Series">
-                                    {account.protected_models?.includes('claude') && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
+                                    {isAccountProtected && <Lock className="w-2.5 h-2.5 text-rose-500 shrink-0 z-10" />}
                                     <span className="truncate">Claude</span>
                                 </span>
                                 <div className="flex-1 flex justify-center">

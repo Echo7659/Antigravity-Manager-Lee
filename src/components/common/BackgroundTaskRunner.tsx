@@ -16,15 +16,17 @@ function BackgroundTaskRunner() {
 
         let intervalId: ReturnType<typeof setTimeout> | null = null;
         const { auto_refresh, refresh_interval } = config;
+        const backendManaged = config.quota_protection?.enabled === true;
 
-        // Check if we just turned it on
-        if (auto_refresh && !prevAutoRefreshRef.current) {
+        if (auto_refresh && !prevAutoRefreshRef.current && !backendManaged) {
             console.log('[BackgroundTask] Auto-refresh enabled, executing immediately...');
             refreshAllQuotas();
         }
         prevAutoRefreshRef.current = auto_refresh;
 
-        if (auto_refresh && refresh_interval > 0) {
+        // Weekly protection is periodically refreshed by the Rust scheduler so headless and
+        // closed-WebView deployments share the same recovery path.
+        if (auto_refresh && refresh_interval > 0 && !backendManaged) {
             console.log(`[BackgroundTask] Starting auto-refresh quota timer: ${refresh_interval} mins`);
             intervalId = setInterval(() => {
                 console.log('[BackgroundTask] Auto-refreshing all quotas...');
@@ -38,7 +40,7 @@ function BackgroundTaskRunner() {
                 clearInterval(intervalId);
             }
         };
-    }, [config?.auto_refresh, config?.refresh_interval]);
+    }, [config?.auto_refresh, config?.refresh_interval, config?.quota_protection?.enabled]);
 
     // Auto Sync Current Account Effect
     useEffect(() => {

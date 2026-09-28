@@ -1940,50 +1940,28 @@ pub fn update_account_quota(account_id: &str, mut quota: QuotaData) -> Result<()
     if let Ok(config) = crate::modules::config::load_app_config() {
         if config.quota_protection.enabled {
             if let Some(ref q) = account.quota {
-                let threshold = config.quota_protection.threshold_percentage as i32;
-
-                let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
-
-                for model in &q.models {
-                    if let Some(std_id) =
-                        crate::proxy::common::model_mapping::normalize_to_standard_id(&model.name)
-                    {
-                        let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                        if model.percentage > *entry {
-                            *entry = model.percentage;
-                        }
-                    }
+                let previous = account.protected_models.clone();
+                account.protected_models = crate::proxy::quota_policy::reconcile_weekly_protection(
+                    &previous,
+                    q,
+                    &config.quota_protection.monitored_models,
+                    config.quota_protection.threshold_percentage,
+                );
+                for model in account.protected_models.difference(&previous) {
+                    crate::modules::logger::log_info(&format!(
+                        "[Quota] Weekly reserve protection enabled: {} (Group: {}, Threshold: {}%)",
+                        account.email, model, config.quota_protection.threshold_percentage
+                    ));
+                }
+                for model in previous.difference(&account.protected_models) {
+                    crate::modules::logger::log_info(&format!(
+                        "[Quota] Weekly reserve protection recovered: {} (Group: {}, Threshold: {}%)",
+                        account.email, model, config.quota_protection.threshold_percentage
+                    ));
                 }
 
-                for std_id in &config.quota_protection.monitored_models {
-                    let lookup_key =
-                        crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
-                            .unwrap_or_else(|| std_id.clone());
-                    let max_pct = group_max_percentage
-                        .get(&lookup_key)
-                        .cloned()
-                        .unwrap_or(100);
-
-                    if max_pct <= threshold {
-                        if !account.protected_models.contains(&lookup_key) {
-                            crate::modules::logger::log_info(&format!(
-                                "[Quota] Triggering model protection: {} (Group: {} Max: {}% <= Thres: {}%)",
-                                account.email, lookup_key, max_pct, threshold
-                            ));
-                            account.protected_models.insert(lookup_key.clone());
-                        }
-                    } else {
-                        if account.protected_models.contains(&lookup_key) {
-                            crate::modules::logger::log_info(&format!(
-                                "[Quota] Model protection recovered: {} (Group: {} Max: {}% > Thres: {}%)",
-                                account.email, lookup_key, max_pct, threshold
-                            ));
-                            account.protected_models.remove(&lookup_key);
-                        }
-                    }
-                }
-
-                // [Compatibility] Migrate from account-level to model-level protection if previously disabled for quota
+                // Migrate legacy proxy_disabled quota state to the dedicated weekly markers.
+                // Any marker now removes the whole account from routing.
                 if account.proxy_disabled
                     && account
                         .proxy_disabled_reason
@@ -1991,7 +1969,7 @@ pub fn update_account_quota(account_id: &str, mut quota: QuotaData) -> Result<()
                         .map_or(false, |r| r == "quota_protection")
                 {
                     crate::modules::logger::log_info(&format!(
-                        "[Quota] Migrating account {} from account-level to model-level protection",
+                        "[Quota] Migrating legacy quota protection state for account {}",
                         account.email
                     ));
                     account.proxy_disabled = false;

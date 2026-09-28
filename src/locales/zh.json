@@ -308,7 +308,7 @@
     "details": {
       "title": "配额详情",
       "model_quota": "模型配额",
-      "protected_models": "受保护模型"
+      "protected_models": "触发保护的周额度组"
     },
     "toast": {
       "proxy_enabled": "成功启用 {{count}} 个账号的反代功能",
@@ -458,13 +458,13 @@
     "quota_protection": {
       "title": "配额保护",
       "enable": "启用配额保护",
-      "enable_desc": "当账号剩余配额低于阈值时自动禁用反代功能，配额重置后将自动恢复账号",
-      "threshold_label": "保留配额百分比",
+      "enable_desc": "任一监控模型组的周额度达到保留阈值时停止调度整个账号，刷新确认恢复后自动启用",
+      "threshold_label": "保留周配额百分比",
       "monitored_models_label": "监控模型 (触发条件)",
-      "monitored_models_desc": "至少选择一个核心模型。任一勾选模型额度低于阈值将触发保护",
+      "monitored_models_desc": "至少选择一个核心模型。任一勾选模型组的周额度达到阈值将触发整账号保护",
       "range": "范围",
-      "example": "示例：设置 {{percentage}}% 时，{{total}} 次配额的账号剩余 ≤ {{threshold}} 次时将被自动禁用",
-      "auto_restore_info": "配额重置后将自动重新启用账号"
+      "example": "示例：设置 {{percentage}}% 时，周额度剩余 ≤ {{percentage}}% 将停止调度整个账号（5 小时额度不参与）",
+      "auto_restore_info": "新周额度快照确认高于阈值后自动恢复账号"
     },
     "pinned_quota_models": {
       "title": "配额关注列表",

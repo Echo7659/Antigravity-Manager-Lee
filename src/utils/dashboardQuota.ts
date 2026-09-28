@@ -1,7 +1,7 @@
 import type { Account } from '../types/account';
 import type { QuotaProtectionConfig } from '../types/config';
-import { findImageQuotaModel, findQuotaModel, getModelProtectionKey } from './modelCategory';
-import { getModelQuotaDisplay } from './quotaDisplay';
+import { findImageQuotaModel, findQuotaModel } from './modelCategory';
+import { getModelQuotaDisplay, getWeeklyQuotaFraction } from './quotaDisplay';
 
 export type DashboardQuotaCategory = 'gemini' | 'image' | 'claude';
 
@@ -39,10 +39,17 @@ export function recommendAccount(accounts: Account[], category: 'gemini' | 'clau
         .filter(({ account, quota }) => {
             if (quota === null || quota <= 0) return false;
             const belongs = (name: string) => category === 'claude' ? /^(claude|gpt)/i.test(name) : /^gemini/i.test(name) && !/image/i.test(name);
-            if (protection?.enabled && (account.protected_models || []).some(belongs)) return false;
+            if (protection?.enabled) {
+                if ((account.protected_models || []).length > 0) return false;
+                const threshold = Math.min(100, protection.threshold_percentage) / 100;
+                const weeklyProtected = protection.monitored_models.some(model => {
+                    const fraction = getWeeklyQuotaFraction(model, account.quota?.quota_groups);
+                    return fraction !== null && fraction <= threshold;
+                });
+                if (weeklyProtected) return false;
+            }
             if (Object.entries(account.live_limited_models || {}).some(([name, limit]) => belongs(name) && limit.until > now)) return false;
-            const monitored = protection?.monitored_models.some(name => belongs(name) || (category === 'claude' && getModelProtectionKey(name) === 'claude'));
-            return !(protection?.enabled && monitored && quota <= protection.threshold_percentage);
+            return true;
         })
         .sort((a, b) => (b.quota! - a.quota!) || Number(b.account.id === currentId) - Number(a.account.id === currentId) || a.account.id.localeCompare(b.account.id))[0];
 }

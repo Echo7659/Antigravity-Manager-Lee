@@ -12,7 +12,7 @@ export interface Account {
     proxy_disabled?: boolean;
     proxy_disabled_reason?: string;
     proxy_disabled_at?: number;
-    protected_models?: string[];
+    protected_models?: string[]; // 触发周额度保护的模型组；非空时整账号不参与调度
     live_limited_models?: Record<string, LiveLimitStatus>;
     custom_label?: string;  // 用户自定义标签
     validation_blocked?: boolean;

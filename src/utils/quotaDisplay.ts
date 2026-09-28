@@ -1,16 +1,30 @@
 import type { ModelQuota, QuotaBucket, QuotaGroup } from '../types/account';
 
-/** 配额显示同时保留窗口原值和综合剩余比例；未知窗口不视为零。 */
-export function getModelQuotaDisplay(modelId: string, model: ModelQuota | undefined, groups: QuotaGroup[] = [], window: 'effective' | '5h' = 'effective') {
+function getModelQuotaBuckets(modelId: string, groups: QuotaGroup[]): QuotaBucket[] {
     const name = modelId.toLowerCase();
     const thirdParty = /^(claude|gpt)/.test(name);
-    const buckets = (groups || []).filter(group => {
+    return (groups || []).filter(group => {
         const groupName = (group?.display_name || '').toLowerCase();
         const isThirdParty = /claude|gpt|3p/.test(groupName)
             || (group?.buckets || []).some(bucket => /3p/.test(bucket?.bucket_id || ''));
         return thirdParty ? isThirdParty : name.startsWith('gemini') && !isThirdParty;
     }).flatMap(group => group?.buckets || [])
-        .filter(bucket => bucket && Number.isFinite(bucket.remaining_fraction) && bucket.remaining_fraction >= 0 && bucket.remaining_fraction <= 1);
+        .filter(bucket => bucket && Number.isFinite(bucket.remaining_fraction)
+            && bucket.remaining_fraction >= 0 && bucket.remaining_fraction <= 1);
+}
+
+/** 配额保护使用原始周额度比例，避免 5h 窗口或整数取整改变 10% 边界。 */
+export function getWeeklyQuotaFraction(modelId: string, groups: QuotaGroup[] = []): number | null {
+    const weekly = getModelQuotaBuckets(modelId, groups)
+        .filter(bucket => /week|7d/i.test(`${bucket.window} ${bucket.bucket_id}`))
+        .reduce<QuotaBucket | undefined>((chosen, bucket) =>
+            !chosen || bucket.remaining_fraction < chosen.remaining_fraction ? bucket : chosen, undefined);
+    return weekly?.remaining_fraction ?? null;
+}
+
+/** 配额显示同时保留窗口原值和综合剩余比例；未知窗口不视为零。 */
+export function getModelQuotaDisplay(modelId: string, model: ModelQuota | undefined, groups: QuotaGroup[] = [], window: 'effective' | '5h' = 'effective') {
+    const buckets = getModelQuotaBuckets(modelId, groups);
     const lowest = (values: QuotaBucket[]) => values.reduce<QuotaBucket | undefined>((chosen, bucket) =>
         !chosen || bucket.remaining_fraction < chosen.remaining_fraction ? bucket : chosen, undefined);
     const fiveHour = lowest(buckets.filter(bucket => /5h|hour/i.test(`${bucket.window} ${bucket.bucket_id}`)));

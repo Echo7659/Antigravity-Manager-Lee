@@ -310,7 +310,7 @@
     "details": {
       "title": "Quota Details",
       "model_quota": "Model Quota",
-      "protected_models": "Protected Models"
+      "protected_models": "Weekly Quota Trigger Groups"
     },
     "toast": {
       "proxy_enabled": "Enabled proxy for {{count}} accounts",
@@ -460,13 +460,13 @@
     "quota_protection": {
       "title": "Quota Protection",
       "enable": "Enable Quota Protection",
-      "enable_desc": "Automatically disable proxy when account quota falls below threshold, and auto-restore when quota resets",
-      "threshold_label": "Reserved Quota Percentage",
+      "enable_desc": "Stop routing the entire account when a monitored weekly quota reaches the reserve threshold, then restore it after a fresh recovery snapshot",
+      "threshold_label": "Reserved Weekly Quota",
       "monitored_models_label": "Monitored Models (Trigger Conditions)",
-      "monitored_models_desc": "Select at least one. Protection triggers if ANY selected model falls below threshold",
+      "monitored_models_desc": "Select at least one. Protection stops the entire account if any selected model group's weekly quota reaches the threshold",
       "range": "Range",
-      "example": "Example: At {{percentage}}%, an account with {{total}} quota will be disabled when remaining ≤ {{threshold}}",
-      "auto_restore_info": "Account will be automatically re-enabled when quota resets"
+      "example": "Example: At {{percentage}}%, weekly quota ≤ {{percentage}}% stops the entire account (5-hour quota is excluded)",
+      "auto_restore_info": "The account is restored after a fresh weekly snapshot confirms quota above the threshold"
     },
     "pinned_quota_models": {
       "title": "Pinned Quota Models",

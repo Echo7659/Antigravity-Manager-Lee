@@ -28,6 +28,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
             </div>
         );
     }
+    const isAccountProtected = Boolean(account.protected_models?.length);
 
     const withDisplay = (model: ModelQuota | undefined) => {
         if (!model) return undefined;
@@ -101,7 +102,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                     <div className="space-y-1.5">
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {(account.protected_models?.includes('gemini-3-pro-high') || account.protected_models?.includes('gemini-3.1-pro-high')) && <Lock className="w-2.5 h-2.5 text-rose-500" />}
+                                {isAccountProtected && <Lock className="w-2.5 h-2.5 text-rose-500" />}
                                 {getModelDisplayName(geminiProModel)}
                             </span>
                             <div className="flex items-center gap-2">
@@ -133,7 +134,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
                                 {isImageLiveLimited && <Clock className="w-2.5 h-2.5 text-amber-500" />}
-                                {(imageProtectionKey && account.protected_models?.includes(imageProtectionKey)) && <Lock className="w-2.5 h-2.5 text-rose-500" />}
+                                {isAccountProtected && <Lock className="w-2.5 h-2.5 text-rose-500" />}
                                 {getModelDisplayName(geminiImageModel)}
                             </span>
                             <div className="flex items-center gap-2">
@@ -165,7 +166,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                     <div className="space-y-1.5">
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {account.protected_models?.includes('gemini-3-flash') && <Lock className="w-2.5 h-2.5 text-rose-500" />}
+                                {isAccountProtected && <Lock className="w-2.5 h-2.5 text-rose-500" />}
                                 {getModelDisplayName(geminiFlashModel)}
                             </span>
                             <div className="flex items-center gap-2">
@@ -197,7 +198,7 @@ function CurrentAccount({ account, onSwitch }: CurrentAccountProps) {
                     <div className="space-y-1.5">
                         <div className="flex justify-between items-baseline">
                             <span className="text-xs font-medium text-gray-600 dark:text-gray-400 flex items-center gap-1">
-                                {account.protected_models?.includes('claude') && <Lock className="w-2.5 h-2.5 text-rose-500" />}
+                                {isAccountProtected && <Lock className="w-2.5 h-2.5 text-rose-500" />}
                                 {getModelDisplayName(claudeModel, t('common.claude_series', 'Claude 系列'))}
                             </span>
                             <div className="flex items-center gap-2">

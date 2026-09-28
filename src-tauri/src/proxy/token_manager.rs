@@ -136,6 +136,10 @@ pub struct ProxyToken {
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
 }
 
+fn is_account_quota_protected(token: &ProxyToken, protection_enabled: bool) -> bool {
+    protection_enabled && !token.protected_models.is_empty()
+}
+
 pub struct TokenManager {
     tokens: Arc<DashMap<String, ProxyToken>>, // account_id -> ProxyToken
     current_index: Arc<AtomicUsize>,
@@ -207,8 +211,12 @@ impl TokenManager {
     }
 
     pub(crate) fn enabled_account_ids(&self) -> Vec<String> {
+        let protection_enabled = crate::modules::config::load_app_config()
+            .map(|config| config.quota_protection.enabled)
+            .unwrap_or(false);
         self.tokens
             .iter()
+            .filter(|entry| !is_account_quota_protected(entry.value(), protection_enabled))
             .map(|entry| entry.key().clone())
             .collect()
     }
@@ -768,8 +776,7 @@ impl TokenManager {
         }))
     }
 
-    /// 检查账号是否应该被配额保护
-    /// 如果配额低于阈值，自动禁用账号并返回 true
+    /// 按原始周额度维护账号保护标记；任一标记存在时整账号退出调度。
     async fn check_and_protect_quota(
         &self,
         account_json: &mut serde_json::Value,
@@ -805,7 +812,7 @@ impl TokenManager {
             None => return false, // 无配额信息，跳过
         };
 
-        // 3. [兼容性 #621] 检查是否被旧版账号级配额保护禁用,尝试恢复并转为模型级
+        // 3. 检查旧版 proxy_disabled 配额保护状态并迁移到专用保护标记。
         let is_proxy_disabled = account_json
             .get("proxy_disabled")
             .and_then(|v| v.as_bool())
@@ -817,7 +824,7 @@ impl TokenManager {
             .unwrap_or("");
 
         if is_proxy_disabled && reason == "quota_protection" {
-            // 如果是被旧版账号级保护禁用的,尝试恢复并转为模型级
+            // 如果是旧版配额保护禁用，恢复主开关并迁移保护状态。
             return self
                 .check_and_restore_quota(account_json, account_path, &quota, &config)
                 .await;
@@ -825,97 +832,59 @@ impl TokenManager {
 
         // [修复 #1344] 不再处理其他禁用原因,让调用方负责检查手动禁用
 
-        // 4. 获取模型列表
-        let models = match quota.get("models").and_then(|m| m.as_array()) {
-            Some(m) => m,
-            None => return false,
+        // 4. 只使用原始 weekly / 7d 桶判定保留额度。5 小时和模型额度不参与。
+        let typed_quota = match serde_json::from_value::<crate::models::QuotaData>(quota.clone()) {
+            Ok(quota) => quota,
+            Err(_) => return false,
         };
+        let current: HashSet<String> = account_json
+            .get("protected_models")
+            .and_then(|models| models.as_array())
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|model| model.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let desired = crate::proxy::quota_policy::reconcile_weekly_protection(
+            &current,
+            &typed_quota,
+            &config.monitored_models,
+            config.threshold_percentage,
+        );
 
-        // 5. [重构] 聚合判定逻辑：按 Standard ID 对账号所有型号进行分组
-        // 解决如 Pro-Low (0%) 和 Pro-High (100%) 在同一账号内导致状态冲突的问题
-        let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
-
-        for model in models {
-            let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let percentage = model
-                .get("percentage")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(100) as i32;
-
-            if let Some(std_id) =
-                crate::proxy::common::model_mapping::normalize_to_standard_id(name)
-            {
-                let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                if percentage > *entry {
-                    *entry = percentage;
-                }
-            }
-        }
-
-        // 6. 遍历受监控的 Standard ID，根据组内“最好状态”执行锁定或恢复
-        let threshold = config.threshold_percentage as i32;
+        // 5. 缺失周额度不是恢复证据；取消监控或新快照高于阈值才会移除旧标记。
         let account_id = account_json
             .get("id")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
-        let mut changed = false;
-
-        for std_id in &config.monitored_models {
-            // [FIX] 归一化监控模型为标准 ID（例如用户在 UI 选了 gemini-3.7-flash，对齐到 gemini-3-flash）
-            let lookup_key = crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
-                .unwrap_or_else(|| std_id.clone());
-
-            // 获取该组的最高百分比，如果账号没该组型号则视为 100%
-            let max_pct = group_max_percentage
-                .get(&lookup_key)
-                .cloned()
-                .unwrap_or(100);
-
-            if max_pct <= threshold {
-                // 只有组内所有模型都不行，才触发全组保护
-                if self
-                    .trigger_quota_protection(
-                        account_json,
-                        &account_id,
-                        account_path,
-                        max_pct,
-                        threshold,
-                        &lookup_key,
-                    )
-                    .await
-                    .unwrap_or(false)
-                {
-                    changed = true;
-                }
-            } else {
-                // 只有全组都好（或者没这型号），才尝试从之前受限状态恢复
-                let protected_models = account_json
-                    .get("protected_models")
-                    .and_then(|v| v.as_array());
-
-                let is_protected = protected_models.map_or(false, |arr| {
-                    arr.iter().any(|m| m.as_str() == Some(lookup_key.as_str()))
-                });
-
-                if is_protected {
-                    if self
-                        .restore_quota_protection(
-                            account_json,
-                            &account_id,
-                            account_path,
-                            &lookup_key,
-                        )
-                        .await
-                        .unwrap_or(false)
-                    {
-                        changed = true;
-                    }
-                }
-            }
+        for model in desired.difference(&current) {
+            let weekly_percentage = typed_quota
+                .quota_groups
+                .as_deref()
+                .and_then(|groups| {
+                    crate::proxy::quota_policy::weekly_remaining_fraction(model, groups)
+                })
+                .map(|remaining| (remaining * 100.0).round() as i32)
+                .unwrap_or_default();
+            let _ = self
+                .trigger_quota_protection(
+                    account_json,
+                    &account_id,
+                    account_path,
+                    weekly_percentage,
+                    config.threshold_percentage.min(100) as i32,
+                    model,
+                )
+                .await;
         }
-
-        let _ = changed; // 避免 unused 警告，如果后续逻辑需要可以继续使用
+        for model in current.difference(&desired) {
+            let _ = self
+                .restore_quota_protection(account_json, &account_id, account_path, model)
+                .await;
+        }
 
         // 我们不再因为配额原因返回 true（即不再跳过账号），
         // 而是加载并在 get_token 时进行过滤。
@@ -1205,7 +1174,7 @@ impl TokenManager {
             protected_models.push(serde_json::Value::String(model_name.to_string()));
 
             tracing::info!(
-                "账号 {} 的模型 {} 因配额受限（{}% < {}%）已被加入保护列表",
+                "账号 {} 的周额度组 {} 已触发整账号保护（{}% <= {}%）",
                 account_id,
                 model_name,
                 current_val,
@@ -1241,7 +1210,7 @@ impl TokenManager {
         Ok(false)
     }
 
-    /// 检查并从账号级保护恢复（迁移至模型级，Issue #621）
+    /// 将旧版 proxy_disabled 配额保护迁移至周额度保护标记。
     async fn check_and_restore_quota(
         &self,
         account_json: &mut serde_json::Value,
@@ -1249,10 +1218,9 @@ impl TokenManager {
         quota: &serde_json::Value,
         config: &crate::models::QuotaProtectionConfig,
     ) -> bool {
-        // [兼容性] 如果该账号当前处于 proxy_disabled=true 且原因是 quota_protection，
-        // 我们将其 proxy_disabled 设为 false，但同时更新其 protected_models 列表。
+        // proxy_disabled 恢复为正常主开关；周额度保护由 protected_models 标记承载。
         tracing::info!(
-            "正在迁移账号 {} 从全局配额保护模式至模型级保护模式",
+            "正在迁移账号 {} 的旧版配额保护状态",
             account_json
                 .get("email")
                 .and_then(|v| v.as_str())
@@ -1263,46 +1231,31 @@ impl TokenManager {
         account_json["proxy_disabled_reason"] = serde_json::Value::Null;
         account_json["proxy_disabled_at"] = serde_json::Value::Null;
 
-        let threshold = config.threshold_percentage as i32;
-        let mut protected_list: Vec<serde_json::Value> = Vec::new();
-
-        if let Some(models) = quota.get("models").and_then(|m| m.as_array()) {
-            let mut group_max_percentage: HashMap<String, i32> = HashMap::new();
-
-            for model in models {
-                let name = model.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let percentage = model
-                    .get("percentage")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32;
-
-                if let Some(std_id) =
-                    crate::proxy::common::model_mapping::normalize_to_standard_id(name)
-                {
-                    let entry = group_max_percentage.entry(std_id).or_insert(-1);
-                    if percentage > *entry {
-                        *entry = percentage;
-                    }
-                }
-            }
-
-            for std_id in &config.monitored_models {
-                let lookup_key =
-                    crate::proxy::common::model_mapping::normalize_to_standard_id(std_id)
-                        .unwrap_or_else(|| std_id.clone());
-                let max_pct = group_max_percentage
-                    .get(&lookup_key)
-                    .cloned()
-                    .unwrap_or(100);
-                if max_pct <= threshold
-                    && !protected_list
-                        .iter()
-                        .any(|v| v.as_str() == Some(lookup_key.as_str()))
-                {
-                    protected_list.push(serde_json::Value::String(lookup_key));
-                }
-            }
-        }
+        let current = account_json
+            .get("protected_models")
+            .and_then(|models| models.as_array())
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|model| model.as_str().map(str::to_owned))
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let protected = serde_json::from_value::<crate::models::QuotaData>(quota.clone())
+            .map(|quota| {
+                crate::proxy::quota_policy::reconcile_weekly_protection(
+                    &current,
+                    &quota,
+                    &config.monitored_models,
+                    config.threshold_percentage,
+                )
+            })
+            .unwrap_or(current);
+        let mut protected_list: Vec<serde_json::Value> = protected
+            .into_iter()
+            .map(serde_json::Value::String)
+            .collect();
+        protected_list.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
 
         account_json["protected_models"] = serde_json::Value::Array(protected_list.clone());
 
@@ -1356,7 +1309,7 @@ impl TokenManager {
         Ok(false)
     }
 
-    /// 从已排序且符合保护规则的最高订阅等级账号中采样，优先使用目标模型剩余额度较高者。
+    /// 从未触发周额度保护的最高订阅等级账号中采样。
     fn select_with_p2c<'a>(
         &self,
         candidates: &'a [ProxyToken],
@@ -1373,11 +1326,7 @@ impl TokenManager {
         let available: Vec<&ProxyToken> = candidates
             .iter()
             .filter(|t| !attempted.contains(&t.account_id))
-            .filter(|t| {
-                !quota_protection_enabled
-                    || !(t.protected_models.contains(&normalized_target)
-                        || t.protected_models.contains(target_model))
-            })
+            .filter(|t| !is_account_quota_protected(t, quota_protection_enabled))
             .collect();
 
         if available.is_empty() {
@@ -1676,27 +1625,13 @@ impl TokenManager {
         // 此处假设所有受支持的模型都会出现在 model_quotas 中
         // 如果 API 返回的配额信息不完整，可能会导致误杀，但为了严格性，我们执行此过滤
         tokens_snapshot.retain(|t| t.model_quotas.contains_key(&normalized_target));
-        let protection = crate::modules::config::load_app_config()
-            .map(|c| c.quota_protection)
-            .unwrap_or_default();
-        let protects_target = protection.enabled
-            && protection.monitored_models.iter().any(|m| {
-                crate::proxy::common::model_mapping::normalize_to_standard_id(m)
-                    .unwrap_or_else(|| m.clone())
-                    == normalized_target
-            });
-        if protects_target {
+        let protection_enabled = crate::modules::config::load_app_config()
+            .map(|config| config.quota_protection.enabled)
+            .unwrap_or(false);
+        if protection_enabled {
             tokens_snapshot.retain(|t| {
                 !self.quota_refresh_inflight.contains_key(&t.account_id)
-                    && !crate::proxy::quota_policy::is_protected(
-                        crate::proxy::quota_policy::model_percentage(
-                            &t.exact_model_quotas,
-                            &t.model_quotas,
-                            target_model,
-                            &normalized_target,
-                        ),
-                        protection.threshold_percentage as i32,
-                    )
+                    && !is_account_quota_protected(t, true)
             });
         }
 
@@ -1833,10 +1768,8 @@ impl TokenManager {
                         let is_rate_limited = self
                             .is_rate_limited(&preferred_token.account_id, Some(&normalized_target))
                             .await;
-                        let is_quota_protected = quota_protection_enabled
-                            && preferred_token
-                                .protected_models
-                                .contains(&normalized_target);
+                        let is_quota_protected =
+                            is_account_quota_protected(&preferred_token, quota_protection_enabled);
 
                         if !is_rate_limited && !is_quota_protected {
                             tracing::info!(
@@ -2083,18 +2016,16 @@ impl TokenManager {
                             );
                             self.session_accounts.remove(sid);
                         } else if !attempted.contains(&bound_id)
-                            && !(quota_protection_enabled
-                                && bound_token.protected_models.contains(&normalized_target))
+                            && !is_account_quota_protected(bound_token, quota_protection_enabled)
                         {
                             // 3. 账号可用且未被标记为尝试失败，优先复用
                             tracing::info!("Sticky Session: Successfully reusing bound account {} for session {}", bound_token.email, sid);
                             target_token = Some(bound_token.clone());
                             need_update_last_used =
                                 Some((bound_token.account_id.clone(), std::time::Instant::now()));
-                        } else if quota_protection_enabled
-                            && bound_token.protected_models.contains(&normalized_target)
+                        } else if is_account_quota_protected(bound_token, quota_protection_enabled)
                         {
-                            tracing::debug!("Sticky Session: Bound account {} is quota-protected for model {} [{}], unbinding and switching.", bound_token.email, normalized_target, target_model);
+                            tracing::debug!("Sticky Session: Bound account {} is weekly-quota-protected, unbinding and switching.", bound_token.email);
                             self.session_accounts.remove(sid);
                         } else if attempted.contains(&bound_id) {
                             // [FIX] 绑定的账号在当前轮次请求中已尝试失败，立即解绑避免死锁
@@ -2131,8 +2062,7 @@ impl TokenManager {
                                 if !self
                                     .is_rate_limited(&found.account_id, Some(&normalized_target))
                                     .await
-                                    && !(quota_protection_enabled
-                                        && found.protected_models.contains(&normalized_target))
+                                    && !is_account_quota_protected(found, quota_protection_enabled)
                                 {
                                     tracing::debug!(
                                         "60s Window: Force reusing last account: {}",
@@ -2154,7 +2084,7 @@ impl TokenManager {
                                             found.email
                                         );
                                     } else {
-                                        tracing::debug!("60s Window: Last account {} is quota-protected for model {} [{}], skipping", found.email, normalized_target, target_model);
+                                        tracing::debug!("60s Window: Last account {} is weekly-quota-protected, skipping", found.email);
                                     }
                                 }
                             }
@@ -2272,8 +2202,7 @@ impl TokenManager {
                                             Some(&normalized_target),
                                         )
                                         .await
-                                    || (quota_protection_enabled
-                                        && token.protected_models.contains(&normalized_target))
+                                    || is_account_quota_protected(token, quota_protection_enabled)
                                 {
                                     continue;
                                 }
@@ -2976,11 +2905,10 @@ impl TokenManager {
             }
 
             // 2. 检查是否被配额保护(如果启用)
-            if quota_protection_enabled && token.protected_models.contains(target_model) {
+            if is_account_quota_protected(token, quota_protection_enabled) {
                 tracing::debug!(
-                    "[Fallback Check] Account {} is quota-protected for model {}, skipping",
-                    token.email,
-                    target_model
+                    "[Fallback Check] Account {} is weekly-quota-protected, skipping",
+                    token.email
                 );
                 continue;
             }
@@ -4568,7 +4496,17 @@ mod tests {
         account_snapshot["proxy_disabled_reason"] =
             serde_json::Value::String("quota_protection".to_string());
         let quota = serde_json::json!({
-            "models": [{ "name": "gemini-3-flash", "percentage": 0 }]
+            "last_updated": chrono::Utc::now().timestamp(),
+            "models": [{ "name": "gemini-3-flash", "percentage": 100, "reset_time": "" }],
+            "quota_groups": [{
+                "display_name": "Gemini Models",
+                "buckets": [{
+                    "bucket_id": "gemini-weekly",
+                    "window": "weekly",
+                    "remaining_fraction": 0.10,
+                    "reset_time": "2030-01-01T00:00:00Z"
+                }]
+            }]
         });
         let config = crate::models::QuotaProtectionConfig {
             enabled: true,
@@ -5406,12 +5344,12 @@ mod tests {
     }
 
     #[test]
-    fn test_p2c_skips_protected_models() {
-        // P2C 应跳过对目标模型有保护的账号 (quota_protection_enabled = true)
+    fn test_p2c_skips_weekly_protected_account_for_every_model() {
+        // 任一周额度保护标记都应让整账号退出 P2C 候选池。
         let manager = TokenManager::new(PathBuf::from("/tmp/test"));
 
         let mut protected = HashSet::new();
-        protected.insert("claude-sonnet".to_string());
+        protected.insert("claude".to_string());
 
         let protected_account =
             create_test_token_with_protected("protected@test.com", Some(90), protected);
@@ -5421,7 +5359,7 @@ mod tests {
         let candidates = vec![protected_account, normal_account];
         let attempted: HashSet<String> = HashSet::new();
 
-        let result = manager.select_with_p2c(&candidates, &attempted, "claude-sonnet", true);
+        let result = manager.select_with_p2c(&candidates, &attempted, "gemini-3-flash", true);
         assert!(result.is_some());
         assert_eq!(result.unwrap().email, "normal@test.com");
     }

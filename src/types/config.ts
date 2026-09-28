@@ -142,7 +142,7 @@ export interface ScheduledWarmupConfig {
 
 export interface QuotaProtectionConfig {
     enabled: boolean;
-    threshold_percentage: number; // 1-99
+    threshold_percentage: number; // 1-99, weekly quota only
     monitored_models: string[];
 }
 

@@ -151,50 +151,20 @@ mod tests {
             ),
         ];
 
-        // 模拟请求 claude-opus-4-5-thinking
-        let target_model = "claude-opus-4-5-thinking";
-        let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
-
-        // 过滤掉被保护的账号
+        // 任一周额度保护标记都会让整个账号退出调度。
         let available_accounts: Vec<_> = tokens
             .iter()
-            .filter(|t| !t.protected_models.contains(&normalized_target))
+            .filter(|t| t.protected_models.is_empty())
             .collect();
 
-        // 验证：账号 1 被过滤（因为 claude 被保护）
-        // 账号 2 和 3 可用
-        assert_eq!(available_accounts.len(), 2);
+        assert_eq!(available_accounts.len(), 1);
         assert!(available_accounts
             .iter()
             .any(|t| t.account_id == "account-2"));
-        assert!(available_accounts
-            .iter()
-            .any(|t| t.account_id == "account-3"));
         assert!(!available_accounts
             .iter()
             .any(|t| t.account_id == "account-1"));
-
-        // 模拟请求 gemini-3-flash
-        let target_model_2 = "gemini-3-flash";
-        let normalized_target_2 =
-            normalize_to_standard_id(target_model_2).unwrap_or_else(|| target_model_2.to_string());
-
-        let available_accounts_2: Vec<_> = tokens
-            .iter()
-            .filter(|t| !t.protected_models.contains(&normalized_target_2))
-            .collect();
-
-        // 验证：账号 3 被过滤（因为 gemini-3-flash 被保护）
-        // 账号 1 和 2 可用
-        assert_eq!(available_accounts_2.len(), 2);
-        assert!(available_accounts_2
-            .iter()
-            .any(|t| t.account_id == "account-1"));
-        assert!(available_accounts_2
-            .iter()
-            .any(|t| t.account_id == "account-2"));
-        assert!(!available_accounts_2
+        assert!(!available_accounts
             .iter()
             .any(|t| t.account_id == "account-3"));
     }
@@ -213,13 +183,9 @@ mod tests {
             create_mock_token("account-3", "user3@example.com", vec!["claude"], Some(5)),
         ];
 
-        let target_model = "claude-opus-4-5-thinking";
-        let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
-
         let available_accounts: Vec<_> = tokens
             .iter()
-            .filter(|t| !t.protected_models.contains(&normalized_target))
+            .filter(|t| t.protected_models.is_empty())
             .collect();
 
         // 所有账号都被过滤，应该返回 0
@@ -331,15 +297,8 @@ mod tests {
         assert_eq!(tokens[1].account_id, "account-mid");
         assert_eq!(tokens[2].account_id, "account-low");
 
-        // 模拟请求 claude-opus-4-5-thinking
-        let target_model = "claude-opus-4-5-thinking";
-        let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
-
         // 按顺序选择第一个可用账号
-        let selected = tokens
-            .iter()
-            .find(|t| !t.protected_models.contains(&normalized_target));
+        let selected = tokens.iter().find(|t| t.protected_models.is_empty());
 
         // 验证：account-high 被跳过，选择 account-mid
         assert!(selected.is_some());
@@ -351,30 +310,13 @@ mod tests {
     }
 
     // ==================================================================================
-    // 测试 8: 模型级别保护（同一账号不同模型）
-    // 验证一个账号可以对某些模型保护，对其他模型不保护
+    // 测试 8: 任一周额度组触发后整账号保护
     // ==================================================================================
 
     #[test]
-    fn test_model_level_protection_granularity() {
-        // 账号对 claude 保护，但对 gemini-3-flash 不保护
+    fn test_weekly_protection_is_account_wide() {
         let token = create_mock_token("account-1", "user@example.com", vec!["claude"], Some(50));
-
-        // 请求 claude-opus-4-5-thinking -> 被保护
-        let normalized_claude = normalize_to_standard_id("claude-opus-4-5-thinking")
-            .unwrap_or_else(|| "claude-opus-4-5-thinking".to_string());
-        assert!(
-            token.protected_models.contains(&normalized_claude),
-            "Claude 请求应该被保护"
-        );
-
-        // 请求 gemini-3-flash -> 不被保护
-        let normalized_gemini = normalize_to_standard_id("gemini-3-flash")
-            .unwrap_or_else(|| "gemini-3-flash".to_string());
-        assert!(
-            !token.protected_models.contains(&normalized_gemini),
-            "Gemini 请求不应该被保护"
-        );
+        assert!(!token.protected_models.is_empty(), "整个账号应该退出调度");
     }
 
     // ==================================================================================
@@ -398,18 +340,14 @@ mod tests {
 
         let token = create_mock_token("account-1", "user@example.com", vec!["claude"], Some(50));
 
-        let target_model = "claude-opus-4-5-thinking";
-        let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
-
         // 启用配额保护时，账号应该被过滤
         let is_protected_when_enabled =
-            config_enabled.enabled && token.protected_models.contains(&normalized_target);
+            config_enabled.enabled && !token.protected_models.is_empty();
         assert!(is_protected_when_enabled, "启用时应该被保护");
 
         // 禁用配额保护时，即使 protected_models 中有值，也不过滤
         let is_protected_when_disabled =
-            config_disabled.enabled && token.protected_models.contains(&normalized_target);
+            config_disabled.enabled && !token.protected_models.is_empty();
         assert!(!is_protected_when_disabled, "禁用时不应该被保护");
     }
 
@@ -451,58 +389,42 @@ mod tests {
 
         // 3. 模拟多次请求，验证账号选择逻辑
 
-        // 请求 1: claude-opus-4-5-thinking
-        let target_claude = normalize_to_standard_id("claude-opus-4-5-thinking")
-            .unwrap_or_else(|| "claude-opus-4-5-thinking".to_string());
-
         let available_for_claude: Vec<_> = accounts
             .iter()
-            .filter(|a| !config.enabled || !a.protected_models.contains(&target_claude))
+            .filter(|a| !config.enabled || a.protected_models.is_empty())
             .collect();
 
-        // 账号 A 和 C 被过滤，B 和 D 可用
-        assert_eq!(available_for_claude.len(), 2);
+        // A、C、D 均有保护标记，只有 B 可用。
+        assert_eq!(available_for_claude.len(), 1);
         let claude_account_ids: Vec<_> = available_for_claude
             .iter()
             .map(|a| a.account_id.as_str())
             .collect();
         assert!(claude_account_ids.contains(&"account-b"));
-        assert!(claude_account_ids.contains(&"account-d"));
-
-        // 请求 2: gemini-3-flash
-        let target_gemini = normalize_to_standard_id("gemini-3-flash")
-            .unwrap_or_else(|| "gemini-3-flash".to_string());
 
         let available_for_gemini: Vec<_> = accounts
             .iter()
-            .filter(|a| !config.enabled || !a.protected_models.contains(&target_gemini))
+            .filter(|a| !config.enabled || a.protected_models.is_empty())
             .collect();
 
-        // 账号 C 和 D 被过滤，A 和 B 可用
-        assert_eq!(available_for_gemini.len(), 2);
+        assert_eq!(available_for_gemini.len(), 1);
         let gemini_account_ids: Vec<_> = available_for_gemini
             .iter()
             .map(|a| a.account_id.as_str())
             .collect();
-        assert!(gemini_account_ids.contains(&"account-a"));
         assert!(gemini_account_ids.contains(&"account-b"));
 
         // 请求 3: 未被监控的模型 (gemini-2.5-flash)
-        let target_unmonitored = normalize_to_standard_id("gemini-2.5-flash")
-            .unwrap_or_else(|| "gemini-2.5-flash".to_string());
-
         let available_for_unmonitored: Vec<_> = accounts
             .iter()
-            .filter(|a| !config.enabled || !a.protected_models.contains(&target_unmonitored))
+            .filter(|a| !config.enabled || a.protected_models.is_empty())
             .collect();
 
-        // 未被监控的模型 (Gemini 2.5 Flash 实际上被归一化为已监控的 3-flash)
-        // 在 4 个测试账号中，账号 C 和 D 开启了 3-flash 保护，而 A 和 B 未开启。
-        // 因此，应该有 2 个账号可用。
+        // 保护是账号级，因此未监控模型也不能绕过。
         assert_eq!(
             available_for_unmonitored.len(),
-            2,
-            "Gemini 2.5 Flash 共享了 3-flash 的保护状态，应有 2 个账号可用"
+            1,
+            "任一周额度保护标记都应移除整个账号"
         );
     }
 
@@ -560,10 +482,6 @@ mod tests {
         // 预期：返回配额保护错误
 
         let session_id = "session-12345";
-        let target_model = "claude-opus-4-5-thinking";
-        let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
-
         // 初始状态：账号 A 没有被保护
         let mut account_a = create_mock_token(
             "account-a",
@@ -585,7 +503,7 @@ mod tests {
 
         // === 请求 2: 继续使用账号 A ===
         // 账号 A 仍然可用
-        assert!(!account_a.protected_models.contains(&normalized_target));
+        assert!(account_a.protected_models.is_empty());
 
         // === 系统触发配额刷新，发现账号 A 配额低于阈值 ===
         // 模拟配额刷新后，account_a 的 claude 被加入保护列表
@@ -597,14 +515,14 @@ mod tests {
         // 检查绑定的账号是否被保护
         let bound_id = session_bindings.get(session_id).unwrap();
         let bound_account = accounts.iter().find(|a| &a.account_id == bound_id).unwrap();
-        let is_protected = bound_account.protected_models.contains(&normalized_target);
+        let is_protected = !bound_account.protected_models.is_empty();
 
         assert!(is_protected, "账号 A 应该被配额保护");
 
         // 尝试找其他可用账号
         let available_accounts: Vec<_> = accounts
             .iter()
-            .filter(|a| !a.protected_models.contains(&normalized_target))
+            .filter(|a| a.protected_models.is_empty())
             .collect();
 
         // 没有可用账号
@@ -613,14 +531,8 @@ mod tests {
         // 在实际实现中，这会返回错误消息
         // 验证应该返回配额保护相关的错误
         let error_message = if available_accounts.is_empty() {
-            if accounts
-                .iter()
-                .all(|a| a.protected_models.contains(&normalized_target))
-            {
-                format!(
-                    "All accounts quota-protected for model {}",
-                    normalized_target
-                )
+            if accounts.iter().all(|a| !a.protected_models.is_empty()) {
+                "All accounts weekly-quota-protected".to_string()
             } else {
                 "All accounts failed or unhealthy.".to_string()
             }
@@ -640,10 +552,6 @@ mod tests {
         // 场景：多个账号，会话绑定的账号配额保护生效后，应该路由到其他账号
 
         let session_id = "session-67890";
-        let target_model = "claude-opus-4-5-thinking";
-        let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
-
         // 初始状态：账号 A 和 B 都没有被保护
         let mut account_a = create_mock_token("account-a", "a@example.com", vec![], Some(70));
         let account_b = create_mock_token("account-b", "b@example.com", vec![], Some(80));
@@ -655,7 +563,7 @@ mod tests {
         session_bindings.insert(session_id.to_string(), account_a.account_id.clone());
 
         // === 请求 2: 继续使用账号 A ===
-        assert!(!account_a.protected_models.contains(&normalized_target));
+        assert!(account_a.protected_models.is_empty());
 
         // === 系统触发配额刷新，账号 A 被保护 ===
         account_a.protected_models.insert("claude".to_string());
@@ -666,7 +574,7 @@ mod tests {
         // 检查绑定的账号
         let bound_id = session_bindings.get(session_id).unwrap();
         let bound_account = accounts.iter().find(|a| &a.account_id == bound_id).unwrap();
-        let is_protected = bound_account.protected_models.contains(&normalized_target);
+        let is_protected = !bound_account.protected_models.is_empty();
 
         assert!(is_protected, "账号 A 应该被配额保护");
 
@@ -678,7 +586,7 @@ mod tests {
         // 寻找其他可用账号
         let available_accounts: Vec<_> = accounts
             .iter()
-            .filter(|a| !a.protected_models.contains(&normalized_target))
+            .filter(|a| a.protected_models.is_empty())
             .collect();
 
         // 应该有账号 B 可用
@@ -747,12 +655,9 @@ mod tests {
         );
 
         // 现在请求应该被正确过滤
-        let target = normalize_to_standard_id("claude-opus-4-5-thinking")
-            .unwrap_or_else(|| "claude-opus-4-5-thinking".to_string());
-
         let available: Vec<_> = tokens_in_memory
             .iter()
-            .filter(|t| !t.protected_models.contains(&target))
+            .filter(|t| t.protected_models.is_empty())
             .collect();
 
         assert_eq!(available.len(), 0, "同步后账号应该被过滤");
@@ -765,10 +670,6 @@ mod tests {
 
     #[test]
     fn test_quota_protection_dynamic_changes() {
-        let target_model = "claude-opus-4-5-thinking";
-        let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
-
         // 账号池
         let mut account_a = create_mock_token("account-a", "a@example.com", vec![], Some(70));
         let mut account_b = create_mock_token("account-b", "b@example.com", vec![], Some(80));
@@ -777,7 +678,7 @@ mod tests {
         let accounts = vec![account_a.clone(), account_b.clone()];
         let available: Vec<_> = accounts
             .iter()
-            .filter(|t| !t.protected_models.contains(&normalized_target))
+            .filter(|t| t.protected_models.is_empty())
             .collect();
         assert_eq!(available.len(), 2, "阶段1: 两个账号都可用");
 
@@ -788,7 +689,7 @@ mod tests {
         let accounts = vec![account_a.clone(), account_b.clone()];
         let available: Vec<_> = accounts
             .iter()
-            .filter(|t| !t.protected_models.contains(&normalized_target))
+            .filter(|t| t.protected_models.is_empty())
             .collect();
         assert_eq!(available.len(), 1, "阶段2: 只有账号 B 可用");
         assert_eq!(available[0].account_id, "account-b");
@@ -800,7 +701,7 @@ mod tests {
         let accounts = vec![account_a.clone(), account_b.clone()];
         let available: Vec<_> = accounts
             .iter()
-            .filter(|t| !t.protected_models.contains(&normalized_target))
+            .filter(|t| t.protected_models.is_empty())
             .collect();
         assert_eq!(available.len(), 0, "阶段3: 没有可用账号");
 
@@ -811,7 +712,7 @@ mod tests {
         let accounts = vec![account_a.clone(), account_b.clone()];
         let available: Vec<_> = accounts
             .iter()
-            .filter(|t| !t.protected_models.contains(&normalized_target))
+            .filter(|t| t.protected_models.is_empty())
             .collect();
         assert_eq!(available.len(), 1, "阶段4: 账号 A 恢复可用");
         assert_eq!(available[0].account_id, "account-a");
@@ -824,31 +725,24 @@ mod tests {
 
     #[test]
     fn test_error_messages_for_quota_protection() {
-        let target_model = "claude-opus-4-5-thinking";
-        let normalized_target =
-            normalize_to_standard_id(target_model).unwrap_or_else(|| target_model.to_string());
-
         // 场景 1: 所有账号都因配额保护不可用
         let all_protected = vec![
             create_mock_token("a1", "a1@example.com", vec!["claude"], Some(30)),
             create_mock_token("a2", "a2@example.com", vec!["claude"], Some(20)),
         ];
 
-        let all_are_quota_protected = all_protected
-            .iter()
-            .all(|a| a.protected_models.contains(&normalized_target));
+        let all_are_quota_protected = all_protected.iter().all(|a| !a.protected_models.is_empty());
 
         assert!(all_are_quota_protected, "所有账号都被配额保护");
 
         // 生成错误消息
         let error = format!(
-            "All {} accounts are quota-protected for model '{}'. Wait for quota reset or adjust protection threshold.",
-            all_protected.len(),
-            normalized_target
+            "All {} accounts are weekly-quota-protected. Wait for a fresh quota snapshot or adjust the threshold.",
+            all_protected.len()
         );
 
         assert!(error.contains("quota-protected"));
-        assert!(error.contains("claude"));
+        assert!(error.contains("weekly"));
 
         // 场景 2: 混合情况（部分限流，部分配额保护）
         let mixed = vec![
@@ -858,7 +752,7 @@ mod tests {
 
         let quota_protected_count = mixed
             .iter()
-            .filter(|a| a.protected_models.contains(&normalized_target))
+            .filter(|a| !a.protected_models.is_empty())
             .count();
 
         assert_eq!(quota_protected_count, 1);
