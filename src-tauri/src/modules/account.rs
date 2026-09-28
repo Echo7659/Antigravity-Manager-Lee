@@ -12,6 +12,7 @@ use crate::models::{
 };
 use crate::modules;
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Global per-account lock to prevent concurrent write collisions on the same account JSON file
@@ -616,6 +617,14 @@ mod tests {
             .contains_key("gemini-3.1-flash-image"));
         assert!(!updated.live_limited_models.contains_key("gemini-2.5-pro"));
         std::env::remove_var("ABV_DATA_DIR");
+    }
+
+    #[test]
+    fn quota_refresh_guard_coalesces_and_releases_duplicate_runs() {
+        let first = QuotaRefreshGuard::try_acquire().expect("first refresh should acquire guard");
+        assert!(QuotaRefreshGuard::try_acquire().is_none());
+        drop(first);
+        assert!(QuotaRefreshGuard::try_acquire().is_some());
     }
 }
 
@@ -2422,11 +2431,42 @@ pub struct RefreshStats {
     pub details: Vec<String>,
 }
 
+static QUOTA_REFRESH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct QuotaRefreshGuard;
+
+impl QuotaRefreshGuard {
+    fn try_acquire() -> Option<Self> {
+        QUOTA_REFRESH_ACTIVE
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(Self)
+    }
+}
+
+impl Drop for QuotaRefreshGuard {
+    fn drop(&mut self) {
+        QUOTA_REFRESH_ACTIVE.store(false, Ordering::Release);
+    }
+}
+
 /// Core logic to batch refresh all account quotas (decoupled from Tauri status)
 pub async fn refresh_all_quotas_logic() -> Result<RefreshStats, String> {
     use futures::future::join_all;
     use std::sync::Arc;
     use tokio::sync::Semaphore;
+
+    let Some(_refresh_guard) = QuotaRefreshGuard::try_acquire() else {
+        crate::modules::logger::log_info(
+            "Quota refresh already in progress; coalescing duplicate request",
+        );
+        return Ok(RefreshStats {
+            total: 0,
+            success: 0,
+            failed: 0,
+            details: vec!["quota_refresh_already_in_progress".to_string()],
+        });
+    };
 
     const MAX_CONCURRENT: usize = 5;
     let start = std::time::Instant::now();
