@@ -140,6 +140,16 @@ fn is_account_quota_protected(token: &ProxyToken, protection_enabled: bool) -> b
     protection_enabled && !token.protected_models.is_empty()
 }
 
+fn normalized_protection_models(models: &[String]) -> Vec<String> {
+    models
+        .iter()
+        .map(|model| {
+            crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+                .unwrap_or_else(|| model.clone())
+        })
+        .collect()
+}
+
 pub struct TokenManager {
     tokens: Arc<DashMap<String, ProxyToken>>, // account_id -> ProxyToken
     current_index: Arc<AtomicUsize>,
@@ -847,10 +857,11 @@ impl TokenManager {
                     .collect()
             })
             .unwrap_or_default();
+        let monitored_models = normalized_protection_models(&config.monitored_models);
         let desired = crate::proxy::quota_policy::reconcile_weekly_protection(
             &current,
             &typed_quota,
-            &config.monitored_models,
+            &monitored_models,
             config.threshold_percentage,
         );
 
@@ -1241,12 +1252,13 @@ impl TokenManager {
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
+        let monitored_models = normalized_protection_models(&config.monitored_models);
         let protected = serde_json::from_value::<crate::models::QuotaData>(quota.clone())
             .map(|quota| {
                 crate::proxy::quota_policy::reconcile_weekly_protection(
                     &current,
                     &quota,
-                    &config.monitored_models,
+                    &monitored_models,
                     config.threshold_percentage,
                 )
             })

@@ -68,13 +68,7 @@ pub fn reconcile_weekly_protection(
     monitored_models: &[String],
     threshold_percentage: u32,
 ) -> HashSet<String> {
-    let monitored: HashSet<String> = monitored_models
-        .iter()
-        .map(|model| {
-            crate::proxy::common::model_mapping::normalize_to_standard_id(model)
-                .unwrap_or_else(|| model.clone())
-        })
-        .collect();
+    let monitored: HashSet<String> = monitored_models.iter().cloned().collect();
     let mut protected: HashSet<String> = existing.intersection(&monitored).cloned().collect();
     let Some(groups) = quota.quota_groups.as_deref() else {
         return protected;

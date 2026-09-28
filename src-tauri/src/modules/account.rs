@@ -1941,10 +1941,19 @@ pub fn update_account_quota(account_id: &str, mut quota: QuotaData) -> Result<()
         if config.quota_protection.enabled {
             if let Some(ref q) = account.quota {
                 let previous = account.protected_models.clone();
+                let monitored_models: Vec<String> = config
+                    .quota_protection
+                    .monitored_models
+                    .iter()
+                    .map(|model| {
+                        crate::proxy::common::model_mapping::normalize_to_standard_id(model)
+                            .unwrap_or_else(|| model.clone())
+                    })
+                    .collect();
                 account.protected_models = crate::proxy::quota_policy::reconcile_weekly_protection(
                     &previous,
                     q,
-                    &config.quota_protection.monitored_models,
+                    &monitored_models,
                     config.quota_protection.threshold_percentage,
                 );
                 for model in account.protected_models.difference(&previous) {
