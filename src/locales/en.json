@@ -1616,6 +1616,13 @@
     "cached_token": "Cached token",
     "total": "Total",
     "percentage": "Share",
+    "estimated_cost": "Estimated Cost",
+    "estimated_cost_usd": "Estimated Cost (USD)",
+    "input_cost": "Input Cost",
+    "output_cost": "Output Cost",
+    "cached_cost": "Cached Cost",
+    "unpriced_tokens": "{{tokens}} unpriced tokens",
+    "cost_note": "Priced by the routed model; cached tokens are $0.03/M. Tokens without a configured price are flagged separately.",
     "no_data": "No data available"
   },
   "errors": {

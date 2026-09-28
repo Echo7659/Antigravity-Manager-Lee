@@ -367,11 +367,17 @@ impl ProxyMonitor {
             (&log.account_email, log.input_tokens, log.output_tokens)
         {
             let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
+            let billing_model = log.mapped_model.clone();
             let account = account.clone();
             let cached = log.cached_tokens.unwrap_or(0);
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::modules::token_stats::record_usage(
-                    &account, &model, input, output, cached,
+                    &account,
+                    &model,
+                    billing_model.as_deref(),
+                    input,
+                    output,
+                    cached,
                 ) {
                     tracing::debug!("Failed to record token stats: {}", e);
                 }

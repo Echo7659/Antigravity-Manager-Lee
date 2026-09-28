@@ -1,6 +1,92 @@
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+const NANODOLLARS_PER_USD: u128 = 1_000_000_000;
+const CACHED_NANODOLLARS_PER_TOKEN: u64 = 30; // $0.03 / 1M tokens
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelPrice {
+    input_nanos_per_token: u64,
+    output_nanos_per_token: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UsageCost {
+    input_nanos: u128,
+    output_nanos: u128,
+    cached_nanos: u128,
+    unpriced_tokens: u64,
+}
+
+fn matches_gemini_version(model: &str, version: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase();
+    let model_id = normalized.rsplit('/').next().unwrap_or(&normalized);
+    [format!("gemini-{version}"), format!("gemini{version}")]
+        .iter()
+        .any(|prefix| {
+            model_id.strip_prefix(prefix).is_some_and(|suffix| {
+                suffix
+                    .chars()
+                    .next()
+                    .is_none_or(|character| !character.is_ascii_digit())
+            })
+        })
+}
+
+fn price_for_model(model: &str) -> Option<ModelPrice> {
+    let (input_nanos_per_token, output_nanos_per_token) = if matches_gemini_version(model, "2.5") {
+        (300, 2_502)
+    } else if ["3.6", "3.7", "3.8"]
+        .iter()
+        .any(|version| matches_gemini_version(model, version))
+    {
+        (750, 3_750)
+    } else if matches_gemini_version(model, "3.1") {
+        (2_000, 12_000)
+    } else if matches_gemini_version(model, "3.5") {
+        (1_500, 9_000)
+    } else {
+        return None;
+    };
+
+    Some(ModelPrice {
+        input_nanos_per_token,
+        output_nanos_per_token,
+    })
+}
+
+fn calculate_usage_cost(
+    model: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+) -> UsageCost {
+    let billable_cached_tokens = cached_tokens.min(input_tokens);
+    let uncached_input_tokens = input_tokens.saturating_sub(billable_cached_tokens);
+    let cached_nanos =
+        u128::from(billable_cached_tokens) * u128::from(CACHED_NANODOLLARS_PER_TOKEN);
+
+    match price_for_model(model) {
+        Some(price) => UsageCost {
+            input_nanos: u128::from(uncached_input_tokens)
+                * u128::from(price.input_nanos_per_token),
+            output_nanos: u128::from(output_tokens) * u128::from(price.output_nanos_per_token),
+            cached_nanos,
+            unpriced_tokens: 0,
+        },
+        None => UsageCost {
+            cached_nanos,
+            unpriced_tokens: uncached_input_tokens.saturating_add(output_tokens),
+            ..UsageCost::default()
+        },
+    }
+}
+
+fn nanos_to_usd(nanos: u128) -> f64 {
+    nanos as f64 / NANODOLLARS_PER_USD as f64
+}
 
 /// Aggregated token statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +108,11 @@ pub struct AccountTokenStats {
     pub total_cached_tokens: u64,
     pub total_tokens: u64,
     pub request_count: u64,
+    pub input_cost_usd: f64,
+    pub output_cost_usd: f64,
+    pub cached_cost_usd: f64,
+    pub total_cost_usd: f64,
+    pub unpriced_tokens: u64,
 }
 
 /// Summary statistics
@@ -99,6 +190,7 @@ pub fn init_db() -> Result<(), String> {
             timestamp INTEGER NOT NULL,
             account_email TEXT NOT NULL,
             model TEXT NOT NULL,
+            billing_model TEXT,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
             cached_tokens INTEGER NOT NULL DEFAULT 0,
@@ -157,6 +249,7 @@ pub fn init_db() -> Result<(), String> {
         "token_usage",
         "cached_tokens INTEGER NOT NULL DEFAULT 0",
     )?;
+    add_column_if_missing(&conn, "token_usage", "billing_model TEXT")?;
     add_column_if_missing(
         &conn,
         "token_stats_hourly",
@@ -170,6 +263,7 @@ pub fn init_db() -> Result<(), String> {
 pub fn record_usage(
     account_email: &str,
     model: &str,
+    billing_model: Option<&str>,
     input_tokens: u32,
     output_tokens: u32,
     cached_tokens: u32,
@@ -180,9 +274,9 @@ pub fn record_usage(
 
     // Insert into raw usage table
     conn.execute(
-        "INSERT INTO token_usage (timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, total_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![timestamp, account_email, model, input_tokens, output_tokens, cached_tokens, total_tokens],
+        "INSERT INTO token_usage (timestamp, account_email, model, billing_model, input_tokens, output_tokens, cached_tokens, total_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![timestamp, account_email, model, billing_model, input_tokens, output_tokens, cached_tokens, total_tokens],
     ).map_err(|e| e.to_string())?;
 
     let hour_bucket = chrono::Local::now().format("%Y-%m-%d %H:00").to_string();
@@ -388,41 +482,94 @@ pub fn get_weekly_stats(weeks: i64) -> Result<Vec<TokenStatsAggregated>, String>
 /// Get per-account statistics for a time range
 pub fn get_account_stats(hours: i64) -> Result<Vec<AccountTokenStats>, String> {
     let conn = connect_db()?;
-    let cutoff = chrono::Local::now() - chrono::Duration::hours(hours);
-    let cutoff_bucket = cutoff.format("%Y-%m-%d %H:00").to_string();
+    let cutoff_timestamp = chrono::Local::now().timestamp() - (hours * 3600);
+    get_account_stats_with_conn(&conn, cutoff_timestamp)
+}
 
+#[derive(Debug, Default)]
+struct AccountStatsAccumulator {
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_cached_tokens: u64,
+    request_count: u64,
+    input_cost_nanos: u128,
+    output_cost_nanos: u128,
+    cached_cost_nanos: u128,
+    unpriced_tokens: u64,
+}
+
+fn get_account_stats_with_conn(
+    conn: &Connection,
+    cutoff_timestamp: i64,
+) -> Result<Vec<AccountTokenStats>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT account_email,
-                SUM(total_input_tokens) as input, 
-                SUM(total_output_tokens) as output,
-                SUM(total_cached_tokens) as cached,
-                SUM(total_tokens) as total,
-                SUM(request_count) as count
-         FROM token_stats_hourly 
-         WHERE hour_bucket >= ?1
-         GROUP BY account_email
-         ORDER BY total DESC",
+                COALESCE(NULLIF(billing_model, ''), model) as effective_model,
+                SUM(input_tokens) as input,
+                SUM(output_tokens) as output,
+                SUM(cached_tokens) as cached,
+                COUNT(*) as count
+         FROM token_usage
+         WHERE timestamp >= ?1
+         GROUP BY account_email, effective_model",
         )
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
-        .query_map([cutoff_bucket], |row| {
-            Ok(AccountTokenStats {
-                account_email: row.get(0)?,
-                total_input_tokens: row.get(1)?,
-                total_output_tokens: row.get(2)?,
-                total_cached_tokens: row.get(3)?,
-                total_tokens: row.get(4)?,
-                request_count: row.get(5)?,
-            })
+        .query_map([cutoff_timestamp], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, u64>(4)?,
+                row.get::<_, u64>(5)?,
+            ))
         })
         .map_err(|e| e.to_string())?;
 
-    let mut result = Vec::new();
+    let mut accounts: HashMap<String, AccountStatsAccumulator> = HashMap::new();
     for row in rows {
-        result.push(row.map_err(|e| e.to_string())?);
+        let (account_email, model, input, output, cached, requests) =
+            row.map_err(|e| e.to_string())?;
+        let cost = calculate_usage_cost(&model, input, output, cached);
+        let account = accounts.entry(account_email).or_default();
+        account.total_input_tokens = account.total_input_tokens.saturating_add(input);
+        account.total_output_tokens = account.total_output_tokens.saturating_add(output);
+        account.total_cached_tokens = account.total_cached_tokens.saturating_add(cached);
+        account.request_count = account.request_count.saturating_add(requests);
+        account.input_cost_nanos = account.input_cost_nanos.saturating_add(cost.input_nanos);
+        account.output_cost_nanos = account.output_cost_nanos.saturating_add(cost.output_nanos);
+        account.cached_cost_nanos = account.cached_cost_nanos.saturating_add(cost.cached_nanos);
+        account.unpriced_tokens = account.unpriced_tokens.saturating_add(cost.unpriced_tokens);
     }
+
+    let mut result = accounts
+        .into_iter()
+        .map(|(account_email, account)| {
+            let total_cost_nanos = account
+                .input_cost_nanos
+                .saturating_add(account.output_cost_nanos)
+                .saturating_add(account.cached_cost_nanos);
+            AccountTokenStats {
+                account_email,
+                total_input_tokens: account.total_input_tokens,
+                total_output_tokens: account.total_output_tokens,
+                total_cached_tokens: account.total_cached_tokens,
+                total_tokens: account
+                    .total_input_tokens
+                    .saturating_add(account.total_output_tokens),
+                request_count: account.request_count,
+                input_cost_usd: nanos_to_usd(account.input_cost_nanos),
+                output_cost_usd: nanos_to_usd(account.output_cost_nanos),
+                cached_cost_usd: nanos_to_usd(account.cached_cost_nanos),
+                total_cost_usd: nanos_to_usd(total_cost_nanos),
+                unpriced_tokens: account.unpriced_tokens,
+            }
+        })
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| right.total_tokens.cmp(&left.total_tokens));
     Ok(result)
 }
 
@@ -680,6 +827,147 @@ pub fn get_account_trend_daily(days: i64) -> Result<Vec<AccountTrendPoint>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_usd_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 0.000_000_001,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn pricing_matches_supported_gemini_versions_without_prefix_collisions() {
+        assert_eq!(
+            price_for_model("gemini-2.5-pro"),
+            Some(ModelPrice {
+                input_nanos_per_token: 300,
+                output_nanos_per_token: 2_502,
+            })
+        );
+        assert_eq!(
+            price_for_model("projects/example/models/GEMINI-3.7-FLASH-HIGH"),
+            Some(ModelPrice {
+                input_nanos_per_token: 750,
+                output_nanos_per_token: 3_750,
+            })
+        );
+        assert_eq!(
+            price_for_model("gemini3.1-pro"),
+            Some(ModelPrice {
+                input_nanos_per_token: 2_000,
+                output_nanos_per_token: 12_000,
+            })
+        );
+        assert!(price_for_model("gemini-3.10-pro").is_none());
+        assert!(price_for_model("claude-sonnet-4-6").is_none());
+    }
+
+    #[test]
+    fn pricing_separates_cached_input_and_marks_unknown_models() {
+        let priced = calculate_usage_cost("gemini-3.1-pro-high", 1_500_000, 250_000, 500_000);
+        assert_eq!(priced.input_nanos, 2_000_000_000);
+        assert_eq!(priced.output_nanos, 3_000_000_000);
+        assert_eq!(priced.cached_nanos, 15_000_000);
+        assert_eq!(
+            priced.input_nanos + priced.output_nanos + priced.cached_nanos,
+            5_015_000_000
+        );
+        assert_eq!(priced.unpriced_tokens, 0);
+
+        let unknown = calculate_usage_cost("custom-model", 100, 200, 20);
+        assert_eq!(unknown.cached_nanos, 600);
+        assert_eq!(
+            unknown.input_nanos + unknown.output_nanos + unknown.cached_nanos,
+            600
+        );
+        assert_eq!(unknown.unpriced_tokens, 280);
+    }
+
+    #[test]
+    fn account_costs_use_routed_model_and_fallback_to_requested_model() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE token_usage (
+                timestamp INTEGER NOT NULL,
+                account_email TEXT NOT NULL,
+                model TEXT NOT NULL,
+                billing_model TEXT,
+                input_tokens INTEGER NOT NULL,
+                output_tokens INTEGER NOT NULL,
+                cached_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for (timestamp, email, model, billing_model, input, output, cached) in [
+            (
+                100,
+                "a@example.com",
+                "client-alias",
+                Some("gemini-3.1-pro-high"),
+                1_500_000,
+                250_000,
+                500_000,
+            ),
+            (101, "a@example.com", "custom-model", None, 100, 200, 20),
+            (
+                102,
+                "b@example.com",
+                "gemini-2.5-pro",
+                None,
+                1_000_000,
+                1_000_000,
+                0,
+            ),
+            (
+                -1,
+                "excluded@example.com",
+                "gemini-3.5-flash",
+                None,
+                1_000_000,
+                1_000_000,
+                0,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO token_usage VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?5 + ?6)",
+                params![
+                    timestamp,
+                    email,
+                    model,
+                    billing_model,
+                    input,
+                    output,
+                    cached
+                ],
+            )
+            .unwrap();
+        }
+
+        let stats = get_account_stats_with_conn(&conn, 0).unwrap();
+        assert_eq!(stats.len(), 2);
+        let account_a = stats
+            .iter()
+            .find(|account| account.account_email == "a@example.com")
+            .unwrap();
+        assert_eq!(account_a.request_count, 2);
+        assert_eq!(account_a.total_input_tokens, 1_500_100);
+        assert_eq!(account_a.total_output_tokens, 250_200);
+        assert_eq!(account_a.total_cached_tokens, 500_020);
+        assert_eq!(account_a.total_tokens, 1_750_300);
+        assert_eq!(account_a.unpriced_tokens, 280);
+        assert_usd_close(account_a.input_cost_usd, 2.0);
+        assert_usd_close(account_a.output_cost_usd, 3.0);
+        assert_usd_close(account_a.cached_cost_usd, 0.015_000_6);
+        assert_usd_close(account_a.total_cost_usd, 5.015_000_6);
+
+        let account_b = stats
+            .iter()
+            .find(|account| account.account_email == "b@example.com")
+            .unwrap();
+        assert_usd_close(account_b.total_cost_usd, 2.802);
+        assert_eq!(account_b.unpriced_tokens, 0);
+    }
 
     fn weekly_snapshot(observed: i64, reset: i64, fraction: f64) -> crate::models::QuotaData {
         let iso = |seconds| {

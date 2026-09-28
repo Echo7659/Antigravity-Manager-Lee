@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { request as invoke } from '../utils/request';
 import { useTranslation } from 'react-i18next';
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
-import { Clock, Calendar, CalendarDays, Users, Zap, TrendingUp, RefreshCw, Cpu } from 'lucide-react';
+import { Clock, Calendar, CalendarDays, Users, Zap, TrendingUp, RefreshCw, Cpu, DollarSign } from 'lucide-react';
 
 interface TokenStatsAggregated {
     period: string;
@@ -21,6 +21,11 @@ interface AccountTokenStats {
     total_cached_tokens: number;
     total_tokens: number;
     request_count: number;
+    input_cost_usd: number;
+    output_cost_usd: number;
+    cached_cost_usd: number;
+    total_cost_usd: number;
+    unpriced_tokens: number;
 }
 
 interface ModelTokenStats {
@@ -67,6 +72,11 @@ const formatNumber = (num: number): string => {
     if (num >= 1000) return `${(num / 1000).toFixed(1)}K`;
     return num.toString();
 };
+
+function formatUsd(amount: number): string {
+    const fractionDigits = amount >= 1 ? 4 : 6;
+    return `$${amount.toFixed(fractionDigits)}`;
+}
 
 const shortenModelName = (model: string): string => {
     return model
@@ -184,6 +194,8 @@ const TokenStats: React.FC = () => {
         fullEmail: account.account_email,
         color: COLORS[index % COLORS.length]
     }));
+    const totalCostUsd = accountData.reduce((sum, account) => sum + account.total_cost_usd, 0);
+    const totalUnpricedTokens = accountData.reduce((sum, account) => sum + account.unpriced_tokens, 0);
 
     const trendChartContainerRef = useRef<HTMLDivElement>(null);
     const [tooltipPosition, setTooltipPosition] = useState<{ x: number; y: number } | undefined>(undefined);
@@ -380,7 +392,7 @@ const TokenStats: React.FC = () => {
                 </div>
 
                 {summary && (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-4">
                         <div className="bg-gradient-to-br from-white to-gray-50 dark:from-gray-800 dark:to-gray-800/50 rounded-xl p-4 shadow-sm border border-gray-200 dark:border-gray-700 hover:shadow-md transition-shadow">
                             <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400 text-sm mb-2">
                                 <div className="p-1.5 rounded-lg bg-gray-100 dark:bg-gray-700">
@@ -391,6 +403,22 @@ const TokenStats: React.FC = () => {
                             <div className="text-2xl font-bold text-gray-800 dark:text-white">
                                 {formatNumber(summary.total_tokens)}
                             </div>
+                        </div>
+                        <div className="bg-gradient-to-br from-emerald-50/50 to-white dark:from-emerald-900/10 dark:to-gray-800 rounded-xl p-4 shadow-sm border border-emerald-100 dark:border-emerald-900/30 hover:shadow-md transition-shadow">
+                            <div className="flex items-center gap-2 text-emerald-600/80 dark:text-emerald-400/80 text-sm mb-2">
+                                <div className="p-1.5 rounded-lg bg-emerald-100/50 dark:bg-emerald-900/30">
+                                    <DollarSign className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                                </div>
+                                {t('token_stats.estimated_cost', '预估金额')}
+                            </div>
+                            <div className="text-2xl font-bold text-emerald-600 dark:text-emerald-400">
+                                {formatUsd(totalCostUsd)}
+                            </div>
+                            {totalUnpricedTokens > 0 && (
+                                <div className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+                                    {t('token_stats.unpriced_tokens', '{{tokens}} Token 未计价', { tokens: formatNumber(totalUnpricedTokens) })}
+                                </div>
+                            )}
                         </div>
                         <div className="bg-gradient-to-br from-blue-50/50 to-white dark:from-blue-900/10 dark:to-gray-800 rounded-xl p-4 shadow-sm border border-blue-100 dark:border-blue-900/30 hover:shadow-md transition-shadow">
                             <div className="flex items-center gap-2 text-blue-600/80 dark:text-blue-400/80 text-sm mb-2">
@@ -755,9 +783,14 @@ const TokenStats: React.FC = () => {
                 {
                     accountData.length > 0 && viewMode === 'account' && (
                         <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow-sm border border-gray-200 dark:border-gray-700">
-                            <h2 className="text-lg font-semibold text-gray-800 dark:text-white mb-4">
-                                {t('token_stats.account_details', '账号详细统计')}
-                            </h2>
+                            <div className="mb-4">
+                                <h2 className="text-lg font-semibold text-gray-800 dark:text-white">
+                                    {t('token_stats.account_details', '账号详细统计')}
+                                </h2>
+                                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                                    {t('token_stats.cost_note', '按实际路由模型计价；缓存 Token 统一按 $0.03/M，未配置价格的 Token 会单独标记。')}
+                                </p>
+                            </div>
                             <div className="overflow-x-auto">
                                 <table className="w-full text-sm">
                                     <thead>
@@ -779,6 +812,9 @@ const TokenStats: React.FC = () => {
                                             </th>
                                             <th className="text-right py-3 px-4 font-medium text-gray-500 dark:text-gray-400">
                                                 {t('token_stats.total', '合计')}
+                                            </th>
+                                            <th className="text-right py-3 px-4 font-medium text-gray-500 dark:text-gray-400">
+                                                {t('token_stats.estimated_cost_usd', '预估金额 (USD)')}
                                             </th>
                                         </tr>
                                     </thead>
@@ -805,6 +841,19 @@ const TokenStats: React.FC = () => {
                                                 </td>
                                                 <td className="py-3 px-4 text-right font-semibold text-gray-800 dark:text-white">
                                                     {formatNumber(account.total_tokens)}
+                                                </td>
+                                                <td
+                                                    className="py-3 px-4 text-right whitespace-nowrap"
+                                                    title={`${t('token_stats.input_cost', '输入金额')}: ${formatUsd(account.input_cost_usd)} · ${t('token_stats.cached_cost', '缓存金额')}: ${formatUsd(account.cached_cost_usd)} · ${t('token_stats.output_cost', '输出金额')}: ${formatUsd(account.output_cost_usd)}`}
+                                                >
+                                                    <div className="font-semibold text-emerald-600 dark:text-emerald-400">
+                                                        {formatUsd(account.total_cost_usd)}
+                                                    </div>
+                                                    {account.unpriced_tokens > 0 && (
+                                                        <div className="text-[11px] text-amber-600 dark:text-amber-400">
+                                                            {t('token_stats.unpriced_tokens', '{{tokens}} Token 未计价', { tokens: formatNumber(account.unpriced_tokens) })}
+                                                        </div>
+                                                    )}
                                                 </td>
                                             </tr>
                                         ))}

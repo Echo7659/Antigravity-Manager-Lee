@@ -1582,6 +1582,13 @@
     "cached_token": "缓存命中",
     "total": "合计",
     "percentage": "占比",
+    "estimated_cost": "预估金额",
+    "estimated_cost_usd": "预估金额 (USD)",
+    "input_cost": "输入金额",
+    "output_cost": "输出金额",
+    "cached_cost": "缓存金额",
+    "unpriced_tokens": "{{tokens}} Token 未计价",
+    "cost_note": "按实际路由模型计价；缓存 Token 统一按 $0.03/M，未配置价格的 Token 会单独标记。",
     "no_data": "暂无数据"
   },
   "errors": {
