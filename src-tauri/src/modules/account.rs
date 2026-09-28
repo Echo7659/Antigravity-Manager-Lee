@@ -626,6 +626,53 @@ mod tests {
         drop(first);
         assert!(QuotaRefreshGuard::try_acquire().is_some());
     }
+
+    #[test]
+    fn protected_quota_refresh_waits_for_weekly_reset() {
+        let now = chrono::Utc::now().timestamp();
+        let mut account = Account::new(
+            "protected".to_string(),
+            "protected@example.test".to_string(),
+            TokenData::new(
+                "access".to_string(),
+                "refresh".to_string(),
+                3600,
+                Some("protected@example.test".to_string()),
+                None,
+                None,
+                true,
+                None,
+            ),
+        );
+        account
+            .protected_models
+            .insert("gemini-3-flash".to_string());
+        account.quota = Some(
+            serde_json::from_value(serde_json::json!({
+                "last_updated": now,
+                "models": [],
+                "quota_groups": [{"display_name":"Gemini Models","buckets":[{
+                    "bucket_id":"gemini-weekly","window":"weekly","remaining_fraction":0.10,
+                    "reset_time":chrono::DateTime::from_timestamp(now + 3600, 0).unwrap().to_rfc3339()
+                }]}]
+            }))
+            .unwrap(),
+        );
+        assert!(!protected_quota_refresh_due(&account, now));
+
+        account
+            .quota
+            .as_mut()
+            .unwrap()
+            .quota_groups
+            .as_mut()
+            .unwrap()[0]
+            .buckets[0]
+            .reset_time = chrono::DateTime::from_timestamp(now - 1, 0)
+            .unwrap()
+            .to_rfc3339();
+        assert!(protected_quota_refresh_due(&account, now));
+    }
 }
 
 /// Global account write lock to prevent corruption during concurrent operations
@@ -2460,6 +2507,27 @@ pub async fn refresh_protected_quotas_logic() -> Result<RefreshStats, String> {
     refresh_quotas_logic(true).await
 }
 
+fn protected_quota_refresh_due(account: &Account, now: i64) -> bool {
+    if account.protected_models.is_empty() {
+        return false;
+    }
+    let Some(groups) = account
+        .quota
+        .as_ref()
+        .and_then(|quota| quota.quota_groups.as_deref())
+    else {
+        return true;
+    };
+    account.protected_models.iter().any(|model| {
+        let Some(bucket) = crate::proxy::quota_policy::weekly_limiting_bucket(model, groups) else {
+            return true;
+        };
+        chrono::DateTime::parse_from_rfc3339(&bucket.reset_time)
+            .map(|reset| reset.timestamp() <= now.saturating_add(60))
+            .unwrap_or(true)
+    })
+}
+
 async fn refresh_quotas_logic(protected_only: bool) -> Result<RefreshStats, String> {
     use futures::future::join_all;
     use std::sync::Arc;
@@ -2486,13 +2554,14 @@ async fn refresh_quotas_logic(protected_only: bool) -> Result<RefreshStats, Stri
         MAX_CONCURRENT
     ));
     let accounts = list_accounts()?;
+    let now = chrono::Utc::now().timestamp();
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT));
 
     let tasks: Vec<_> = accounts
         .into_iter()
         .filter(|account| {
-            if protected_only && account.protected_models.is_empty() {
+            if protected_only && !protected_quota_refresh_due(account, now) {
                 return false;
             }
             // [MOD] Now we allow refreshing disabled and proxy_disabled accounts

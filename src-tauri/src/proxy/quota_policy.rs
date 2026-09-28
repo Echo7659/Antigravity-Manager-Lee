@@ -42,11 +42,11 @@ pub fn limiting_bucket<'a>(
         .min_by(|a, b| a.remaining_fraction.total_cmp(&b.remaining_fraction))
 }
 
-/// 返回目标模型组最新快照中的原始周额度比例，不混入 5 小时或模型额度。
-pub fn weekly_remaining_fraction(
+/// 返回目标模型组最新快照中额度最低的原始周额度桶。
+pub fn weekly_limiting_bucket<'a>(
     model: &str,
-    groups: &[crate::models::quota::QuotaGroup],
-) -> Option<f64> {
+    groups: &'a [crate::models::quota::QuotaGroup],
+) -> Option<&'a crate::models::quota::QuotaBucket> {
     let model = model.to_ascii_lowercase();
     groups
         .iter()
@@ -57,8 +57,15 @@ pub fn weekly_remaining_fraction(
                 && bucket.remaining_fraction.is_finite()
                 && (0.0..=1.0).contains(&bucket.remaining_fraction)
         })
-        .map(|bucket| bucket.remaining_fraction)
-        .min_by(f64::total_cmp)
+        .min_by(|a, b| a.remaining_fraction.total_cmp(&b.remaining_fraction))
+}
+
+/// 返回目标模型组最新快照中的原始周额度比例，不混入 5 小时或模型额度。
+pub fn weekly_remaining_fraction(
+    model: &str,
+    groups: &[crate::models::quota::QuotaGroup],
+) -> Option<f64> {
+    weekly_limiting_bucket(model, groups).map(|bucket| bucket.remaining_fraction)
 }
 
 /// 根据原始周额度快照更新保护键。缺失或无效的周额度不是恢复证据，因此保留旧状态。
