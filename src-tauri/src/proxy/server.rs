@@ -1585,10 +1585,29 @@ async fn admin_switch_account(
     }
 }
 
-async fn admin_refresh_all_quotas() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
-{
-    logger::log_info("[API] Starting refresh of all account quotas");
-    let stats = account::refresh_all_quotas_logic().await.map_err(|e| {
+#[derive(Debug, Default, Deserialize)]
+struct AccountRefreshQuery {
+    scope: Option<String>,
+}
+
+async fn admin_refresh_all_quotas(
+    Query(query): Query<AccountRefreshQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let protection_enabled = config::load_app_config()
+        .map(|app_config| app_config.quota_protection.enabled)
+        .unwrap_or(false);
+    let protected_only = protection_enabled && query.scope.as_deref() != Some("all");
+    logger::log_info(if protected_only {
+        "[API] Starting refresh of protected account quotas"
+    } else {
+        "[API] Starting refresh of all account quotas"
+    });
+    let result = if protected_only {
+        account::refresh_protected_quotas_logic().await
+    } else {
+        account::refresh_all_quotas_logic().await
+    };
+    let stats = result.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
