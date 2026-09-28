@@ -89,6 +89,42 @@ fn pick_model_for_group(group_name: &str, bucket_id: &str, monitored_models: &[S
     }
 }
 
+fn cached_weekly_warmup_candidate(
+    account: &Account,
+    now: i64,
+    monitored_models: &[String],
+) -> bool {
+    let Some(quota) = account.quota.as_ref() else {
+        return true;
+    };
+    if let Some(groups) = quota.quota_groups.as_deref() {
+        let mut saw_weekly_bucket = false;
+        for bucket in groups.iter().flat_map(|group| &group.buckets) {
+            let key = format!("{} {}", bucket.window, bucket.bucket_id).to_ascii_lowercase();
+            if !(key.contains("week") || key.contains("7d")) {
+                continue;
+            }
+            saw_weekly_bucket = true;
+            if bucket.remaining_fraction >= 0.999
+                && parse_reset_time_ts(&bucket.reset_time)
+                    .is_none_or(|reset| now >= reset.saturating_sub(60))
+            {
+                return true;
+            }
+        }
+        return !saw_weekly_bucket;
+    }
+    if quota.models.is_empty() {
+        return true;
+    }
+    quota.models.iter().any(|model| {
+        model.percentage >= 100
+            && monitored_models.contains(&model.name)
+            && parse_reset_time_ts(&model.reset_time)
+                .is_some_and(|reset| now >= reset.saturating_sub(60))
+    })
+}
+
 /// Start smart weekly scheduler
 pub fn start_scheduler(
     app_handle: Option<tauri::AppHandle>,
@@ -165,6 +201,13 @@ pub fn start_scheduler(
 
             for acc in &accounts {
                 if acc.disabled || acc.proxy_disabled {
+                    continue;
+                }
+                if !cached_weekly_warmup_candidate(
+                    acc,
+                    now_ts,
+                    &app_config.scheduled_warmup.monitored_models,
+                ) {
                     continue;
                 }
 
@@ -419,5 +462,73 @@ pub async fn trigger_warmup_for_account(account: &Account) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{QuotaData, TokenData};
+
+    fn account_with_weekly(now: i64, remaining: f64, reset_time: String) -> Account {
+        let mut account = Account::new(
+            "warmup".to_string(),
+            "warmup@example.test".to_string(),
+            TokenData::new(
+                "access".to_string(),
+                "refresh".to_string(),
+                3600,
+                Some("warmup@example.test".to_string()),
+                None,
+                None,
+                true,
+                None,
+            ),
+        );
+        account.quota = Some(
+            serde_json::from_value::<QuotaData>(serde_json::json!({
+                "last_updated": now,
+                "models": [],
+                "quota_groups": [{"display_name":"Gemini Models","buckets":[{
+                    "bucket_id":"gemini-weekly","window":"weekly",
+                    "remaining_fraction":remaining,"reset_time":reset_time
+                }]}]
+            }))
+            .unwrap(),
+        );
+        account
+    }
+
+    #[test]
+    fn warmup_prefilter_only_selects_due_or_cold_weekly_accounts() {
+        let now = Utc::now().timestamp();
+        let models = vec!["gemini-3-flash".to_string()];
+        let future = chrono::DateTime::from_timestamp(now + 3600, 0)
+            .unwrap()
+            .to_rfc3339();
+        let past = chrono::DateTime::from_timestamp(now - 1, 0)
+            .unwrap()
+            .to_rfc3339();
+
+        assert!(!cached_weekly_warmup_candidate(
+            &account_with_weekly(now, 1.0, future),
+            now,
+            &models
+        ));
+        assert!(cached_weekly_warmup_candidate(
+            &account_with_weekly(now, 1.0, past),
+            now,
+            &models
+        ));
+        assert!(cached_weekly_warmup_candidate(
+            &account_with_weekly(now, 1.0, String::new()),
+            now,
+            &models
+        ));
+        assert!(!cached_weekly_warmup_candidate(
+            &account_with_weekly(now, 0.10, String::new()),
+            now,
+            &models
+        ));
     }
 }
