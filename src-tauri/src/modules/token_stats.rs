@@ -510,7 +510,7 @@ fn get_account_stats_with_conn(
                 SUM(output_tokens) as output,
                 SUM(cached_tokens) as cached,
                 COUNT(*) as count
-         FROM token_usage
+         FROM token_usage INDEXED BY idx_token_timestamp
          WHERE timestamp >= ?1
          GROUP BY account_email, effective_model",
         )
@@ -896,7 +896,8 @@ mod tests {
                 output_tokens INTEGER NOT NULL,
                 cached_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL
-            );",
+            );
+            CREATE INDEX idx_token_timestamp ON token_usage(timestamp DESC);",
         )
         .unwrap();
         for (timestamp, email, model, billing_model, input, output, cached) in [
