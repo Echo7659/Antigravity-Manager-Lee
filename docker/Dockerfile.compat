@@ -98,3 +98,5 @@ LABEL org.opencontainers.image.version="4.8.1-lee.3"
 ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
 LABEL org.opencontainers.image.source="https://github.com/Echo7659/Antigravity-Manager-Lee"
+HEALTHCHECK --interval=30s --timeout=8s --start-period=30s --retries=3 \
+    CMD ["/app/antigravity-tools", "--health-check"]

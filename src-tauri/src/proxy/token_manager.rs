@@ -176,6 +176,8 @@ pub struct TokenManager {
 
     /// 支持优雅关闭时主动 abort 后台任务
     auto_cleanup_handle: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Serialize account-pool reconciliation without blocking request routing on file I/O.
+    account_reload_lock: Arc<tokio::sync::Mutex<()>>,
     cancel_token: CancellationToken,
     image_scheduler: std::sync::RwLock<Option<Weak<ImageScheduler>>>,
     quota_refresh_inflight: Arc<DashMap<String, ()>>,
@@ -208,6 +210,7 @@ impl TokenManager {
             load_code_assist_inflight: Arc::new(DashMap::new()), // 初始化 inflight 表
             invalid_grant_failures: Arc::new(DashMap::new()),
             auto_cleanup_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            account_reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             cancel_token: CancellationToken::new(),
             image_scheduler: std::sync::RwLock::new(None),
         }
@@ -281,31 +284,28 @@ impl TokenManager {
 
     /// 从主应用账号目录加载所有账号
     pub async fn load_accounts(&self) -> Result<usize, String> {
+        let _reload_guard = self.account_reload_lock.lock().await;
         let accounts_dir = self.resolved_data_dir().join("accounts");
 
-        if !accounts_dir.exists() {
+        if !tokio::fs::try_exists(&accounts_dir)
+            .await
+            .map_err(|e| format!("检查账号目录失败: {}", e))?
+        {
             return Err(format!("账号目录不存在: {:?}", accounts_dir));
         }
 
-        // Reload should reflect current on-disk state (accounts can be added/removed/disabled).
-        self.tokens.clear();
-        self.sync_image_scheduler_accounts();
-        self.current_index.store(0, Ordering::SeqCst);
+        // Build a complete snapshot before mutating the live pool. This keeps existing routing
+        // available while hundreds of account files are read and parsed.
+        let mut entries = tokio::fs::read_dir(&accounts_dir)
+            .await
+            .map_err(|e| format!("读取账号目录失败: {}", e))?;
+        let mut loaded = HashMap::new();
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| format!("读取目录项失败: {}", e))?
         {
-            let mut last_used = self.last_used_account.lock().await;
-            *last_used = None;
-        }
-
-        let entries =
-            std::fs::read_dir(&accounts_dir).map_err(|e| format!("读取账号目录失败: {}", e))?;
-
-        let mut count = 0;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| {
-                self.sync_image_scheduler_accounts();
-                format!("读取目录项失败: {}", e)
-            })?;
             let path = entry.path();
 
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -316,8 +316,7 @@ impl TokenManager {
             match self.load_single_account(&path).await {
                 Ok(Some(token)) => {
                     let account_id = token.account_id.clone();
-                    self.tokens.insert(account_id, token);
-                    count += 1;
+                    loaded.insert(account_id, token);
                 }
                 Ok(None) => {
                     // 跳过无效账号
@@ -328,17 +327,64 @@ impl TokenManager {
             }
         }
 
+        let loaded_ids: HashSet<String> = loaded.keys().cloned().collect();
+        let stale_ids: Vec<String> = self
+            .tokens
+            .iter()
+            .filter(|entry| !loaded_ids.contains(entry.key()))
+            .map(|entry| entry.key().clone())
+            .collect();
+        for (account_id, token) in loaded {
+            self.tokens.insert(account_id, token);
+        }
+        for account_id in stale_ids {
+            self.remove_account_from_caches(&account_id);
+        }
+
+        self.current_index.store(0, Ordering::SeqCst);
+        *self.last_used_account.lock().await = None;
         self.sync_image_scheduler_accounts();
-        Ok(count)
+        Ok(loaded_ids.len())
     }
 
     /// 重新加载指定账号（用于配额更新后的实时同步）
     pub async fn reload_account(&self, account_id: &str) -> Result<(), String> {
+        let _reload_guard = self.account_reload_lock.lock().await;
+        let result = self.reload_account_inner(account_id).await;
+        self.sync_image_scheduler_accounts();
+        result
+    }
+
+    /// Batch targeted account reloads and update dependent schedulers once.
+    pub async fn reload_accounts(&self, account_ids: &[String]) -> Vec<(String, String)> {
+        if account_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let _reload_guard = self.account_reload_lock.lock().await;
+        let mut unique_ids = account_ids.to_vec();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+
+        let mut errors = Vec::new();
+        for account_id in unique_ids {
+            if let Err(error) = self.reload_account_inner(&account_id).await {
+                errors.push((account_id, error));
+            }
+        }
+        self.sync_image_scheduler_accounts();
+        errors
+    }
+
+    async fn reload_account_inner(&self, account_id: &str) -> Result<(), String> {
         let path = self
             .data_dir
             .join("accounts")
             .join(format!("{}.json", account_id));
-        if !path.exists() {
+        if !tokio::fs::try_exists(&path)
+            .await
+            .map_err(|e| format!("检查账号文件失败: {}", e))?
+        {
             return Err(format!("账号文件不存在: {:?}", path));
         }
 
@@ -346,14 +392,13 @@ impl TokenManager {
             Ok(Some(token)) => {
                 // 额度刷新不能清除其他模型或仍在等待中的限流记录。
                 self.tokens.insert(account_id.to_string(), token);
-                self.sync_image_scheduler_accounts();
                 Ok(())
             }
             Ok(None) => {
                 // [FIX] 账号被禁用或不可用时，从内存池中彻底移除 (Issue #1565)
                 // load_single_account returning None means the account should be skipped in its
                 // current state (disabled / proxy_disabled / quota_protection / validation_blocked...).
-                self.remove_account(account_id);
+                self.remove_account_from_caches(account_id);
                 Ok(())
             }
             Err(e) => Err(format!("同步账号失败: {}", e)),
@@ -367,7 +412,11 @@ impl TokenManager {
 
     /// 从内存中彻底移除指定账号及其关联数据 (Issue #1477)
     pub fn remove_account(&self, account_id: &str) {
-        // ... (省略原有逻辑)
+        self.remove_account_from_caches(account_id);
+        self.sync_image_scheduler_accounts();
+    }
+
+    fn remove_account_from_caches(&self, account_id: &str) {
         if self.tokens.remove(account_id).is_some() {
             tracing::info!("[Proxy] Removed account {} from memory cache", account_id);
         }
@@ -383,7 +432,6 @@ impl TokenManager {
                 );
             }
         }
-        self.sync_image_scheduler_accounts();
     }
 
     /// 根据账号 ID 获取完整的 ProxyToken 对象 (v4.1.29)
@@ -466,7 +514,9 @@ impl TokenManager {
 
     /// 加载单个账号
     async fn load_single_account(&self, path: &PathBuf) -> Result<Option<ProxyToken>, String> {
-        let content = std::fs::read_to_string(path).map_err(|e| format!("读取文件失败: {}", e))?;
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| format!("读取文件失败: {}", e))?;
 
         let mut account: serde_json::Value =
             serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {}", e))?;
@@ -1564,15 +1614,15 @@ impl TokenManager {
     ) -> Result<(String, String, String, String, u64), String> {
         // [FIX] 检查并处理待重新加载的账号（配额保护同步）
         let pending_reload = crate::proxy::server::take_pending_reload_accounts();
-        for account_id in pending_reload {
-            if let Err(e) = self.reload_account(&account_id).await {
-                tracing::warn!("[Quota] Failed to reload account {}: {}", account_id, e);
-            } else {
-                tracing::info!(
-                    "[Quota] Reloaded account {} (protected_models synced)",
-                    account_id
-                );
-            }
+        let pending_count = pending_reload.len();
+        for (account_id, error) in self.reload_accounts(&pending_reload).await {
+            tracing::warn!("[Quota] Failed to reload account {}: {}", account_id, error);
+        }
+        if pending_count > 0 {
+            tracing::info!(
+                "[Quota] Reloaded {} changed account(s) (protected_models synced)",
+                pending_count
+            );
         }
 
         // [FIX #1477] 检查并处理待删除的账号（彻底清理缓存）
@@ -4294,6 +4344,54 @@ mod tests {
             TokenManager::build_dynamic_model_candidates("gemini-3.1-pro-high").unwrap();
         assert_eq!(candidates_high[0], "gemini-3.1-pro-high");
         assert!(candidates_high.contains(&"gemini-pro-agent".to_string()));
+    }
+
+    #[tokio::test]
+    async fn targeted_batch_reload_keeps_unrelated_accounts_online() {
+        let tmp_root = std::env::temp_dir().join(format!(
+            "antigravity-targeted-reload-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let accounts_dir = tmp_root.join("accounts");
+        std::fs::create_dir_all(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let write_account = |id: &str, disabled: bool| {
+            let account = serde_json::json!({
+                "id": id,
+                "email": format!("{}@test.invalid", id),
+                "token": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "expires_in": 3600,
+                    "expiry_timestamp": now + 3600
+                },
+                "disabled": disabled,
+                "proxy_disabled": false,
+                "created_at": now,
+                "last_used": now
+            });
+            std::fs::write(
+                accounts_dir.join(format!("{}.json", id)),
+                serde_json::to_string_pretty(&account).unwrap(),
+            )
+            .unwrap();
+        };
+
+        write_account("account-a", false);
+        write_account("account-b", false);
+        let manager = TokenManager::new(tmp_root.clone());
+        manager.load_accounts().await.unwrap();
+        assert!(manager.tokens.contains_key("account-a"));
+        assert!(manager.tokens.contains_key("account-b"));
+
+        write_account("account-a", true);
+        let errors = manager.reload_accounts(&["account-a".to_string()]).await;
+        assert!(errors.is_empty());
+        assert!(!manager.tokens.contains_key("account-a"));
+        assert!(manager.tokens.contains_key("account-b"));
+
+        let _ = std::fs::remove_dir_all(tmp_root);
     }
 
     #[tokio::test]

@@ -83,6 +83,118 @@ fn credential_state(value: &str) -> &'static str {
     }
 }
 
+fn health_response_ok(response: &[u8]) -> bool {
+    response.starts_with(b"HTTP/1.1 200 ") || response.starts_with(b"HTTP/1.0 200 ")
+}
+
+fn health_check_port() -> u16 {
+    std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8045)
+}
+
+fn run_blocking_health_check(port: u16) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let timeout = Duration::from_secs(5);
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    if stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut response = [0_u8; 256];
+    stream
+        .read(&mut response)
+        .is_ok_and(|read| health_response_ok(&response[..read]))
+}
+
+async fn probe_headless_health(port: u16, timeout: std::time::Duration) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let probe = async {
+        let mut stream =
+            tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = [0_u8; 256];
+        let read = stream.read(&mut response).await?;
+        Ok::<bool, std::io::Error>(health_response_ok(&response[..read]))
+    };
+
+    matches!(tokio::time::timeout(timeout, probe).await, Ok(Ok(true)))
+}
+
+fn start_headless_health_watchdog(port: u16) {
+    let enabled = std::env::var("ABV_HEALTH_WATCHDOG_ENABLED")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(true);
+    if !enabled {
+        info!("Headless HTTP health watchdog disabled by configuration");
+        return;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+        const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const FAILURE_THRESHOLD: u8 = 3;
+
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let mut consecutive_failures = 0_u8;
+        loop {
+            if probe_headless_health(port, PROBE_TIMEOUT).await {
+                if consecutive_failures > 0 {
+                    info!("Headless HTTP health watchdog recovered");
+                }
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                warn!(
+                    "Headless HTTP health probe failed ({}/{})",
+                    consecutive_failures, FAILURE_THRESHOLD
+                );
+                if consecutive_failures >= FAILURE_THRESHOLD {
+                    error!(
+                        "Headless HTTP runtime is unresponsive; exiting for process supervisor restart"
+                    );
+                    std::process::exit(1);
+                }
+            }
+            tokio::time::sleep(PROBE_INTERVAL).await;
+        }
+    });
+}
+
+#[cfg(test)]
+mod headless_health_tests {
+    use super::health_response_ok;
+
+    #[test]
+    fn health_probe_requires_success_status_line() {
+        assert!(health_response_ok(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{}"
+        ));
+        assert!(!health_response_ok(b"HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(!health_response_ok(b"not-http"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn nvidia_proprietary_loaded() -> bool {
     std::path::Path::new("/dev/nvidia0").exists()
@@ -231,12 +343,20 @@ fn greet(name: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--health-check") {
+        std::process::exit(if run_blocking_health_check(health_check_port()) {
+            0
+        } else {
+            1
+        });
+    }
+
     // Disable Windows background throttling/EcoQoS
     #[cfg(target_os = "windows")]
     windows_api::disable_efficiency_mode();
 
     // Check for headless mode
-    let args: Vec<String> = std::env::args().collect();
     let is_headless = args.iter().any(|arg| arg == "--headless");
 
     // Increase file descriptor limit (macOS only)
@@ -386,6 +506,7 @@ pub fn run() {
                     }
 
                     // Start proxy service
+                    let proxy_port = config.proxy.port;
                     if let Err(e) = commands::proxy::internal_start_proxy_service(
                         config.proxy,
                         &proxy_state,
@@ -397,6 +518,8 @@ pub fn run() {
                     }
 
                     info!("Headless proxy service is running.");
+
+                    start_headless_health_watchdog(proxy_port);
 
                     // Start smart scheduler for 7-day weekly reset warmup
                     modules::scheduler::start_scheduler(None, proxy_state.clone());

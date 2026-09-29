@@ -286,15 +286,56 @@ pub async fn fetch_account_quota(
 
 pub use modules::account::RefreshStats;
 
+#[derive(Clone, Copy)]
+enum QuotaRefreshSync {
+    FullPool,
+    ChangedAccounts,
+}
+
 async fn synchronize_quota_refresh(
     proxy_state: &crate::commands::proxy::ProxyServiceState,
     app_handle: Option<tauri::AppHandle>,
+    sync: QuotaRefreshSync,
 ) {
-    let instance_lock = proxy_state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
-        let _ = instance.token_manager.reload_all_accounts().await;
+    let token_manager = proxy_state
+        .instance
+        .read()
+        .await
+        .as_ref()
+        .map(|instance| instance.token_manager.clone());
+
+    if let Some(token_manager) = token_manager {
+        let mut pending = crate::proxy::server::take_pending_reload_accounts();
+        if matches!(sync, QuotaRefreshSync::FullPool) {
+            match token_manager.reload_all_accounts().await {
+                Ok(_) => pending.clear(),
+                Err(error) => {
+                    tracing::warn!("Full account reload after quota refresh failed: {}", error)
+                }
+            }
+            // Preserve updates queued while the full snapshot was being constructed.
+            pending.extend(crate::proxy::server::take_pending_reload_accounts());
+        }
+
+        // Quota updates already enqueue their exact account IDs. Drain and batch them so the
+        // scheduler never clears/reloads the entire live pool for a protected-only refresh.
+        pending.sort_unstable();
+        pending.dedup();
+        let pending_count = pending.len();
+        for (account_id, error) in token_manager.reload_accounts(&pending).await {
+            tracing::warn!(
+                "Targeted quota refresh reload failed for {}: {}",
+                account_id,
+                error
+            );
+        }
+        if pending_count > 0 {
+            tracing::info!(
+                "Synchronized {} changed account(s) after quota refresh",
+                pending_count
+            );
+        }
     }
-    drop(instance_lock);
 
     if let Some(handle) = app_handle {
         use tauri::Emitter;
@@ -308,7 +349,7 @@ pub async fn refresh_all_quotas_internal(
     app_handle: Option<tauri::AppHandle>,
 ) -> Result<RefreshStats, String> {
     let stats = modules::account::refresh_all_quotas_logic().await?;
-    synchronize_quota_refresh(proxy_state, app_handle).await;
+    synchronize_quota_refresh(proxy_state, app_handle, QuotaRefreshSync::FullPool).await;
     Ok(stats)
 }
 
@@ -318,7 +359,7 @@ pub async fn refresh_protected_quotas_internal(
     app_handle: Option<tauri::AppHandle>,
 ) -> Result<RefreshStats, String> {
     let stats = modules::account::refresh_protected_quotas_logic().await?;
-    synchronize_quota_refresh(proxy_state, app_handle).await;
+    synchronize_quota_refresh(proxy_state, app_handle, QuotaRefreshSync::ChangedAccounts).await;
     Ok(stats)
 }
 
