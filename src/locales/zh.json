@@ -1589,6 +1589,13 @@
     "cached_cost": "缓存金额",
     "unpriced_tokens": "{{tokens}} Token 未计价",
     "cost_note": "按实际路由模型计价；缓存 Token 统一按 $0.03/M，未配置价格的 Token 会单独标记。",
+    "requests_count": "{{requests}} 次请求",
+    "matched_accounts": "匹配账号",
+    "total_accounts": "共 {{total}} 个有用量账号",
+    "search_account": "搜索账号",
+    "search_account_placeholder": "输入邮箱搜索账号",
+    "no_matching_accounts": "没有找到匹配的账号",
+    "load_failed": "统计数据加载失败，请重试。",
     "no_data": "暂无数据"
   },
   "errors": {

@@ -1623,6 +1623,13 @@
     "cached_cost": "Cached Cost",
     "unpriced_tokens": "{{tokens}} unpriced tokens",
     "cost_note": "Priced by the routed model; cached tokens are $0.03/M. Tokens without a configured price are flagged separately.",
+    "requests_count": "{{requests}} requests",
+    "matched_accounts": "Matching Accounts",
+    "total_accounts": "{{total}} accounts with usage",
+    "search_account": "Search accounts",
+    "search_account_placeholder": "Search by email",
+    "no_matching_accounts": "No matching accounts",
+    "load_failed": "Failed to load statistics. Please try again.",
     "no_data": "No data available"
   },
   "errors": {
