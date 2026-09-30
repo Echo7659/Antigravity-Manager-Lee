@@ -1630,6 +1630,7 @@
     "search_account_placeholder": "Search by email",
     "no_matching_accounts": "No matching accounts",
     "load_failed": "Failed to load statistics. Please try again.",
+    "loading_range": "Loading {{range}} data...",
     "no_data": "No data available"
   },
   "errors": {

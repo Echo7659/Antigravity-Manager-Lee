@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Calendar, CalendarDays, Clock, RefreshCw, Search } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import Pagination from '../components/common/Pagination';
 import { request as invoke } from '../utils/request';
 import {
     filterAccountTokenStats,
@@ -15,6 +16,8 @@ const TIME_RANGE_HOURS: Record<TimeRange, number> = {
     daily: 168,
     weekly: 720,
 };
+
+const ACCOUNTS_PER_PAGE = 50;
 
 function formatNumber(num: number): string {
     if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(1)}M`;
@@ -34,10 +37,15 @@ const TokenStats: React.FC = () => {
     const [searchQuery, setSearchQuery] = useState('');
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+    const [currentPage, setCurrentPage] = useState(1);
     const requestIdRef = useRef(0);
+    const loadedRangeRef = useRef<TimeRange | null>(null);
 
     const fetchData = useCallback(async () => {
         const requestId = ++requestIdRef.current;
+        if (loadedRangeRef.current !== timeRange) {
+            setAccountData([]);
+        }
         setLoading(true);
         setError(null);
 
@@ -47,6 +55,8 @@ const TokenStats: React.FC = () => {
             });
             if (requestId === requestIdRef.current) {
                 setAccountData(accounts);
+                setCurrentPage(1);
+                loadedRangeRef.current = timeRange;
             }
         } catch (fetchError) {
             console.error('Failed to fetch token stats:', fetchError);
@@ -72,6 +82,19 @@ const TokenStats: React.FC = () => {
         () => summarizeAccountTokenStats(visibleAccounts),
         [visibleAccounts],
     );
+    const totalPages = Math.max(1, Math.ceil(visibleAccounts.length / ACCOUNTS_PER_PAGE));
+    const paginatedAccounts = useMemo(() => {
+        const start = (currentPage - 1) * ACCOUNTS_PER_PAGE;
+        return visibleAccounts.slice(start, start + ACCOUNTS_PER_PAGE);
+    }, [currentPage, visibleAccounts]);
+
+    useEffect(() => {
+        setCurrentPage(1);
+    }, [searchQuery, timeRange]);
+
+    useEffect(() => {
+        setCurrentPage((page) => Math.min(page, totalPages));
+    }, [totalPages]);
 
     const rangeOptions: Array<{
         id: TimeRange;
@@ -82,6 +105,7 @@ const TokenStats: React.FC = () => {
         { id: 'daily', label: t('token_stats.daily', '日'), icon: Calendar },
         { id: 'weekly', label: t('token_stats.weekly', '周'), icon: CalendarDays },
     ];
+    const selectedRangeLabel = rangeOptions.find((option) => option.id === timeRange)?.label ?? '';
 
     return (
         <div className="h-full w-full overflow-y-auto">
@@ -219,7 +243,7 @@ const TokenStats: React.FC = () => {
                         </div>
                     </div>
 
-                    <div className="mt-4 overflow-x-auto">
+                    <div className="mt-4 overflow-x-auto" aria-busy={loading}>
                         <table className="w-full min-w-[850px] text-sm">
                             <thead>
                                 <tr className="border-b border-gray-200 dark:border-gray-700">
@@ -247,7 +271,7 @@ const TokenStats: React.FC = () => {
                                 </tr>
                             </thead>
                             <tbody>
-                                {visibleAccounts.map((account) => (
+                                {paginatedAccounts.map((account) => (
                                     <tr
                                         key={account.account_email}
                                         className="border-b border-gray-100 hover:bg-gray-50 dark:border-gray-700/50 dark:hover:bg-gray-700/30"
@@ -292,7 +316,9 @@ const TokenStats: React.FC = () => {
 
                         {loading && accountData.length === 0 && (
                             <div className="py-12 text-center text-sm text-gray-400">
-                                {t('common.loading', '加载中...')}
+                                {t('token_stats.loading_range', '正在加载{{range}}数据...', {
+                                    range: selectedRangeLabel,
+                                })}
                             </div>
                         )}
                         {!loading && visibleAccounts.length === 0 && (
@@ -303,6 +329,15 @@ const TokenStats: React.FC = () => {
                             </div>
                         )}
                     </div>
+                    {visibleAccounts.length > 0 && (
+                        <Pagination
+                            currentPage={currentPage}
+                            totalPages={totalPages}
+                            onPageChange={setCurrentPage}
+                            totalItems={visibleAccounts.length}
+                            itemsPerPage={ACCOUNTS_PER_PAGE}
+                        />
+                    )}
                 </div>
             </div>
         </div>

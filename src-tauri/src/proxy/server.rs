@@ -16,6 +16,66 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{oneshot, watch, RwLock};
 use tracing::{debug, error};
 
+fn prevent_stale_html(response: &mut Response) {
+    let is_html = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    if !is_html {
+        return;
+    }
+
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    headers.insert(
+        axum::http::header::PRAGMA,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        axum::http::header::EXPIRES,
+        axum::http::HeaderValue::from_static("0"),
+    );
+}
+
+async fn prevent_stale_html_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    prevent_stale_html(&mut response);
+    response
+}
+
+#[cfg(test)]
+mod static_cache_tests {
+    use super::prevent_stale_html;
+    use axum::{body::Body, http::header, response::Response};
+
+    #[test]
+    fn static_html_responses_disable_browser_cache() {
+        let mut html = Response::builder()
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::empty())
+            .unwrap();
+        prevent_stale_html(&mut html);
+        assert_eq!(
+            html.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store, no-cache, must-revalidate"
+        );
+
+        let mut json = Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::empty())
+            .unwrap();
+        prevent_stale_html(&mut json);
+        assert!(json.headers().get(header::CACHE_CONTROL).is_none());
+    }
+}
+
 // [FIX] 全局待重新加载账号队列
 // 当 update_account_quota 更新 protected_models 后，将账号 ID 加入此队列
 // TokenManager 在 get_token 时会检查并处理这些账号
@@ -1044,7 +1104,8 @@ impl AxumServer {
             ))
         } else {
             app
-        };
+        }
+        .layer(axum::middleware::from_fn(prevent_stale_html_middleware));
 
         // 绑定地址（使用 socket2 开启 SO_REUSEADDR，通配地址自动开启 IPv6/IPv4 双栈支持）
         let listener = bind_tcp_listener(&host, port)?;

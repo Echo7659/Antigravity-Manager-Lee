@@ -1596,6 +1596,7 @@
     "search_account_placeholder": "输入邮箱搜索账号",
     "no_matching_accounts": "没有找到匹配的账号",
     "load_failed": "统计数据加载失败，请重试。",
+    "loading_range": "正在加载{{range}}数据...",
     "no_data": "暂无数据"
   },
   "errors": {
