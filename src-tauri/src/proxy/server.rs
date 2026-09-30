@@ -1998,12 +1998,23 @@ async fn admin_get_account_proxy_binding(
 async fn admin_trigger_proxy_health_check(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state.proxy_pool_manager.health_check().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
+    let manager = state.proxy_pool_manager.clone();
+    tauri::async_runtime::spawn(async move { manager.health_check().await })
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Health check task failed: {}", error),
+                }),
+            )
+        })?
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error }),
+            )
+        })?;
 
     // 返回更新后的代理池配置（包含健康状态）
     let config = state.proxy_pool_state.read().await;

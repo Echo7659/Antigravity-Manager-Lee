@@ -2,6 +2,7 @@ use crate::proxy::config::{ProxyEntry, ProxyPoolConfig, ProxySelectionStrategy};
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
 use rquest::Client;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,6 +46,30 @@ pub struct ProxyPoolManager {
 
     /// 轮询索引 (用于 RoundRobin 策略)
     round_robin_index: Arc<AtomicUsize>,
+
+    /// Prevent manual and background health scans from overlapping.
+    health_check_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[derive(Debug, Default)]
+struct HealthCheckSummary {
+    checked: usize,
+    healthy: usize,
+    failed: usize,
+    elapsed_ms: u128,
+}
+
+fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+fn health_batch_delay_secs(interval_secs: u64, total: usize, batch_size: usize) -> u64 {
+    let batches = total.div_ceil(batch_size.max(1)).max(1) as u64;
+    (interval_secs.max(30) / batches).max(1)
 }
 
 impl ProxyPoolManager {
@@ -71,6 +96,7 @@ impl ProxyPoolManager {
             usage_counter: Arc::new(DashMap::new()),
             account_bindings,
             round_robin_index: Arc::new(AtomicUsize::new(0)),
+            health_check_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -518,6 +544,7 @@ impl ProxyPoolManager {
 
     /// 批量检查代理健康状态
     pub async fn health_check(&self) -> Result<(), String> {
+        let _health_check_guard = self.health_check_lock.lock().await;
         let proxies_to_check: Vec<ProxyEntry> = {
             let config = self.config.read().await;
             config
@@ -528,42 +555,62 @@ impl ProxyPoolManager {
                 .collect()
         };
 
-        let concurrency_limit = 20usize;
+        let concurrency_limit = env_usize("ABV_PROXY_HEALTH_CONCURRENCY", 5, 1, 20);
+        let summary = self
+            .health_check_proxies(proxies_to_check, concurrency_limit)
+            .await;
+        tracing::info!(
+            checked = summary.checked,
+            healthy = summary.healthy,
+            failed = summary.failed,
+            elapsed_ms = summary.elapsed_ms,
+            "Proxy pool manual health check completed"
+        );
+        Ok(())
+    }
+
+    async fn health_check_proxies(
+        &self,
+        proxies_to_check: Vec<ProxyEntry>,
+        concurrency_limit: usize,
+    ) -> HealthCheckSummary {
+        let started = std::time::Instant::now();
         let results = stream::iter(proxies_to_check)
             .map(|proxy| async move {
                 let (is_healthy, latency) = self.check_proxy_health(&proxy).await;
-
-                let latency_msg = if let Some(ms) = latency {
-                    format!("{}ms", ms)
-                } else {
-                    "-".to_string()
-                };
-
-                tracing::info!(
-                    "Proxy {} ({}) health check: {} (Latency: {})",
-                    proxy.name,
-                    proxy.url,
-                    if is_healthy { "✓ OK" } else { "✗ FAILED" },
-                    latency_msg
-                );
-
                 (proxy.id, is_healthy, latency)
             })
-            .buffer_unordered(concurrency_limit)
+            .buffer_unordered(concurrency_limit.max(1))
             .collect::<Vec<_>>()
             .await;
 
-        // 统一更新状态
+        let checked = results.len();
+        let healthy = results
+            .iter()
+            .filter(|(_, is_healthy, _)| *is_healthy)
+            .count();
+        let mut results_by_id: HashMap<String, (bool, Option<u64>)> = results
+            .into_iter()
+            .map(|(id, is_healthy, latency)| (id, (is_healthy, latency)))
+            .collect();
+        let checked_at = chrono::Utc::now().timestamp();
+
+        // Update by ID in one linear pass instead of scanning the full list for every result.
         let mut config = self.config.write().await;
-        for (id, is_healthy, latency) in results {
-            if let Some(proxy) = config.proxies.iter_mut().find(|p| p.id == id) {
+        for proxy in &mut config.proxies {
+            if let Some((is_healthy, latency)) = results_by_id.remove(&proxy.id) {
                 proxy.is_healthy = is_healthy;
                 proxy.latency = latency;
-                proxy.last_check_time = Some(chrono::Utc::now().timestamp());
+                proxy.last_check_time = Some(checked_at);
             }
         }
 
-        Ok(())
+        HealthCheckSummary {
+            checked,
+            healthy,
+            failed: checked.saturating_sub(healthy),
+            elapsed_ms: started.elapsed().as_millis(),
+        }
     }
 
     /// 检查单个代理健康状态
@@ -581,12 +628,13 @@ impl ProxyPoolManager {
         };
 
         // 尝试构建 Client，如果失败直接视为不健康
-        let proxy_res = self.build_proxy_config(entry);
-        if let Err(e) = proxy_res {
-            tracing::error!("Proxy {} build config failed: {}", entry.url, e);
+        let Ok(proxy_cfg) = self.build_proxy_config(entry) else {
+            tracing::warn!(
+                proxy_id = %entry.id,
+                "Proxy health check client configuration failed"
+            );
             return (false, None);
-        }
-        let proxy_cfg = proxy_res.unwrap();
+        };
 
         let client_result = Client::builder()
             .proxy(proxy_cfg.proxy)
@@ -597,8 +645,11 @@ impl ProxyPoolManager {
 
         let client = match client_result {
             Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Proxy {} build client failed: {}", entry.url, e);
+            Err(_) => {
+                tracing::warn!(
+                    proxy_id = %entry.id,
+                    "Proxy health check client build failed"
+                );
                 return (false, None);
             }
         };
@@ -610,16 +661,19 @@ impl ProxyPoolManager {
                 if resp.status().is_success() {
                     (true, Some(latency))
                 } else {
-                    tracing::warn!(
-                        "Proxy {} health check status error: {}",
-                        entry.url,
-                        resp.status()
+                    tracing::debug!(
+                        proxy_id = %entry.id,
+                        status = %resp.status(),
+                        "Proxy health check returned a non-success status"
                     );
                     (false, None)
                 }
             }
-            Err(e) => {
-                tracing::warn!("Proxy {} health check request failed: {}", entry.url, e);
+            Err(_) => {
+                tracing::debug!(
+                    proxy_id = %entry.id,
+                    "Proxy health check request failed"
+                );
                 (false, None)
             }
         }
@@ -627,28 +681,75 @@ impl ProxyPoolManager {
 
     /// 启动健康检查循环
     pub fn start_health_check_loop(self: Arc<Self>) {
-        tokio::spawn(async move {
-            tracing::info!("Starting proxy pool health check loop...");
-            loop {
-                // Perform check only if enabled
-                let enabled = self.config.read().await.enabled;
-                if enabled {
-                    if let Err(e) = self.health_check().await {
-                        tracing::error!("Proxy pool health check failed: {}", e);
-                    }
-                }
+        tauri::async_runtime::spawn(async move {
+            let batch_size = env_usize("ABV_PROXY_HEALTH_BATCH_SIZE", 25, 1, 200);
+            let concurrency = env_usize("ABV_PROXY_HEALTH_CONCURRENCY", 5, 1, 20);
+            let start_delay_secs =
+                env_usize("ABV_PROXY_HEALTH_START_DELAY_SECS", 60, 0, 3600) as u64;
+            tracing::info!(
+                batch_size,
+                concurrency,
+                start_delay_secs,
+                "Starting staggered proxy pool health check loop"
+            );
+            tokio::time::sleep(Duration::from_secs(start_delay_secs)).await;
 
-                // Get interval and sleep AFTER check
-                let interval_secs = {
+            let mut cursor = 0usize;
+            let mut cycle = HealthCheckSummary::default();
+            loop {
+                let (batch, total, interval_secs) = {
                     let cfg = self.config.read().await;
                     if !cfg.enabled {
-                        60 // check every minute if disabled
+                        (Vec::new(), 0, 60)
                     } else {
-                        cfg.health_check_interval.max(30) // Back to default min 30s
+                        let enabled: Vec<&ProxyEntry> =
+                            cfg.proxies.iter().filter(|proxy| proxy.enabled).collect();
+                        let total = enabled.len();
+                        if total == 0 {
+                            (Vec::new(), 0, cfg.health_check_interval.max(30))
+                        } else {
+                            cursor %= total;
+                            let count = batch_size.min(total - cursor);
+                            let batch = (0..count)
+                                .map(|offset| (*enabled[cursor + offset]).clone())
+                                .collect();
+                            (batch, total, cfg.health_check_interval.max(30))
+                        }
                     }
                 };
 
-                tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                if batch.is_empty() {
+                    cursor = 0;
+                    cycle = HealthCheckSummary::default();
+                    tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                    continue;
+                }
+
+                let checked = batch.len();
+                let summary = {
+                    let _health_check_guard = self.health_check_lock.lock().await;
+                    self.health_check_proxies(batch, concurrency).await
+                };
+                cycle.checked += summary.checked;
+                cycle.healthy += summary.healthy;
+                cycle.failed += summary.failed;
+                cycle.elapsed_ms += summary.elapsed_ms;
+
+                let next_cursor = (cursor + checked) % total;
+                if next_cursor <= cursor {
+                    tracing::info!(
+                        checked = cycle.checked,
+                        healthy = cycle.healthy,
+                        failed = cycle.failed,
+                        active_elapsed_ms = cycle.elapsed_ms,
+                        "Proxy pool staggered health cycle completed"
+                    );
+                    cycle = HealthCheckSummary::default();
+                }
+                cursor = next_cursor;
+
+                let delay_secs = health_batch_delay_secs(interval_secs, total, batch_size);
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
             }
         });
     }
@@ -658,6 +759,14 @@ impl ProxyPoolManager {
 mod tests {
     use super::*;
     use crate::proxy::config::ProxyAuth;
+
+    #[test]
+    fn compat_health_batch_delay_spreads_checks_across_the_configured_cycle() {
+        assert_eq!(health_batch_delay_secs(300, 1000, 25), 7);
+        assert_eq!(health_batch_delay_secs(300, 25, 25), 300);
+        assert_eq!(health_batch_delay_secs(10, 1000, 25), 1);
+        assert_eq!(health_batch_delay_secs(300, 0, 25), 300);
+    }
 
     #[test]
     fn test_build_proxy_config_with_explicit_auth() {
