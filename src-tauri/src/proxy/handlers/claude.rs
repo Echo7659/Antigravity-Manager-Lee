@@ -943,6 +943,18 @@ pub async fn handle_messages(
             )
         };
         last_mapped_model = Some(mapped_model.clone());
+        let tool_config = request_for_body
+            .tool_choice
+            .as_ref()
+            .and_then(crate::proxy::mappers::common_utils::map_claude_tool_choice_to_gemini);
+        if let Err(message) =
+            crate::proxy::pipeline::InboundThinkingPipeline::validate_request_constraints(
+                &mapped_model,
+                &json!({"toolConfig": tool_config}),
+            )
+        {
+            return (StatusCode::BAD_REQUEST, Json(json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}}))).into_response();
+        }
 
         // 将 Claude 工具转为 Value 数组以便探测联网
         let tools_val: Option<Vec<Value>> = request_for_body.tools.as_ref().map(|list| {
@@ -1067,6 +1079,14 @@ pub async fn handle_messages(
                 }
             };
 
+        if let Err(message) =
+            crate::proxy::pipeline::InboundThinkingPipeline::validate_request_constraints(
+                &mapped_model,
+                &gemini_body,
+            )
+        {
+            return (StatusCode::BAD_REQUEST, Json(json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}}))).into_response();
+        }
         let _ =
             crate::proxy::mappers::context_manager::ContextManager::apply_post_transit_context_mgmt(
                 &mut gemini_body,

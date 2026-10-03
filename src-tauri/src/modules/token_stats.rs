@@ -10,6 +10,7 @@ const CACHED_NANODOLLARS_PER_TOKEN: u64 = 30; // $0.03 / 1M tokens
 struct ModelPrice {
     input_nanos_per_token: u64,
     output_nanos_per_token: u64,
+    cached_nanos_per_token: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -36,6 +37,14 @@ fn matches_gemini_version(model: &str, version: &str) -> bool {
 }
 
 fn price_for_model(model: &str) -> Option<ModelPrice> {
+    let model_id = model.trim().rsplit('/').next().unwrap_or(model);
+    if crate::proxy::model_specs::is_adaptive_thinking_model(model_id) {
+        return Some(ModelPrice {
+            input_nanos_per_token: 4_000,
+            output_nanos_per_token: 20_000,
+            cached_nanos_per_token: 200,
+        });
+    }
     let (input_nanos_per_token, output_nanos_per_token) = if matches_gemini_version(model, "2.5") {
         (300, 2_502)
     } else if ["3.6", "3.7", "3.8"]
@@ -54,6 +63,7 @@ fn price_for_model(model: &str) -> Option<ModelPrice> {
     Some(ModelPrice {
         input_nanos_per_token,
         output_nanos_per_token,
+        cached_nanos_per_token: CACHED_NANODOLLARS_PER_TOKEN,
     })
 }
 
@@ -65,20 +75,17 @@ fn calculate_usage_cost(
 ) -> UsageCost {
     let billable_cached_tokens = cached_tokens.min(input_tokens);
     let uncached_input_tokens = input_tokens.saturating_sub(billable_cached_tokens);
-    let cached_nanos =
-        u128::from(billable_cached_tokens) * u128::from(CACHED_NANODOLLARS_PER_TOKEN);
-
     match price_for_model(model) {
         Some(price) => UsageCost {
             input_nanos: u128::from(uncached_input_tokens)
                 * u128::from(price.input_nanos_per_token),
             output_nanos: u128::from(output_tokens) * u128::from(price.output_nanos_per_token),
-            cached_nanos,
+            cached_nanos: u128::from(billable_cached_tokens)
+                * u128::from(price.cached_nanos_per_token),
             unpriced_tokens: 0,
         },
         None => UsageCost {
-            cached_nanos,
-            unpriced_tokens: uncached_input_tokens.saturating_add(output_tokens),
+            unpriced_tokens: input_tokens.saturating_add(output_tokens),
             ..UsageCost::default()
         },
     }
@@ -836,12 +843,30 @@ mod tests {
     }
 
     #[test]
+    fn pricing_opus_5_5_includes_model_specific_cache_price() {
+        assert_eq!(
+            price_for_model("claude-opus-5-5"),
+            Some(ModelPrice {
+                input_nanos_per_token: 4_000,
+                output_nanos_per_token: 20_000,
+                cached_nanos_per_token: 200,
+            })
+        );
+        let cost = calculate_usage_cost("claude-opus-5-5", 1_500_000, 250_000, 500_000);
+        assert_eq!(cost.input_nanos, 4_000_000_000);
+        assert_eq!(cost.output_nanos, 5_000_000_000);
+        assert_eq!(cost.cached_nanos, 100_000_000);
+        assert_eq!(cost.unpriced_tokens, 0);
+    }
+
+    #[test]
     fn pricing_matches_supported_gemini_versions_without_prefix_collisions() {
         assert_eq!(
             price_for_model("gemini-2.5-pro"),
             Some(ModelPrice {
                 input_nanos_per_token: 300,
                 output_nanos_per_token: 2_502,
+                cached_nanos_per_token: 30,
             })
         );
         assert_eq!(
@@ -849,6 +874,7 @@ mod tests {
             Some(ModelPrice {
                 input_nanos_per_token: 750,
                 output_nanos_per_token: 3_750,
+                cached_nanos_per_token: 30,
             })
         );
         assert_eq!(
@@ -856,6 +882,7 @@ mod tests {
             Some(ModelPrice {
                 input_nanos_per_token: 2_000,
                 output_nanos_per_token: 12_000,
+                cached_nanos_per_token: 30,
             })
         );
         assert!(price_for_model("gemini-3.10-pro").is_none());
@@ -875,12 +902,12 @@ mod tests {
         assert_eq!(priced.unpriced_tokens, 0);
 
         let unknown = calculate_usage_cost("custom-model", 100, 200, 20);
-        assert_eq!(unknown.cached_nanos, 600);
+        assert_eq!(unknown.cached_nanos, 0);
         assert_eq!(
             unknown.input_nanos + unknown.output_nanos + unknown.cached_nanos,
-            600
+            0
         );
-        assert_eq!(unknown.unpriced_tokens, 280);
+        assert_eq!(unknown.unpriced_tokens, 300);
     }
 
     #[test]
@@ -956,11 +983,11 @@ mod tests {
         assert_eq!(account_a.total_output_tokens, 250_200);
         assert_eq!(account_a.total_cached_tokens, 500_020);
         assert_eq!(account_a.total_tokens, 1_750_300);
-        assert_eq!(account_a.unpriced_tokens, 280);
+        assert_eq!(account_a.unpriced_tokens, 300);
         assert_usd_close(account_a.input_cost_usd, 2.0);
         assert_usd_close(account_a.output_cost_usd, 3.0);
-        assert_usd_close(account_a.cached_cost_usd, 0.015_000_6);
-        assert_usd_close(account_a.total_cost_usd, 5.015_000_6);
+        assert_usd_close(account_a.cached_cost_usd, 0.015);
+        assert_usd_close(account_a.total_cost_usd, 5.015);
 
         let account_b = stats
             .iter()

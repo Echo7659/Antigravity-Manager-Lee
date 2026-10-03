@@ -77,6 +77,31 @@ pub fn extract_client_thinking_switch(
 pub struct InboundThinkingPipeline;
 
 impl InboundThinkingPipeline {
+    /// 校验 Gemini 工具选择与目标模型的兼容性，错误由协议入口映射为客户端错误。
+    pub fn validate_request_constraints(
+        target_model: &str,
+        body: &Value,
+    ) -> Result<(), &'static str> {
+        if !crate::proxy::model_specs::is_adaptive_thinking_model(target_model) {
+            return Ok(());
+        }
+        let request = body.get("request").unwrap_or(body);
+        let mode = request
+            .get("toolConfig")
+            .or_else(|| request.get("tool_config"))
+            .and_then(|config| {
+                config
+                    .get("functionCallingConfig")
+                    .or_else(|| config.get("function_calling_config"))
+            })
+            .and_then(|config| config.get("mode"))
+            .and_then(Value::as_str);
+        if mode.is_some_and(|mode| mode.eq_ignore_ascii_case("ANY")) {
+            return Err("Adaptive thinking does not support forced tool choice; use auto or none.");
+        }
+        Ok(())
+    }
+
     /// 执行统一进站处理
     pub fn process_contents(
         contents: &mut Vec<Value>,
@@ -85,6 +110,8 @@ impl InboundThinkingPipeline {
         session_id: Option<&str>,
         is_retry: bool,
     ) {
+        let is_thinking_enabled = is_thinking_enabled
+            || crate::proxy::model_specs::is_adaptive_thinking_model(target_model);
         let is_claude = target_model.to_lowercase().contains("claude");
 
         // 0. 工具调用 ID 统一归一化治理（Pipeline First）：
@@ -1033,6 +1060,13 @@ impl InboundThinkingPipeline {
         client_budget: Option<u64>,
         token: Option<&crate::proxy::token_manager::ProxyToken>,
     ) -> Option<i64> {
+        if crate::proxy::model_specs::is_adaptive_thinking_model(target_model) {
+            if let Some(obj) = generation_config.as_object_mut() {
+                obj.remove("thinking_config");
+            }
+            generation_config["thinkingConfig"] = json!({"includeThoughts": true});
+            return None;
+        }
         let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(target_model);
         if is_under_v3 {
             // Gemini < 3 非思考模型严禁注入 thinkingConfig
@@ -1545,6 +1579,13 @@ impl InboundThinkingPipeline {
                 }
                 gc_obj.insert("thinkingConfig".to_string(), tc);
             }
+        }
+
+        // 自适应模型在终审阶段覆盖所有客户端与动态规格预算。
+        if crate::proxy::model_specs::is_adaptive_thinking_model(target_model) {
+            req_obj.remove("thinking_config");
+            gc_obj.remove("thinking_config");
+            gc_obj.insert("thinkingConfig".into(), json!({"includeThoughts": true}));
         }
 
         // 官方标准：从官方模型结构体中动态读取 maxOutputTokens

@@ -11,6 +11,8 @@ pub mod estimator;
 pub mod inbound;
 #[cfg(test)]
 mod official_alignment_tests;
+#[cfg(test)]
+mod opus_tests;
 pub mod policy;
 pub mod response_guard;
 pub mod usage;

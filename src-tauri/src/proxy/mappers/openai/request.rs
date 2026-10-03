@@ -318,11 +318,14 @@ pub fn transform_openai_request_with_session(
 
     let is_client_disabled = is_client_control && client_switch.is_disabled();
 
-    let actual_include_thinking = if is_client_disabled {
-        false
-    } else {
-        !is_under_v3 && (is_thinking_model || force_server_thinking || is_client_control)
-    };
+    let actual_include_thinking =
+        if crate::proxy::model_specs::is_adaptive_thinking_model(mapped_model) {
+            true
+        } else if is_client_disabled {
+            false
+        } else {
+            !is_under_v3 && (is_thinking_model || force_server_thinking || is_client_control)
+        };
 
     if _user_enabled_thinking || _user_thinking_budget.is_some() {
         tracing::debug!(

@@ -585,14 +585,15 @@ pub fn transform_claude_request_in_timed(
     let tb_config = crate::proxy::config::get_thinking_budget_config();
     let is_client_control =
         tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
-    let is_client_disabled = is_client_control && client_switch.is_disabled();
+    let is_adaptive = crate::proxy::model_specs::is_adaptive_thinking_model(&mapped_model);
+    let is_client_disabled = !is_adaptive && is_client_control && client_switch.is_disabled();
 
     let thinking_type = claude_req.thinking.as_ref().map(|t| t.type_.as_str());
     let force_server_thinking = crate::proxy::thinking_store::any_model_forces_server_thinking(&[
         claude_req.model.as_str(),
         mapped_model.as_str(),
     ]);
-    let target_model_supports_thinking = model_supports_thinking(&mapped_model);
+    let target_model_supports_thinking = is_adaptive || model_supports_thinking(&mapped_model);
     let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(&mapped_model)
         || crate::proxy::model_specs::is_gemini_under_v3(&claude_req.model);
     let mut is_thinking_enabled = !is_client_disabled

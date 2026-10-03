@@ -2100,6 +2100,22 @@ pub async fn handle_chat_completions(
             effort_hint.as_deref(),
         )
     };
+    let tool_config = openai_req
+        .tool_choice
+        .as_ref()
+        .and_then(crate::proxy::mappers::common_utils::map_openai_tool_choice_to_gemini);
+    if let Err(message) =
+        crate::proxy::pipeline::InboundThinkingPipeline::validate_request_constraints(
+            &mapped_model,
+            &json!({"toolConfig": tool_config}),
+        )
+    {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"type": "invalid_request_error", "message": message}})),
+        )
+            .into_response());
+    }
     let anchor = SessionManager::openai_content_anchor(&openai_req);
     let session_scope = crate::proxy::thinking_store::SessionScope::resolve(
         &headers,
@@ -2218,6 +2234,18 @@ pub async fn handle_chat_completions(
                 false,
             );
         let session_id = store_key.clone();
+        if let Err(message) =
+            crate::proxy::pipeline::InboundThinkingPipeline::validate_request_constraints(
+                &mapped_model,
+                &gemini_body,
+            )
+        {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"type": "invalid_request_error", "message": message}})),
+            )
+                .into_response());
+        }
         let tf_micros = tf_start.elapsed().as_micros() as u64;
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
@@ -3713,6 +3741,22 @@ pub async fn handle_completions(
         &*state.custom_mapping.read().await,
         effort_hint,
     );
+    let tool_config = openai_req
+        .tool_choice
+        .as_ref()
+        .and_then(crate::proxy::mappers::common_utils::map_openai_tool_choice_to_gemini);
+    if let Err(message) =
+        crate::proxy::pipeline::InboundThinkingPipeline::validate_request_constraints(
+            &mapped_model,
+            &json!({"toolConfig": tool_config}),
+        )
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"type": "invalid_request_error", "message": message}})),
+        )
+            .into_response();
+    }
     let trace_id = format!("req_{}", chrono::Utc::now().timestamp_subsec_millis());
     if debug_logger::is_enabled(&debug_cfg) {
         if let Some(ledger) = normalized_interaction_ledger {
@@ -3858,6 +3902,18 @@ pub async fn handle_completions(
             )
         };
         let session_id = session_id_str.clone();
+        if let Err(message) =
+            crate::proxy::pipeline::InboundThinkingPipeline::validate_request_constraints(
+                &mapped_model,
+                &gemini_body,
+            )
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {"type": "invalid_request_error", "message": message}})),
+            )
+                .into_response();
+        }
         let tf_micros = tf_start.elapsed().as_micros() as u64;
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;

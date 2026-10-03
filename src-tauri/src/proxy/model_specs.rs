@@ -3,6 +3,14 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// 标识只接受自适应思考的模型，不修改路由 ID。
+pub fn is_adaptive_thinking_model(model: &str) -> bool {
+    model
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("claude-opus-5-5")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub max_output_tokens: Option<u64>,

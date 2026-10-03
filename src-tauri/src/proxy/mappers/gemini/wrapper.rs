@@ -98,7 +98,8 @@ pub fn wrap_request_v2(
         client_budget.map(|b| if b <= 0 { 0 } else { b as u64 }),
         client_level,
     );
-    let is_client_disabled = is_client_control && client_switch.is_disabled();
+    let is_adaptive = crate::proxy::model_specs::is_adaptive_thinking_model(final_model_name);
+    let is_client_disabled = !is_adaptive && is_client_control && client_switch.is_disabled();
 
     let is_under_v3 = crate::proxy::model_specs::is_gemini_under_v3(final_model_name)
         || crate::proxy::model_specs::is_gemini_under_v3(original_model);
@@ -110,7 +111,8 @@ pub fn wrap_request_v2(
     let is_preview = lower_model.contains("preview");
     let should_inject = !is_client_disabled
         && !is_under_v3
-        && (force_server_thinking
+        && (is_adaptive
+            || force_server_thinking
             || lower_model.contains("thinking")
             || (crate::proxy::model_specs::is_gemini_v3_or_above(final_model_name) && !is_preview));
 

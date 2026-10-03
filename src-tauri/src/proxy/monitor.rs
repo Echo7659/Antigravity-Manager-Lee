@@ -79,6 +79,51 @@ pub(crate) mod prompt_log_tests {
     }
 
     #[tokio::test]
+    async fn opus_5_5_protocol_stats_survive_disabled_detail_logging() {
+        let _dir = TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        crate::modules::token_stats::init_db().unwrap();
+        let monitor = ProxyMonitor {
+            logs: RwLock::new(VecDeque::new()),
+            stats: RwLock::new(ProxyStats::default()),
+            max_logs: 2,
+            enabled: Arc::new(AtomicBool::new(false)),
+            capture_health_logs: Arc::new(AtomicBool::new(false)),
+        };
+        let mut log = sample_log("opus-disabled", 100);
+        log.status = 200;
+        log.model = Some("claude-opus-5-5".into());
+        log.mapped_model = Some("claude-opus-5-5".into());
+        log.account_email = Some("opus@example.test".into());
+        log.input_tokens = Some(1_500);
+        log.output_tokens = Some(250);
+        log.cached_tokens = Some(500);
+        monitor.log_request(log).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let totals = crate::modules::token_stats::get_hourly_stats(1).unwrap();
+                if totals.iter().any(|row| row.request_count == 1) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("token writer did not finish");
+        let models = crate::modules::token_stats::get_model_stats(1).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "claude-opus-5-5");
+        assert_eq!(models[0].total_tokens, 1_750);
+        assert_eq!(models[0].total_cached_tokens, 500);
+        let accounts = crate::modules::token_stats::get_account_stats(1).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!((accounts[0].total_cost_usd - 0.0091).abs() < 1e-12);
+        assert_eq!(accounts[0].unpriced_tokens, 0);
+        assert!(monitor.logs.read().await.is_empty());
+        assert!(crate::modules::proxy_db::get_log_detail("opus-disabled").is_err());
+    }
+
+    #[tokio::test]
     async fn prompt_log_memory_summary_and_database_detail() {
         let _dir = TestDataDir::new();
         crate::modules::proxy_db::init_db().unwrap();

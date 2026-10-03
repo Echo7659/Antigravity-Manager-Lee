@@ -191,6 +191,18 @@ pub async fn handle_generate(
         &*state.custom_mapping.read().await,
         client_effort,
     );
+    if let Err(message) =
+        crate::proxy::pipeline::InboundThinkingPipeline::validate_request_constraints(
+            &initial_mapped_model,
+            &body,
+        )
+    {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": message}})),
+        )
+            .into_response());
+    }
 
     for attempt in 0..max_attempts {
         let norm_start = std::time::Instant::now();
@@ -324,6 +336,14 @@ pub async fn handle_generate(
             Some(&state.upstream),
             Some(&affinity_key),
         );
+        if let Err(message) =
+            crate::proxy::pipeline::InboundThinkingPipeline::validate_request_constraints(
+                &mapped_model,
+                &wrapped_body,
+            )
+        {
+            return Ok((StatusCode::BAD_REQUEST, Json(json!({"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": message}}))).into_response());
+        }
         let tf_micros = tf_start.elapsed().as_micros() as u64;
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         norm_ms = norm_total_micros.saturating_sub(tf_micros) as f64 / 1000.0;
