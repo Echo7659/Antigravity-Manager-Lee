@@ -4818,10 +4818,11 @@ mod tests {
         assert!(manager
             .rate_limit_tracker
             .is_rate_limited(account_id, Some(model)));
+        // 全模型长配额锁仅在状态包含明确重置时间时恢复。
         assert!(!manager
             .rate_limit_tracker
             .is_rate_limited(account_id, Some("gemini-3.1-flash-image")));
-        assert!(!manager
+        assert!(manager
             .rate_limit_tracker
             .is_rate_limited(account_id, Some("gemini-2.5-pro")));
 
