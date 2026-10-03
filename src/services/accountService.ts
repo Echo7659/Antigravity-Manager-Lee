@@ -9,14 +9,6 @@ export async function updateAccountPriority(accountId: string, priority: number)
     await invoke('update_account_priority', { accountId, priority });
 }
 
-// 检查环境 (可选)
-function ensureTauriEnvironment() {
-    // Web 模式下 request 也是一个 function，所以这里不应抛错
-    if (typeof invoke !== 'function') {
-        throw new Error(i18n.t('common.tauri_api_not_loaded'));
-    }
-}
-
 export async function listAccounts(): Promise<Account[]> {
     const response = await invoke<any>('list_accounts');
     // 如果返回的是对象格式 { accounts: [...] }, 则取其 accounts 属性
@@ -64,8 +56,6 @@ export async function refreshAllQuotas(): Promise<RefreshStats> {
 
 // OAuth
 export async function startOAuthLogin(oauthClientKey?: string): Promise<Account> {
-    ensureTauriEnvironment();
-
     try {
         return await invoke('start_oauth_login', oauthClientKey ? { oauthClientKey } : undefined);
     } catch (error) {
@@ -83,7 +73,6 @@ export async function startOAuthLogin(oauthClientKey?: string): Promise<Account>
 }
 
 export async function completeOAuthLogin(): Promise<Account> {
-    ensureTauriEnvironment();
     try {
         return await invoke('complete_oauth_login');
     } catch (error) {
@@ -98,7 +87,6 @@ export async function completeOAuthLogin(): Promise<Account> {
 }
 
 export async function cancelOAuthLogin(): Promise<void> {
-    ensureTauriEnvironment();
     return await invoke('cancel_oauth_login');
 }
 
@@ -131,20 +119,6 @@ export async function importV1Accounts(): Promise<Account[]> {
     return await invoke('import_v1_accounts');
 }
 
-export async function importFromDb(targetIde?: string): Promise<Account[]> {
-    const res = await invoke<any>('import_from_db', { targetIde });
-    if (Array.isArray(res)) return res;
-    return res ? [res] : [];
-}
-
-export async function importFromCustomDb(path: string): Promise<Account> {
-    return await invoke('import_custom_db', { path });
-}
-
-export async function syncAccountFromDb(): Promise<Account | null> {
-    return await invoke('sync_account_from_db');
-}
-
 export async function toggleProxyStatus(accountId: string, enable: boolean, reason?: string): Promise<void> {
     return await invoke('toggle_proxy_status', { accountId, enable, reason });
 }
@@ -159,7 +133,7 @@ export async function reorderAccounts(accountIds: string[]): Promise<void> {
 
 // 设备指纹相关
 export interface DeviceProfilesResponse {
-    current_storage?: DeviceProfile;
+    bound_profile?: DeviceProfile;
     history?: DeviceProfileVersion[];
     baseline?: DeviceProfile;
 }
@@ -168,12 +142,8 @@ export async function getDeviceProfiles(accountId: string): Promise<DeviceProfil
     return await invoke('get_device_profiles', { accountId });
 }
 
-export async function bindDeviceProfile(accountId: string, mode: 'capture' | 'generate'): Promise<DeviceProfile> {
+export async function bindDeviceProfile(accountId: string, mode: 'generate'): Promise<DeviceProfile> {
     return await invoke('bind_device_profile', { accountId, mode });
-}
-
-export async function restoreOriginalDevice(): Promise<string> {
-    return await invoke('restore_original_device');
 }
 
 export async function listDeviceVersions(accountId: string): Promise<DeviceProfilesResponse> {
@@ -186,10 +156,6 @@ export async function restoreDeviceVersion(accountId: string, versionId: string)
 
 export async function deleteDeviceVersion(accountId: string, versionId: string): Promise<void> {
     return await invoke('delete_device_version', { accountId, versionId });
-}
-
-export async function openDeviceFolder(): Promise<void> {
-    return await invoke('open_device_folder');
 }
 
 export async function previewGenerateProfile(): Promise<DeviceProfile> {

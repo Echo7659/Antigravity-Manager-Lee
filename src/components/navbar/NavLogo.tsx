@@ -1,6 +1,5 @@
 import { Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
-import LogoIcon from '../../../src-tauri/icons/icon.png';
 
 export function NavLogo() {
     const { t } = useTranslation();
@@ -9,7 +8,7 @@ export function NavLogo() {
         <Link to="/" draggable="false" className="flex w-full min-w-0 items-center gap-2 text-xl font-semibold text-gray-900 dark:text-base-content">
             <div className="relative flex items-center justify-center">
                 <img
-                    src={LogoIcon}
+                    src="/icon.png"
                     alt="Logo"
                     className="w-8 h-8 cursor-pointer active:scale-95 transition-transform relative z-10"
                     draggable="false"

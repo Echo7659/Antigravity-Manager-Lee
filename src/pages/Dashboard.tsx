@@ -1,4 +1,5 @@
-import { save } from '@tauri-apps/plugin-dialog';
+import { downloadJson } from '../utils/browserFiles';
+
 import {
     AlertTriangle,
     ArrowRight,
@@ -25,8 +26,7 @@ import CurrentAccount from '../components/dashboard/CurrentAccount';
 import { exportAccounts } from '../services/accountService';
 import { useAccountStore } from '../stores/useAccountStore';
 import { Account } from '../types/account';
-import { isTauri } from '../utils/env';
-import { request as invoke } from '../utils/request';
+
 import { DashboardQuotaView } from '../utils/quotaDisplay';
 
 function Dashboard() {
@@ -162,35 +162,12 @@ function Dashboard() {
             }
 
             const exportData = response.accounts;
-            const content = JSON.stringify(exportData, null, 2);
+
             const fileName = `antigravity_accounts_${new Date().toISOString().split('T')[0]}.json`;
 
-            if (isTauri()) {
-                const path = await save({
-                    filters: [{
-                        name: 'JSON',
-                        extensions: ['json']
-                    }],
-                    defaultPath: fileName
-                });
-
-                if (!path) return;
-
-                await invoke('save_text_file', { path, content });
-                showToast(t('dashboard.toast.export_success', { path }), 'success');
-            } else {
-                // Web 模式：使用浏览器下载
-                const blob = new Blob([content], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = fileName;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                showToast(t('dashboard.toast.export_success', { path: fileName }), 'success');
-            }
+            // Web 模式：使用浏览器下载
+            downloadJson(fileName, exportData);
+            showToast(t('dashboard.toast.export_success', { path: fileName }), 'success');
         } catch (error: any) {
             console.error('Export failed:', error);
             showToast(`${t('dashboard.toast.export_error')}: ${error.toString()}`, 'error');

@@ -1,6 +1,3 @@
-// 探测环境
-const isTauri = typeof window !== 'undefined' && (!!(window as any).__TAURI_INTERNALS__ || !!(window as any).__TAURI__);
-
 // 命令到 API 的映射
 const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'DELETE' | 'PATCH' }> = {
   // Accounts
@@ -26,10 +23,8 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'list_device_versions': { url: '/api/accounts/:accountId/device-versions', method: 'GET' },
   'preview_generate_profile': { url: '/api/accounts/device-preview', method: 'POST' },
   'bind_device_profile_with_profile': { url: '/api/accounts/:accountId/bind-device-profile', method: 'POST' },
-  'restore_original_device': { url: '/api/accounts/restore-original', method: 'POST' },
   'restore_device_version': { url: '/api/accounts/:accountId/device-versions/:versionId/restore', method: 'POST' },
   'delete_device_version': { url: '/api/accounts/:accountId/device-versions/:versionId', method: 'DELETE' },
-  'open_device_folder': { url: '/api/system/open-folder', method: 'POST' },
 
   // Proxy Control & Status
   'get_proxy_status': { url: '/api/proxy/status', method: 'GET' },
@@ -67,37 +62,6 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_debug_console_logs': { url: '/api/debug/logs', method: 'GET' },
   'clear_debug_console_logs': { url: '/api/debug/logs/clear', method: 'POST' },
 
-  // CLI Sync
-  'get_cli_sync_status': { url: '/api/proxy/cli/status', method: 'POST' },
-  'execute_cli_sync': { url: '/api/proxy/cli/sync', method: 'POST' },
-  'execute_cli_restore': { url: '/api/proxy/cli/restore', method: 'POST' },
-  'get_cli_config_content': { url: '/api/proxy/cli/config', method: 'POST' },
-
-  // OpenCode Sync
-  'get_opencode_sync_status': { url: '/api/proxy/opencode/status', method: 'POST' },
-  'get_opencode_providers': { url: '/api/proxy/opencode/providers', method: 'GET' },
-  'execute_opencode_sync': { url: '/api/proxy/opencode/sync', method: 'POST' },
-  'execute_opencode_openai_sync': { url: '/api/proxy/opencode/openai-sync', method: 'POST' },
-  'execute_opencode_remove_provider': { url: '/api/proxy/opencode/remove-provider', method: 'POST' },
-  'execute_opencode_restore': { url: '/api/proxy/opencode/restore', method: 'POST' },
-  'execute_opencode_clear': { url: '/api/proxy/opencode/clear', method: 'POST' },
-  'get_opencode_config_content': { url: '/api/proxy/opencode/config', method: 'POST' },
-  'get_canonical_families': { url: '/api/proxy/opencode/families', method: 'GET' },
-
-  // Hermes Agent provider and model configuration
-  'get_hermes_sync_status': { url: '/api/proxy/hermes/status', method: 'POST' },
-  'execute_hermes_sync': { url: '/api/proxy/hermes/sync', method: 'POST' },
-  'execute_hermes_restore': { url: '/api/proxy/hermes/restore', method: 'POST' },
-  'execute_hermes_clear': { url: '/api/proxy/hermes/clear', method: 'POST' },
-  'get_hermes_config_content': { url: '/api/proxy/hermes/config', method: 'POST' },
-
-  // OpenClaw provider and model configuration (supports v1.0 and v2.0)
-  'get_openclaw_sync_status': { url: '/api/proxy/openclaw/status', method: 'POST' },
-  'execute_openclaw_sync': { url: '/api/proxy/openclaw/sync', method: 'POST' },
-  'execute_openclaw_restore': { url: '/api/proxy/openclaw/restore', method: 'POST' },
-  'execute_openclaw_clear': { url: '/api/proxy/openclaw/clear', method: 'POST' },
-  'get_openclaw_config_content': { url: '/api/proxy/openclaw/config', method: 'POST' },
-
   // Stats
   'get_token_stats_hourly': { url: '/api/stats/token/hourly', method: 'GET' },
   'get_token_stats_daily': { url: '/api/stats/token/daily', method: 'GET' },
@@ -115,26 +79,6 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_data_dir_path': { url: '/api/system/data-dir', method: 'GET' },
   'get_internal_error_log_path': { url: '/api/system/error-log-path', method: 'GET' },
   'get_internal_error_log_disk_size': { url: '/api/system/error-log-size', method: 'GET' },
-  'set_data_dir': { url: '/api/system/data-dir', method: 'POST' },
-  'get_update_settings': { url: '/api/system/updates/settings', method: 'GET' },
-  'save_update_settings': { url: '/api/system/updates/save', method: 'POST' },
-  'is_auto_launch_enabled': { url: '/api/system/autostart/status', method: 'GET' },
-  'toggle_auto_launch': { url: '/api/system/autostart/toggle', method: 'POST' },
-  'get_http_api_settings': { url: '/api/system/http-api/settings', method: 'GET' },
-  'save_http_api_settings': { url: '/api/system/http-api/settings', method: 'POST' },
-  'get_antigravity_path': { url: '/api/system/antigravity/path', method: 'GET' },
-  'get_antigravity_args': { url: '/api/system/antigravity/args', method: 'GET' },
-
-  // Cloudflared
-  'cloudflared_install': { url: '/api/proxy/cloudflared/install', method: 'POST' },
-  'cloudflared_start': { url: '/api/proxy/cloudflared/start', method: 'POST' },
-  'cloudflared_stop': { url: '/api/proxy/cloudflared/stop', method: 'POST' },
-  'cloudflared_get_status': { url: '/api/proxy/cloudflared/status', method: 'GET' },
-
-  // Updates
-  'should_check_updates': { url: '/api/system/updates/check-status', method: 'GET' },
-  'check_for_updates': { url: '/api/system/updates/check', method: 'POST' },
-  'update_last_check_time': { url: '/api/system/updates/touch', method: 'POST' },
 
   // OAuth
   'prepare_oauth_url': { url: '/api/auth/url', method: 'GET' },
@@ -148,14 +92,8 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
 
   // Import
   'import_v1_accounts': { url: '/api/accounts/import/v1', method: 'POST' },
-  'import_from_db': { url: '/api/accounts/import/db', method: 'POST' },
-  'import_custom_db': { url: '/api/accounts/import/db-custom', method: 'POST' },
-  'sync_account_from_db': { url: '/api/accounts/sync/db', method: 'POST' },
 
   // System Extra & Cache
-  'open_data_folder': { url: '/api/system/open-folder', method: 'POST' },
-  'clear_antigravity_cache': { url: '/api/system/cache/clear', method: 'POST' },
-  'get_antigravity_cache_paths': { url: '/api/system/cache/paths', method: 'GET' },
   'clear_log_cache': { url: '/api/system/logs/clear-cache', method: 'POST' },
 
   // Security / IP Management
@@ -191,23 +129,10 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_account_proxy_binding': { url: '/api/proxy/pool/binding/:accountId', method: 'GET' },
 };
 
-export async function request<T>(cmd: string, args?: any): Promise<T> {
-  // 1. Tauri 环境：直接使用 invoke ...
-  if (isTauri) {
-    try {
-      const { invoke } = await import('@tauri-apps/api/core');
-      return await invoke<T>(cmd, args);
-    } catch (error) {
-      console.error(`Tauri Invoke Error [${cmd}]:`, error);
-      throw error;
-    }
-  }
-
-  // 2. Web 环境：映射到 HTTP API
+export async function request<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
   const mapping = COMMAND_MAPPING[cmd];
   if (!mapping) {
-    console.error(`Command [${cmd}] is not yet mapped for Web mode. Failing.`);
-    throw new Error(`Command [${cmd}] not supported in Web mode.`);
+    throw new Error(`Unsupported command: ${cmd}`);
   }
 
   let url = mapping.url;
@@ -243,15 +168,13 @@ export async function request<T>(cmd: string, args?: any): Promise<T> {
 
   if ((mapping.method === 'GET' || mapping.method === 'DELETE') && args) {
     const params = new URLSearchParams();
-    Object.entries(args).forEach(([key, value]) => {
-      // [FIX] 跳过已用于路径替换的参数
-      if (url.includes(encodeURIComponent(String(value)))) return;
+    Object.entries(bodyArgs || {}).forEach(([key, value]) => {
       if (value !== undefined && value !== null) {
         params.append(key, String(value));
       }
     });
     const qs = params.toString();
-    if (qs) url += `?${qs}`;
+    if (qs) url += `${url.includes('?') ? '&' : '?'}${qs}`;
   } else if ((mapping.method === 'POST' || mapping.method === 'PATCH') && bodyArgs) {
     // [FIX] 如果有 request 包装，提取其内容作为 body
     const body = bodyArgs.request !== undefined ? bodyArgs.request : bodyArgs;
@@ -261,7 +184,7 @@ export async function request<T>(cmd: string, args?: any): Promise<T> {
   try {
     const response = await fetch(url, options);
     if (!response.ok) {
-      if (!isTauri && response.status === 401) {
+      if (typeof window !== 'undefined' && response.status === 401) {
         // [FIX #1163] 增加防抖锁，避免重复事件导致 UI 抖动
         const now = Date.now();
         const lastAuthError = (window as any)._lastAuthErrorTime || 0;
@@ -272,6 +195,10 @@ export async function request<T>(cmd: string, args?: any): Promise<T> {
       }
       const errorData = await response.json().catch(() => ({}));
       throw errorData.error || `HTTP Error ${response.status}`;
+    }
+
+    if ((cmd === 'save_config' || cmd === 'update_model_mapping') && typeof window !== 'undefined') {
+      window.dispatchEvent(new Event('proxy-models-updated'));
     }
 
     // 如果是 204 No Content，直接返回 null

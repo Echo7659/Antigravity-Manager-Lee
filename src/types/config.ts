@@ -51,7 +51,6 @@ export interface InternalErrorLogRetentionConfig {
     max_storage_mb: number;
 }
 
-
 // ============================================================================
 // Thinking Budget 配置 (控制 AI 深度思考时的 Token 预算)
 // ============================================================================
@@ -162,16 +161,6 @@ export interface AppConfig {
     refresh_interval: number;
     auto_sync: boolean;
     sync_interval: number;
-    default_export_path?: string;
-    antigravity_executable?: string; // [NEW] 手动指定的反重力程序路径
-    antigravity_ide_executable?: string; // [NEW] 手动指定的 Antigravity IDE 程序路径
-    antigravity_cli_executable?: string; // [NEW] 手动指定的 Antigravity CLI (agy) 路径
-    antigravity_args?: string[]; // [NEW] Antigravity 启动参数
-    auto_launch?: boolean; // 开机自动启动
-    quiet_autostart?: boolean; // 开机自启时留在托盘。缺省视为开启
-    auto_check_update?: boolean; // 自动检查更新
-    update_check_interval?: number; // 更新检查间隔（小时）
-    update_channel?: 'stable' | 'beta'; // 更新通道：正式版 vs 预览版
     accounts_page_size?: number; // 账号列表每页显示数量,默认 0 表示自动计算
     hidden_menu_items?: string[]; // 隐藏的菜单项路径列表
     scheduled_warmup: ScheduledWarmupConfig;
@@ -179,33 +168,9 @@ export interface AppConfig {
     pinned_quota_models: PinnedQuotaModelsConfig; // [NEW] 配额关注列表
     circuit_breaker: CircuitBreakerConfig; // [NEW] 熔断器配置
     proxy: ProxyConfig;
-    cloudflared: CloudflaredConfig; // [NEW] Cloudflared 配置
-    lightweight_mode?: boolean; // [NEW] 轻量模式：关闭到托盘时释放 WebView
     suggestion_delete_thinking_store?: boolean; // [NEW] 建议删除历史思考块缓存开关
     thinking_cleanup_dismissed?: boolean; // [NEW] 用户是否已确认/忽略该建议
     dismissed_thinking_cleanup_version?: string; // [NEW] 用户已确认或忽略建议的目标版本号
-}
-
-// ============================================================================
-// Cloudflared (CF隧道) 类型定义
-// ============================================================================
-
-export type TunnelMode = 'quick' | 'auth';
-
-export interface CloudflaredConfig {
-    enabled: boolean;
-    mode: TunnelMode;
-    port: number;
-    token?: string;
-    use_http2: boolean;
-}
-
-export interface CloudflaredStatus {
-    installed: boolean;
-    version?: string;
-    running: boolean;
-    url?: string;
-    error?: string;
 }
 
 // ============================================================================

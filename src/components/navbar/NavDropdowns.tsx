@@ -1,10 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { ChevronDown, MoreVertical, Sun, Moon, LogOut, Minimize2 } from 'lucide-react';
+import { ChevronDown, MoreVertical, Sun, Moon, LogOut } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import type { NavItem, Language } from './constants';
-import { isTauri } from '../../utils/env';
-import { useViewStore } from '../../stores/useViewStore';
 
 // useClickOutside Hook
 export function useClickOutside(
@@ -179,7 +177,6 @@ export function MoreDropdown({
     const [isOpen, setIsOpen] = useState(false);
     const menuRef = useRef<HTMLDivElement>(null);
     const { t } = useTranslation();
-    const { setMiniView } = useViewStore();
 
     useClickOutside(menuRef, () => setIsOpen(false));
 
@@ -212,17 +209,6 @@ export function MoreDropdown({
             {/* 下拉菜单 (强制右对齐防遮蔽) */}
             {isOpen && (
                 <div className="absolute right-0 mt-2 w-44 bg-white dark:bg-base-200 rounded-xl shadow-xl border border-gray-100 dark:border-base-100 py-1 overflow-hidden animate-in fade-in zoom-in-95 duration-200 origin-top-right z-50">
-                    {/* 迷你视图 */}
-                    <button
-                        onClick={() => {
-                            setMiniView(true);
-                            setIsOpen(false);
-                        }}
-                        className="w-full px-4 py-2.5 text-left text-sm flex items-center gap-3 hover:bg-gray-50 dark:hover:bg-base-100 transition-colors text-gray-700 dark:text-gray-300"
-                    >
-                        <Minimize2 className="w-4 h-4" />
-                        <span>{t('nav.mini_view', 'Mini View')}</span>
-                    </button>
 
                     {/* 主题切换 */}
                     <button
@@ -260,9 +246,8 @@ export function MoreDropdown({
                         </button>
                     ))}
 
-                    {/* 登出按钮 - 仅 Web 模式显示 */}
-                    {!isTauri() && (
-                        <>
+                    {/* 登出按钮 */}
+                    <>
                             <div className="my-1 border-t border-gray-100 dark:border-base-100"></div>
                             <button
                                 onClick={handleLogout}
@@ -272,7 +257,6 @@ export function MoreDropdown({
                                 <span>{t('nav.logout', '登出')}</span>
                             </button>
                         </>
-                    )}
                 </div>
             )}
         </div>

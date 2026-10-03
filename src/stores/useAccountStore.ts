@@ -25,9 +25,6 @@ interface AccountState {
     completeOAuthLogin: () => Promise<void>;
     cancelOAuthLogin: () => Promise<void>;
     importV1Accounts: () => Promise<void>;
-    importFromDb: () => Promise<void>;
-    importFromCustomDb: (path: string) => Promise<void>;
-    syncAccountFromDb: () => Promise<void>;
     toggleProxyStatus: (accountId: string, enable: boolean, reason?: string) => Promise<void>;
     warmUpAccounts: () => Promise<string>;
     warmUpAccount: (accountId: string) => Promise<string>;
@@ -222,49 +219,6 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         } catch (error) {
             set({ error: String(error), loading: false });
             throw error;
-        }
-    },
-
-    importFromDb: async () => {
-        set({ loading: true, error: null });
-        try {
-            await accountService.importFromDb();
-            await Promise.all([
-                get().fetchAccounts(),
-                get().fetchCurrentAccount()
-            ]);
-            set({ loading: false });
-        } catch (error) {
-            set({ error: String(error), loading: false });
-            throw error;
-        }
-    },
-
-    importFromCustomDb: async (path: string) => {
-        set({ loading: true, error: null });
-        try {
-            await accountService.importFromCustomDb(path);
-            await Promise.all([
-                get().fetchAccounts(),
-                get().fetchCurrentAccount()
-            ]);
-            set({ loading: false });
-        } catch (error) {
-            set({ error: String(error), loading: false });
-            throw error;
-        }
-    },
-
-    syncAccountFromDb: async () => {
-        try {
-            const syncedAccount = await accountService.syncAccountFromDb();
-            if (syncedAccount) {
-                console.log('[AccountStore] Account synced from DB:', syncedAccount.email);
-                await get().fetchAccounts();
-                set({ currentAccount: syncedAccount });
-            }
-        } catch (error) {
-            console.error('[AccountStore] Sync from DB failed:', error);
         }
     },
 

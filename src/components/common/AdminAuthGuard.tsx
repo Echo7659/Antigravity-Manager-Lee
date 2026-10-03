@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Lock, Key, Globe, AlertCircle, Loader2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { isTauri } from '../../utils/env';
 
 /**
  * AdminAuthGuard
@@ -10,26 +9,24 @@ import { isTauri } from '../../utils/env';
  */
 export const AdminAuthGuard: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const { t, i18n } = useTranslation();
-    const [isAuthenticated, setIsAuthenticated] = useState(isTauri());
+    const [isAuthenticated, setIsAuthenticated] = useState(false);
     const [apiKey, setApiKey] = useState('');
     const [showLangMenu, setShowLangMenu] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState('');
 
     useEffect(() => {
-        if (isTauri()) return;
 
         // 检查 Session 存储 (优先)
         const sessionKey = sessionStorage.getItem('abv_admin_api_key');
         if (sessionKey) {
             setIsAuthenticated(true);
             setApiKey(sessionKey);
-            return;
         }
 
         // 检查本地存储 (迁移逻辑)
         const savedKey = localStorage.getItem('abv_admin_api_key');
-        if (savedKey) {
+        if (!sessionKey && savedKey) {
             // 迁移到 sessionStorage 并清理 localStorage
             sessionStorage.setItem('abv_admin_api_key', savedKey);
             localStorage.removeItem('abv_admin_api_key');

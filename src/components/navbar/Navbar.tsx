@@ -3,7 +3,7 @@ import i18n from '../../i18n';
 import { LayoutDashboard, Users, Network, Activity, BarChart3, Settings, Lock, KeyRound } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useConfigStore } from '../../stores/useConfigStore';
-import { isTauri, isLinux } from '../../utils/env';
+
 import { NavLogo } from './NavLogo';
 import { NavMenu } from './NavMenu';
 import { NavSettings } from './NavSettings';
@@ -11,7 +11,7 @@ import type { NavItem } from './constants';
 
 /**
  * Navbar 主组件
- * 
+ *
  * 职责: 只负责布局 and 状态管理,不处理响应式细节
  * 响应式逻辑由各个子组件独立处理
  */
@@ -38,8 +38,8 @@ function Navbar() {
 
         const newTheme = config.theme === 'light' ? 'dark' : 'light';
 
-        // Use View Transition API if supported, but skip on Linux (may cause crash)
-        if ('startViewTransition' in document && !isLinux()) {
+        // Use View Transition API when available
+        if ('startViewTransition' in document) {
             const x = event.clientX;
             const y = event.clientY;
             const endRadius = Math.hypot(
@@ -75,7 +75,7 @@ function Navbar() {
                 );
             });
         } else {
-            // Fallback: direct switch (Linux or browsers without View Transition)
+            // Fallback for browsers without View Transition
             await saveConfig({
                 ...config,
                 theme: newTheme,
@@ -109,16 +109,8 @@ function Navbar() {
     return (
         <nav
             style={{ position: 'sticky', top: 0, zIndex: 50 }}
-            className="pt-9 transition-all duration-200 bg-[#FAFBFC] dark:bg-base-300"
+            className="transition-all duration-200 bg-[#FAFBFC] dark:bg-base-300"
         >
-            {/* 窗口拖拽区域 - Tauri 专用 */}
-            {isTauri() && (
-                <div
-                    className="absolute top-9 left-0 right-0 h-16"
-                    style={{ zIndex: 5, backgroundColor: 'rgba(0,0,0,0.001)' }}
-                    data-tauri-drag-region
-                />
-            )}
 
             <div className="max-w-7xl mx-auto px-8 relative" style={{ zIndex: 10 }}>
                 {/* Flexbox 布局 - 子组件自己处理响应式 */}

@@ -1,4 +1,4 @@
-
+import { downloadJson, readJsonFile } from '../utils/browserFiles';
 
 import {
   Calendar,
@@ -29,8 +29,7 @@ import { useAccountStore } from "../stores/useAccountStore";
 import { useConfigStore } from "../stores/useConfigStore";
 import { Account, getAccountTier } from "../types/account";
 import { cn } from "../utils/cn";
-import { isTauri } from "../utils/env";
-import { request as invoke } from "../utils/request";
+
 import { useTranslation } from "react-i18next";
 
 import { matchesAccountStatus, type AccountStatusFilter } from '../utils/accountStatus';
@@ -38,7 +37,6 @@ import { matchesAccountStatus, type AccountStatusFilter } from '../utils/account
 type FilterType = "all" | "pro" | "ultra" | "free";
 type ViewMode = "list" | "grid";
 export type QuotaWindow = "5h" | "weekly";
-
 
 function Accounts() {
   const { t } = useTranslation();
@@ -553,52 +551,14 @@ function Accounts() {
       }
 
       const exportData = response.accounts;
-      const content = JSON.stringify(exportData, null, 2);
+
       const fileName = `antigravity_accounts_${new Date().toISOString().split("T")[0]}.json`;
 
-      // 2. Determine Path & Export
-      if (isTauri()) {
-        let path: string | null = null;
-        const { join } = await import("@tauri-apps/api/path");
-
-        if (config?.default_export_path) {
-          // Use default path
-          path = await join(config.default_export_path, fileName);
-        } else {
-          // Use Native Dialog
-          const { save } = await import("@tauri-apps/plugin-dialog");
-          path = await save({
-            filters: [
-              {
-                name: "JSON",
-                extensions: ["json"],
-              },
-            ],
-            defaultPath: fileName,
-          });
-        }
-
-        if (!path) return; // Cancelled
-
-        // 3. Write File
-        await invoke("save_text_file", { path, content });
-        showToast(`${t("common.success")} ${path}`, "success");
-      } else {
-        // Web 模式：使用浏览器下载
-        const blob = new Blob([content], { type: "application/json" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = fileName;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        showToast(
-          t("dashboard.toast.export_success", { path: fileName }),
-          "success",
-        );
-      }
+      downloadJson(fileName, exportData);
+      showToast(
+        t("dashboard.toast.export_success", { path: fileName }),
+        "success",
+      );
     } catch (error: any) {
       console.error("Export failed:", error);
       showToast(`${t("common.error")}: ${error}`, "error");
@@ -622,15 +582,7 @@ function Accounts() {
     }
   };
 
-  const processImportData = async (content: string) => {
-    let importData: Array<{ email?: string; refresh_token?: string }>;
-    try {
-      importData = JSON.parse(content);
-    } catch {
-      showToast(t("accounts.import_invalid_format"), "error");
-      return;
-    }
-
+  const processImportData = async (importData: unknown) => {
     if (!Array.isArray(importData) || importData.length === 0) {
       showToast(t("accounts.import_invalid_format"), "error");
       return;
@@ -638,7 +590,7 @@ function Accounts() {
 
     const validEntries = importData.filter(
       (item) =>
-        item.refresh_token &&
+        item && typeof item === "object" && item.refresh_token &&
         typeof item.refresh_token === "string" &&
         item.refresh_token.startsWith("1//"),
     );
@@ -683,33 +635,8 @@ function Accounts() {
     }
   };
 
-  const handleImportJson = async () => {
-    if (isTauri()) {
-      try {
-        const { open } = await import("@tauri-apps/plugin-dialog");
-        const selected = await open({
-          multiple: false,
-          filters: [
-            {
-              name: "JSON",
-              extensions: ["json"],
-            },
-          ],
-        });
-        if (!selected || typeof selected !== "string") return;
-
-        const content: string = await invoke("read_text_file", {
-          path: selected,
-        });
-        await processImportData(content);
-      } catch (error) {
-        console.error("Import failed:", error);
-        showToast(t("accounts.import_fail", { error: String(error) }), "error");
-      }
-    } else {
-      // Web 模式: 触发隐藏的 file input
-      fileInputRef.current?.click();
-    }
+  const handleImportJson = () => {
+    fileInputRef.current?.click();
   };
 
   const handleFileChange = async (
@@ -719,8 +646,7 @@ function Accounts() {
     if (!file) return;
 
     try {
-      const content = await file.text();
-      await processImportData(content);
+      await processImportData(await readJsonFile(file));
     } catch (error) {
       console.error("Import failed:", error);
       showToast(t("accounts.import_fail", { error: String(error) }), "error");
