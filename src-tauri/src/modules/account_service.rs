@@ -97,6 +97,16 @@ impl AccountService {
         Ok(())
     }
 
+    /// 批量删除账号；持久化成功后清除被删除的当前账号选择。
+    pub fn delete_accounts(&self, account_ids: &[String]) -> Result<(), String> {
+        let mut current = self.current_account_id.write().map_err(|e| e.to_string())?;
+        modules::delete_accounts(account_ids)?;
+        if current.as_ref().is_some_and(|id| account_ids.contains(id)) {
+            *current = None;
+        }
+        Ok(())
+    }
+
     /// 切换账号逻辑
     pub async fn switch_account(
         &self,

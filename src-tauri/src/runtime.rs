@@ -121,14 +121,23 @@ fn apply_startup_overrides(
     Ok(changed)
 }
 
-async fn probe_health(port: u16) -> bool {
+async fn probe_health(port: u16, api_key: Option<&str>) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let probe = async {
         let mut stream =
             tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-        stream
-            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-            .await?;
+        let mut request =
+            String::from("GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+        if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+            if key.contains(['\r', '\n']) {
+                return Ok(false);
+            }
+            request.push_str("Authorization: Bearer ");
+            request.push_str(key);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await?;
         let mut response = [0_u8; 256];
         let read = stream.read(&mut response).await?;
         Ok::<_, std::io::Error>(
@@ -195,7 +204,10 @@ pub async fn run() -> Result<(), String> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8045);
-        return if probe_health(port).await {
+        let api_key = std::env::var("ABV_API_KEY")
+            .or_else(|_| std::env::var("API_KEY"))
+            .ok();
+        return if probe_health(port, api_key.as_deref()).await {
             Ok(())
         } else {
             Err("HTTP health check failed".into())
@@ -210,6 +222,7 @@ pub async fn run() -> Result<(), String> {
         modules::config::save_app_config(&config)?;
     }
     let port = config.proxy.port;
+    let api_key = config.proxy.api_key.clone();
     let runtime = ServerRuntime::start(config).await?;
     let scheduler = modules::scheduler::start_scheduler(runtime.server.token_manager.clone());
     let watchdog_enabled = std::env::var("ABV_HEALTH_WATCHDOG_ENABLED")
@@ -227,7 +240,7 @@ pub async fn run() -> Result<(), String> {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let mut failures = 0;
         loop {
-            failures = if probe_health(port).await {
+            failures = if probe_health(port, Some(&api_key)).await {
                 0
             } else {
                 failures + 1
@@ -384,7 +397,7 @@ pub(crate) mod tests {
         assert_eq!(fixture.get_model_ids().await, vec!["gemini-3.8-flash"]);
         fixture.stop_proxy().await;
         assert!(!*fixture.runtime.server.is_running.read().await);
-        assert!(super::probe_health(fixture.config.proxy.port).await);
+        assert!(super::probe_health(fixture.config.proxy.port, None).await);
         let path = fixture.dir.path().join("accounts/fixture-account.json");
         let mut account: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -445,6 +458,18 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn server_runtime_strict_health_probe_requires_valid_key() {
+        let fixture = ServerFixture::new().await;
+        let mut config = fixture.config.clone();
+        config.proxy.auth_mode = crate::proxy::ProxyAuthMode::Strict;
+        fixture.save_config(&config).await;
+        assert!(super::probe_health(config.proxy.port, Some("fixture-key")).await);
+        assert!(!super::probe_health(config.proxy.port, None).await);
+        assert!(!super::probe_health(config.proxy.port, Some("wrong-key")).await);
+        fixture.shutdown().await;
     }
 
     #[tokio::test]

@@ -146,6 +146,8 @@ pub fn take_pending_delete_accounts() -> Vec<String> {
 /// Axum 应用状态
 #[derive(Clone)]
 pub struct AppState {
+    /// 配置保存锁覆盖持久化及共享组件更新，防止并发保存交错。
+    config_update: Arc<tokio::sync::Mutex<()>>,
     pub token_manager: Arc<TokenManager>,
     pub custom_mapping: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     pub request_timeout: u64, // API 请求超时(秒)
@@ -616,6 +618,7 @@ impl AxumServer {
         );
 
         let state = AppState {
+            config_update: Arc::new(tokio::sync::Mutex::new(())),
             token_manager: token_manager.clone(),
             custom_mapping: custom_mapping_state.clone(),
             request_timeout,
@@ -1156,6 +1159,184 @@ impl AxumServer {
 
 #[cfg(test)]
 mod admin_model_catalog_tests {
+    async fn config_snapshot(server: &super::AxumServer) -> serde_json::Value {
+        let security = server.security_state.read().await;
+        serde_json::json!({
+            "mapping": *server.custom_mapping.read().await,
+            "raw": *server.only_raw_quota_models.read().await,
+            "debug": *server.debug_logging.read().await,
+            "upstream_proxy": *server.proxy_state.read().await,
+            "user_agent": server.upstream.get_user_agent().await,
+            "security": {"auth_mode":security.auth_mode, "api_key":security.api_key,
+                "admin_password":security.admin_password, "allow_lan_access":security.allow_lan_access,
+                "port":security.port, "security_monitor":security.security_monitor},
+            "experimental": *server.experimental.read().await,
+            "pool": *server.proxy_pool_state.read().await,
+            "circuit": server.token_manager.get_circuit_breaker_config().await,
+            "scheduling": server.token_manager.get_sticky_config().await,
+            "thinking": crate::proxy::config::get_thinking_budget_config(),
+            "system": crate::proxy::config::get_global_system_prompt(),
+            "image": crate::proxy::config::get_image_thinking_mode(),
+            "multimodal": crate::proxy::config::get_multimodal_config(),
+            "audit": crate::proxy::config::get_payload_storage_mode(),
+        })
+    }
+
+    #[tokio::test]
+    async fn admin_runtime_config_updates_one_state_running_and_stopped() {
+        let fixture = crate::runtime::tests::ServerFixture::new().await;
+        let manager = fixture.runtime.server.token_manager.clone();
+        for running in [true, false] {
+            if !running {
+                fixture.stop_proxy().await;
+            }
+            let mut config = fixture.config.clone();
+            config.proxy.debug_logging.enabled = running;
+            config.proxy.debug_logging.output_dir = Some(format!("debug-{running}"));
+            config.proxy.user_agent_override = Some(format!("runtime-test-{running}"));
+            config.circuit_breaker.enabled = !running;
+            config.circuit_breaker.backoff_steps =
+                if running { vec![17, 31] } else { vec![23, 47] };
+            config.proxy.scheduling.max_wait_seconds = if running { 19 } else { 29 };
+            config.proxy.scheduling.mode = if running {
+                crate::proxy::sticky_config::SchedulingMode::CacheFirst
+            } else {
+                crate::proxy::sticky_config::SchedulingMode::PerformanceFirst
+            };
+            config
+                .proxy
+                .custom_mapping
+                .insert(format!("alias-{running}"), "gemini-3.8-flash".into());
+            config.proxy.only_raw_quota_models = !running;
+            config.proxy.auth_mode = crate::proxy::ProxyAuthMode::Strict;
+            config.proxy.upstream_proxy.url =
+                format!("http://127.0.0.1:{}", if running { 12341 } else { 12342 });
+            config.proxy.experimental.enable_usage_scaling = running;
+            config.proxy.experimental.payload_storage_mode =
+                if running { "full" } else { "simple" }.into();
+            config.proxy.proxy_pool.health_check_interval = if running { 123 } else { 234 };
+            config.proxy.thinking_budget.flash_low = if running { 1111 } else { 2222 };
+            config.proxy.global_system_prompt.content = format!("system-{running}");
+            config.proxy.image_thinking_mode =
+                Some(if running { "enabled" } else { "disabled" }.into());
+            config.proxy.multimodal.max_fresh_images = if running { 7 } else { 9 };
+            fixture.save_config(&config).await;
+            assert!(std::sync::Arc::ptr_eq(
+                &manager,
+                &fixture.runtime.server.token_manager
+            ));
+            assert_eq!(*fixture.runtime.server.is_running.read().await, running);
+            assert_eq!(
+                config_snapshot(&fixture.runtime.server).await,
+                serde_json::json!({
+                    "mapping": config.proxy.custom_mapping, "raw": config.proxy.only_raw_quota_models,
+                    "debug": config.proxy.debug_logging, "upstream_proxy": config.proxy.upstream_proxy,
+                    "user_agent": crate::constants::sanitize_egress_user_agent(config.proxy.user_agent_override.as_ref().unwrap()),
+                    "security": {"auth_mode":config.proxy.auth_mode, "api_key":config.proxy.api_key,
+                        "admin_password":config.proxy.admin_password, "allow_lan_access":config.proxy.allow_lan_access,
+                        "port":config.proxy.port, "security_monitor":config.proxy.security_monitor},
+                    "experimental": config.proxy.experimental, "pool": config.proxy.proxy_pool,
+                    "circuit": config.circuit_breaker, "scheduling": config.proxy.scheduling,
+                    "thinking": config.proxy.thinking_budget, "system": config.proxy.global_system_prompt,
+                    "image": config.proxy.image_thinking_mode, "multimodal": config.proxy.multimodal,
+                    "audit": config.proxy.experimental.payload_storage_mode,
+                })
+            );
+        }
+        let before = config_snapshot(&fixture.runtime.server).await;
+        let path = crate::modules::account::get_data_dir()
+            .unwrap()
+            .join("gui_config.json");
+        let backup = path.with_extension("saved");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let response = fixture
+            .client
+            .post(format!("{}/api/config", fixture.url))
+            .bearer_auth("fixture-key")
+            .json(&serde_json::json!({"config": fixture.config}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(config_snapshot(&fixture.runtime.server).await, before);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(backup, path).unwrap();
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn admin_bulk_delete_clears_current_account_and_preserves_survivor() {
+        let fixture = crate::runtime::tests::ServerFixture::new().await;
+        let original = crate::modules::account::load_account("fixture-account").unwrap();
+        let survivor =
+            crate::modules::upsert_account("survivor@example.test".into(), None, original.token)
+                .unwrap();
+        fixture
+            .runtime
+            .server
+            .token_manager
+            .load_accounts()
+            .await
+            .unwrap();
+        fixture
+            .client
+            .post(format!("{}/api/accounts/switch", fixture.url))
+            .bearer_auth("fixture-key")
+            .json(&serde_json::json!({"accountId":"fixture-account"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        fixture
+            .client
+            .post(format!("{}/api/accounts/bulk-delete", fixture.url))
+            .bearer_auth("fixture-key")
+            .json(&serde_json::json!({"accountIds":["fixture-account"]}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let list: serde_json::Value = fixture
+            .client
+            .get(format!("{}/api/accounts", fixture.url))
+            .bearer_auth("fixture-key")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(list["current_account_id"].is_null());
+        let accounts = list["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0]["id"], survivor.id);
+        assert_eq!(accounts[0]["is_current"], false);
+        let current: serde_json::Value = fixture
+            .client
+            .get(format!("{}/api/accounts/current", fixture.url))
+            .bearer_auth("fixture-key")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(current.is_null());
+        assert!(crate::modules::account::load_account(&survivor.id).is_ok());
+        assert_eq!(fixture.runtime.server.token_manager.len(), 1);
+        fixture.shutdown().await;
+    }
+
     #[tokio::test]
     async fn admin_account_label_preserves_other_fields() {
         let fixture = crate::runtime::tests::ServerFixture::new().await;
@@ -2002,77 +2183,74 @@ struct SaveConfigWrapper {
     config: AppConfig,
 }
 
+impl AppState {
+    /// 串行完成配置持久化和共享状态更新；保存失败时不修改运行状态。
+    async fn save_runtime_config(&self, config: &AppConfig) -> Result<(), String> {
+        let _update = self.config_update.lock().await;
+        config::save_app_config(config)?;
+        self.apply_runtime_config(config).await;
+        Ok(())
+    }
+
+    /// 将已保存配置应用到常驻服务的共享组件。
+    async fn apply_runtime_config(&self, config: &AppConfig) {
+        let proxy = &config.proxy;
+        {
+            let mut mapping = self.custom_mapping.write().await;
+            let mut raw = self.only_raw_quota_models.write().await;
+            *mapping = proxy.custom_mapping.clone();
+            *raw = proxy.only_raw_quota_models;
+        }
+        *self.upstream_proxy.write().await = proxy.upstream_proxy.clone();
+        *self.security.write().await = crate::proxy::ProxySecurityConfig::from_proxy_config(proxy);
+        *self.experimental.write().await = proxy.experimental.clone();
+        *self.debug_logging.write().await = proxy.debug_logging.clone();
+        *self.proxy_pool_state.write().await = proxy.proxy_pool.clone();
+        self.proxy_pool_manager.sync_bindings_from_config().await;
+        self.upstream
+            .rebuild_default_client(Some(proxy.upstream_proxy.clone()))
+            .await;
+        self.upstream
+            .set_user_agent_override(proxy.user_agent_override.clone())
+            .await;
+        self.upstream.clear_client_cache();
+        crate::utils::http::invalidate_shared_clients();
+        self.token_manager
+            .update_circuit_breaker_config(config.circuit_breaker.clone())
+            .await;
+        self.token_manager
+            .update_sticky_config(proxy.scheduling.clone())
+            .await;
+        self.monitor.set_enabled(proxy.enable_logging);
+        self.monitor
+            .set_capture_health_logs(proxy.capture_health_logs);
+        crate::proxy::update_thinking_budget_config(proxy.thinking_budget.clone());
+        crate::proxy::update_global_system_prompt_config(proxy.global_system_prompt.clone());
+        crate::proxy::update_image_thinking_mode(proxy.image_thinking_mode.clone());
+        crate::proxy::update_multimodal_config(proxy.multimodal.clone());
+        crate::proxy::config::update_global_audit_config(
+            proxy.experimental.payload_storage_mode.clone(),
+            proxy.experimental.log_retention_days,
+            proxy.experimental.thinking_store_enabled,
+            proxy.experimental.thinking_retention_days,
+            Some(proxy.experimental.thinking_max_memory_turns),
+        );
+    }
+}
+
 async fn admin_save_config(
     State(state): State<AppState>,
     Json(payload): Json<SaveConfigWrapper>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let new_config = payload.config;
-    // 1. 持久化
-    config::save_app_config(&new_config).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-
-    // 2. 热更新内存状态
-    // 这里我们直接复用内部组件的 update 方法
-    // 注意：AppState 本身持有各个组件的 Arc<RwLock> 或直接持有引用
-
-    // 我们需要一个方式获取到当前的 AxumServer 实例来进行热更新，
-    // 或者直接操作 AppState 里的各状态。
-    // 在本重构中，各个状态已经在 AppState 中了。
-
-    // 更新模型映射
-    {
-        let mut mapping = state.custom_mapping.write().await;
-        *mapping = new_config.clone().proxy.custom_mapping;
-    }
-    *state.only_raw_quota_models.write().await = new_config.proxy.only_raw_quota_models;
-
-    // 更新上游代理
-    {
-        let mut proxy = state.upstream_proxy.write().await;
-        *proxy = new_config.clone().proxy.upstream_proxy;
-    }
-
-    // 更新安全策略
-    {
-        let mut security = state.security.write().await;
-        *security = crate::proxy::ProxySecurityConfig::from_proxy_config(&new_config.proxy);
-    }
-
-    // 更新实验性配置
-    {
-        let mut exp = state.experimental.write().await;
-        *exp = new_config.clone().proxy.experimental;
-    }
-
-    // 更新代理池配置（Web/Docker 保存配置时热更新）
-    {
-        let mut pool = state.proxy_pool_state.write().await;
-        *pool = new_config.clone().proxy.proxy_pool;
-    }
-    state.proxy_pool_manager.sync_bindings_from_config().await;
     state
-        .upstream
-        .rebuild_default_client(Some(new_config.proxy.upstream_proxy.clone()))
-        .await;
-    state.upstream.clear_client_cache();
-
-    // 同步全局内存配置（热更新思考预算、系统提示词、图像思考模式与审计策略）
-    crate::proxy::update_thinking_budget_config(new_config.proxy.thinking_budget.clone());
-    crate::proxy::update_global_system_prompt_config(new_config.proxy.global_system_prompt.clone());
-    crate::proxy::update_image_thinking_mode(new_config.proxy.image_thinking_mode.clone());
-    crate::proxy::update_multimodal_config(new_config.proxy.multimodal.clone());
-    crate::proxy::config::update_global_audit_config(
-        new_config.proxy.experimental.payload_storage_mode.clone(),
-        new_config.proxy.experimental.log_retention_days,
-        new_config.proxy.experimental.thinking_store_enabled,
-        new_config.proxy.experimental.thinking_retention_days,
-        Some(new_config.proxy.experimental.thinking_max_memory_turns),
-    );
-
+        .save_runtime_config(&payload.config)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error }),
+            )
+        })?;
     Ok(StatusCode::OK)
 }
 
@@ -2909,7 +3087,8 @@ async fn admin_delete_accounts(
     Json(payload): Json<BulkDeleteRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let ids = payload.account_ids.clone();
-    tokio::task::spawn_blocking(move || crate::modules::account::delete_accounts(&ids))
+    let service = state.account_service.clone();
+    tokio::task::spawn_blocking(move || service.delete_accounts(&ids))
         .await
         .map_err(|e| {
             (
