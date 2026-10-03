@@ -1,0 +1,2 @@
+# 保持既有格式风格，语言版本由 Cargo.toml 的 edition 决定。
+style_edition = "2021"

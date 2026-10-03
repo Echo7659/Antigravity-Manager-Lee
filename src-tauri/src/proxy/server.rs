@@ -5,13 +5,12 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Json, Response},
-    routing::{any, delete, get, post},
+    routing::{delete, get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{watch, RwLock};
 use tracing::{debug, error};
@@ -161,9 +160,8 @@ pub struct AppState {
     pub switching: Arc<RwLock<bool>>, // [NEW] 账号切换状态，用于防止并发切换
     pub account_service: Arc<crate::modules::account_service::AccountService>, // [NEW] 账号管理服务层
     pub security: Arc<RwLock<crate::proxy::ProxySecurityConfig>>,              // [NEW] 安全配置状态
-    pub cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>, // [NEW] Cloudflared 插件状态
-    pub is_running: Arc<RwLock<bool>>, // [NEW] 运行状态标识
-    pub port: u16,                     // [NEW] 本地监听端口 (v4.0.8 修复)
+    pub is_running: Arc<RwLock<bool>>,                                         // [NEW] 运行状态标识
+    pub port: u16, // [NEW] 本地监听端口 (v4.0.8 修复)
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [FIX Web Mode]
     pub proxy_pool_manager: Arc<crate::proxy::proxy_pool::ProxyPoolManager>, // [FIX Web Mode]
     pub only_raw_quota_models: Arc<tokio::sync::RwLock<bool>>, // [NEW] 是否只暴露真实配额模型
@@ -476,8 +474,6 @@ pub struct AxumServer {
     security_state: Arc<RwLock<crate::proxy::ProxySecurityConfig>>,
     experimental: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
     debug_logging: Arc<RwLock<crate::proxy::config::DebugLoggingConfig>>,
-    #[allow(dead_code)] // 预留给 cloudflared 运行状态查询与后续控制
-    pub cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
     pub is_running: Arc<RwLock<bool>>,
     pub token_manager: Arc<TokenManager>, // [NEW] 暴露出 TokenManager 供反代服务复用
     pub proxy_pool_state: Arc<tokio::sync::RwLock<crate::proxy::config::ProxyPoolConfig>>, // [NEW] 代理池配置状态
@@ -585,7 +581,6 @@ impl AxumServer {
         experimental_config: crate::proxy::config::ExperimentalConfig,
         debug_logging: crate::proxy::config::DebugLoggingConfig,
 
-        cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
         proxy_pool_config: crate::proxy::config::ProxyPoolConfig, // [NEW]
         only_raw_quota_models: bool,
         image_scheduler_config: crate::proxy::config::ImageSchedulerConfig,
@@ -643,7 +638,6 @@ impl AxumServer {
             switching: Arc::new(RwLock::new(false)),
             account_service: Arc::new(crate::modules::account_service::AccountService::new()),
             security: security_state.clone(),
-            cloudflared_state: cloudflared_state.clone(),
             is_running: is_running_state.clone(),
             port,
             proxy_pool_state: proxy_pool_state.clone(),
@@ -824,9 +818,6 @@ impl AxumServer {
                 delete(admin_delete_device_version),
             )
             .route("/accounts/import/v1", post(admin_import_v1_accounts))
-            .route("/accounts/import/db", post(admin_import_from_db))
-            .route("/accounts/import/db-custom", post(admin_import_custom_db))
-            .route("/accounts/sync/db", post(admin_sync_account_from_db))
             .route("/stats/summary", get(admin_get_token_stats_summary))
             .route("/stats/hourly", get(admin_get_token_stats_hourly))
             .route("/stats/daily", get(admin_get_token_stats_daily))
@@ -835,63 +826,6 @@ impl AxumServer {
             .route("/stats/models", get(admin_get_token_stats_by_model))
             .route("/config", get(admin_get_config).post(admin_save_config))
             .route("/proxy/models", get(admin_get_proxy_models))
-            .route("/proxy/cli/status", post(admin_get_cli_sync_status))
-            .route("/proxy/cli/sync", post(admin_execute_cli_sync))
-            .route("/proxy/cli/restore", post(admin_execute_cli_restore))
-            .route("/proxy/cli/config", post(admin_get_cli_config_content))
-            .route(
-                "/proxy/opencode/status",
-                post(admin_get_opencode_sync_status),
-            )
-            .route(
-                "/proxy/opencode/providers",
-                get(admin_get_opencode_providers),
-            )
-            .route("/proxy/opencode/sync", post(admin_execute_opencode_sync))
-            .route(
-                "/proxy/opencode/openai-sync",
-                post(admin_execute_opencode_openai_sync),
-            )
-            .route(
-                "/proxy/opencode/remove-provider",
-                post(admin_execute_opencode_remove_provider),
-            )
-            .route(
-                "/proxy/opencode/restore",
-                post(admin_execute_opencode_restore),
-            )
-            .route("/proxy/opencode/clear", post(admin_execute_opencode_clear))
-            .route(
-                "/proxy/opencode/config",
-                post(admin_get_opencode_config_content),
-            )
-            .route("/proxy/opencode/families", get(admin_get_opencode_families))
-            .route("/proxy/hermes/status", post(admin_get_hermes_sync_status))
-            .route("/proxy/hermes/sync", post(admin_execute_hermes_sync))
-            .route("/proxy/hermes/restore", post(admin_execute_hermes_restore))
-            .route("/proxy/hermes/clear", post(admin_execute_hermes_clear))
-            .route(
-                "/proxy/hermes/config",
-                post(admin_get_hermes_config_content),
-            )
-            .route(
-                "/proxy/openclaw/status",
-                post(admin_get_openclaw_sync_status),
-            )
-            .route("/proxy/openclaw/sync", post(admin_execute_openclaw_sync))
-            .route(
-                "/proxy/openclaw/restore",
-                post(admin_execute_openclaw_restore),
-            )
-            .route("/proxy/openclaw/clear", post(admin_execute_openclaw_clear))
-            .route(
-                "/proxy/openclaw/config",
-                post(admin_get_openclaw_config_content),
-            )
-            .route("/proxy/droid/status", post(admin_get_droid_sync_status))
-            .route("/proxy/droid/sync", post(admin_execute_droid_sync))
-            .route("/proxy/droid/restore", post(admin_execute_droid_restore))
-            .route("/proxy/droid/config", post(admin_get_droid_config_content))
             .route("/proxy/status", get(admin_get_proxy_status))
             .route("/proxy/pool/config", get(admin_get_proxy_pool_config))
             .route("/proxy/pool/bindings", get(admin_get_all_account_bindings))
@@ -940,17 +874,6 @@ impl AxumServer {
                 "/proxy/monitor/health-logs/toggle",
                 post(admin_set_proxy_capture_health_logs),
             )
-            .route(
-                "/proxy/cloudflared/status",
-                get(admin_cloudflared_get_status),
-            )
-            .route(
-                "/proxy/cloudflared/install",
-                post(admin_cloudflared_install),
-            )
-            .route("/proxy/cloudflared/start", post(admin_cloudflared_start))
-            .route("/proxy/cloudflared/stop", post(admin_cloudflared_stop))
-            .route("/system/open-folder", post(admin_open_folder))
             .route("/proxy/stats", get(admin_get_proxy_stats))
             .route("/logs", get(admin_get_proxy_logs_filtered))
             .route("/logs/count", get(admin_get_proxy_logs_count_filtered))
@@ -1011,10 +934,7 @@ impl AxumServer {
                 "/accounts/:accountId/priority",
                 post(admin_update_account_priority),
             )
-            .route(
-                "/system/data-dir",
-                get(admin_get_data_dir_path).post(admin_set_data_dir),
-            )
+            .route("/system/data-dir", get(admin_get_data_dir_path))
             .route(
                 "/system/error-log-path",
                 get(admin_get_internal_error_log_path),
@@ -1022,30 +942,6 @@ impl AxumServer {
             .route(
                 "/system/error-log-size",
                 get(admin_get_internal_error_log_disk_size),
-            )
-            .route("/system/updates/settings", get(admin_get_update_settings))
-            .route(
-                "/system/updates/check-status",
-                get(admin_should_check_updates),
-            )
-            .route("/system/updates/check", post(admin_check_for_updates))
-            .route("/system/updates/touch", post(admin_update_last_check_time))
-            .route("/system/updates/save", post(admin_save_update_settings))
-            .route(
-                "/system/autostart/status",
-                get(admin_is_auto_launch_enabled),
-            )
-            .route("/system/autostart/toggle", post(admin_toggle_auto_launch))
-            .route(
-                "/system/http-api/settings",
-                get(admin_get_http_api_settings).post(admin_save_http_api_settings),
-            )
-            .route("/system/antigravity/path", get(admin_get_antigravity_path))
-            .route("/system/antigravity/args", get(admin_get_antigravity_args))
-            .route("/system/cache/clear", post(admin_clear_antigravity_cache))
-            .route(
-                "/system/cache/paths",
-                get(admin_get_antigravity_cache_paths),
             )
             .route("/system/logs/clear-cache", post(admin_clear_log_cache))
             // Security / IP Monitoring
@@ -1092,6 +988,8 @@ impl AxumServer {
             )
             // OAuth (Web) - Admin 接口
             .route("/auth/url", get(admin_prepare_oauth_url_web))
+            // API 未匹配路径不得落入 Web 页面的 index.html fallback。
+            .fallback(|| async { StatusCode::NOT_FOUND })
             // 应用管理特定鉴权层 (强制校验)
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -1154,7 +1052,6 @@ impl AxumServer {
             security_state,
             experimental: experimental_state.clone(),
             debug_logging: debug_logging_state.clone(),
-            cloudflared_state,
             is_running: is_running_state,
             token_manager: token_manager.clone(),
             proxy_pool_state,
@@ -1253,6 +1150,48 @@ impl AxumServer {
 
 #[cfg(test)]
 mod admin_model_catalog_tests {
+    #[tokio::test]
+    async fn removed_admin_routes_return_not_found() {
+        let dist = tempfile::tempdir().unwrap();
+        std::fs::write(dist.path().join("index.html"), "server-panel").unwrap();
+        let previous_dist = std::env::var_os("ABV_DIST_PATH");
+        unsafe { std::env::set_var("ABV_DIST_PATH", dist.path()) };
+        let fixture = crate::runtime::tests::ServerFixture::new().await;
+        unsafe {
+            match previous_dist {
+                Some(value) => std::env::set_var("ABV_DIST_PATH", value),
+                None => std::env::remove_var("ABV_DIST_PATH"),
+            }
+        }
+        let routes: Vec<(String, String)> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/removed-admin-routes.json"
+        ))
+        .unwrap();
+        for (method, path) in routes {
+            let response = fixture
+                .client
+                .request(
+                    method.parse().unwrap(),
+                    format!("{}/api{}", fixture.url, path),
+                )
+                .bearer_auth("fixture-key")
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+        }
+        let page = fixture
+            .client
+            .get(format!("{}/accounts", fixture.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        assert_eq!(page.text().await.unwrap(), "server-panel");
+        fixture.shutdown().await;
+    }
+
     #[tokio::test]
     async fn admin_account_switch_preserves_preferred_account_and_clears_sessions() {
         let fixture = crate::runtime::tests::ServerFixture::new().await;
@@ -2529,42 +2468,10 @@ async fn admin_get_internal_error_log_disk_size() -> impl IntoResponse {
     }
 }
 
-#[derive(Deserialize)]
-struct SetDataDirRequest {
-    path: String,
-}
-
-async fn admin_set_data_dir(
-    Json(payload): Json<SetDataDirRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let path = payload.path;
-    let new_path = tokio::task::spawn_blocking(move || {
-        crate::modules::account::migrate_data_dir(std::path::PathBuf::from(path))
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(Json(crate::modules::account::format_data_dir_path(
-        &new_path,
-    )))
-}
-
 // --- User Token Handlers ---
 
 async fn admin_list_user_tokens() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let tokens = crate::commands::user_token::list_user_tokens()
+    let tokens = crate::modules::user_token::list_user_tokens()
         .await
         .map_err(|e| {
             (
@@ -2577,7 +2484,7 @@ async fn admin_list_user_tokens() -> Result<impl IntoResponse, (StatusCode, Json
 
 async fn admin_get_user_token_summary(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let summary = crate::commands::user_token::get_user_token_summary()
+    let summary = crate::modules::user_token::get_user_token_summary()
         .await
         .map_err(|e| {
             (
@@ -2589,9 +2496,9 @@ async fn admin_get_user_token_summary(
 }
 
 async fn admin_create_user_token(
-    Json(payload): Json<crate::commands::user_token::CreateTokenRequest>,
+    Json(payload): Json<crate::modules::user_token::CreateTokenRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let token = crate::commands::user_token::create_user_token(payload)
+    let token = crate::modules::user_token::create_user_token(payload)
         .await
         .map_err(|e| {
             (
@@ -2612,7 +2519,7 @@ async fn admin_renew_user_token(
     Path(id): Path<String>,
     Json(payload): Json<RenewTokenRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::commands::user_token::renew_user_token(id, payload.expires_type)
+    crate::modules::user_token::renew_user_token(id, payload.expires_type)
         .await
         .map_err(|e| {
             (
@@ -2626,7 +2533,7 @@ async fn admin_renew_user_token(
 async fn admin_delete_user_token(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::commands::user_token::delete_user_token(id)
+    crate::modules::user_token::delete_user_token(id)
         .await
         .map_err(|e| {
             (
@@ -2639,9 +2546,9 @@ async fn admin_delete_user_token(
 
 async fn admin_update_user_token(
     Path(id): Path<String>,
-    Json(payload): Json<crate::commands::user_token::UpdateTokenRequest>,
+    Json(payload): Json<crate::modules::user_token::UpdateTokenRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::commands::user_token::update_user_token(id, payload)
+    crate::modules::user_token::update_user_token(id, payload)
         .await
         .map_err(|e| {
             (
@@ -2652,70 +2559,8 @@ async fn admin_update_user_token(
     Ok(StatusCode::OK)
 }
 
-async fn admin_should_check_updates() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
-{
-    let settings = crate::modules::update_checker::load_update_settings().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    let should = crate::modules::update_checker::should_check_for_updates(&settings);
-    Ok(Json(should))
-}
-
-async fn admin_get_antigravity_path() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
-{
-    let path = crate::commands::get_antigravity_path(Some(true))
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-    Ok(Json(path))
-}
-
-async fn admin_get_antigravity_args() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
-{
-    let args = crate::commands::get_antigravity_args().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(Json(args))
-}
-
-async fn admin_clear_antigravity_cache(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res = crate::commands::clear_antigravity_cache()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-    Ok(Json(res))
-}
-
-async fn admin_get_antigravity_cache_paths(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let res = crate::commands::get_antigravity_cache_paths()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-    Ok(Json(res))
-}
-
 async fn admin_clear_log_cache() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::commands::clear_log_cache().await.map_err(|e| {
+    crate::modules::logger::clear_logs().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { error: e }),
@@ -2969,69 +2814,6 @@ async fn admin_clear_token_stats() -> impl IntoResponse {
     }
 }
 
-async fn admin_get_update_settings() -> impl IntoResponse {
-    // 從真實模組加載設置
-    match crate::modules::update_checker::load_update_settings() {
-        Ok(s) => Json(serde_json::to_value(s).unwrap_or_default()),
-        Err(_) => Json(serde_json::json!({
-            "auto_check": true,
-            "last_check_time": 0,
-            "check_interval_hours": 24
-        })),
-    }
-}
-
-async fn admin_check_for_updates() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let info = crate::modules::update_checker::check_for_updates()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-    Ok(Json(info))
-}
-
-async fn admin_update_last_check_time(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::modules::update_checker::update_last_check_time().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(StatusCode::OK)
-}
-
-async fn admin_save_update_settings(Json(settings): Json<serde_json::Value>) -> impl IntoResponse {
-    if let Ok(s) =
-        serde_json::from_value::<crate::modules::update_checker::UpdateSettings>(settings)
-    {
-        let _ = crate::modules::update_checker::save_update_settings(&s);
-        StatusCode::OK
-    } else {
-        StatusCode::BAD_REQUEST
-    }
-}
-
-async fn admin_is_auto_launch_enabled() -> impl IntoResponse {
-    // 进程自启动由服务器的进程管理器配置。
-    // For now, return false in Web mode.
-    Json(false)
-}
-
-async fn admin_toggle_auto_launch(Json(_payload): Json<serde_json::Value>) -> impl IntoResponse {
-    // 进程自启动由服务器的进程管理器配置。
-    StatusCode::NOT_IMPLEMENTED
-}
-
-async fn admin_get_http_api_settings() -> impl IntoResponse {
-    Json(serde_json::json!({ "enabled": true, "port": 8045 }))
-}
-
-// [整合清理] 冗餘導入已移除
-
 #[derive(Deserialize)]
 struct BulkDeleteRequest {
     #[serde(rename = "accountIds")]
@@ -3184,19 +2966,21 @@ async fn admin_toggle_proxy_status(
 
 async fn admin_warm_up_all_accounts() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
 {
-    let result = crate::commands::warm_up_all_accounts().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
+    let result = crate::modules::quota::warm_up_all_accounts()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
     Ok(Json(result))
 }
 
 async fn admin_warm_up_account(
     Path(account_id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let result = crate::commands::warm_up_account(account_id)
+    let result = crate::modules::quota::warm_up_account(&account_id)
         .await
         .map_err(|e| {
             (
@@ -3206,159 +2990,6 @@ async fn admin_warm_up_account(
         })?;
     Ok(Json(result))
 }
-
-async fn admin_save_http_api_settings(
-    Json(payload): Json<crate::modules::http_api::HttpApiSettings>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::modules::http_api::save_settings(&payload).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(StatusCode::OK)
-}
-
-// Cloudflared Handlers
-async fn admin_cloudflared_get_status(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .cloudflared_state
-        .ensure_manager()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-
-    let lock = state.cloudflared_state.manager.read().await;
-    if let Some(manager) = lock.as_ref() {
-        let (installed, version) = manager.check_installed().await;
-        let mut status = manager.get_status().await;
-        status.installed = installed;
-        status.version = version;
-        if !installed {
-            status.running = false;
-            status.url = None;
-        }
-        Ok(Json(status))
-    } else {
-        Ok(Json(
-            crate::modules::cloudflared::CloudflaredStatus::default(),
-        ))
-    }
-}
-
-async fn admin_cloudflared_install(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .cloudflared_state
-        .ensure_manager()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-
-    let lock = state.cloudflared_state.manager.read().await;
-    if let Some(manager) = lock.as_ref() {
-        let status = manager.install().await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-        Ok(Json(status))
-    } else {
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Manager not initialized".to_string(),
-            }),
-        ))
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CloudflaredStartRequest {
-    config: crate::modules::cloudflared::CloudflaredConfig,
-}
-
-async fn admin_cloudflared_start(
-    State(state): State<AppState>,
-    Json(payload): Json<CloudflaredStartRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .cloudflared_state
-        .ensure_manager()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-
-    let lock = state.cloudflared_state.manager.read().await;
-    if let Some(manager) = lock.as_ref() {
-        let status = manager.start(payload.config).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-        Ok(Json(status))
-    } else {
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Manager not initialized".to_string(),
-            }),
-        ))
-    }
-}
-
-async fn admin_cloudflared_stop(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .cloudflared_state
-        .ensure_manager()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-
-    let lock = state.cloudflared_state.manager.read().await;
-    if let Some(manager) = lock.as_ref() {
-        let status = manager.stop().await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-        Ok(Json(status))
-    } else {
-        Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Manager not initialized".to_string(),
-            }),
-        ))
-    }
-}
-
-// --- Supplementary Account Handlers ---
 
 async fn admin_get_device_profiles(
     State(_state): State<AppState>,
@@ -3486,20 +3117,6 @@ async fn admin_delete_device_version(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn admin_open_folder() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // Note: In Web mode, this may not actually open a local folder unless the backend handles it.
-    // For ABV_Refactor, the backend should use opener to open it on the server (the desktop).
-    crate::commands::open_data_folder().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(StatusCode::OK)
-}
-
-// --- Import Handlers ---
-
 async fn admin_import_v1_accounts(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -3524,232 +3141,6 @@ async fn admin_import_v1_accounts(
         .map(|a| to_account_response(a, &current_id))
         .collect();
     Ok(Json(responses))
-}
-
-async fn admin_import_from_db(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let account = migration::import_from_db(None).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-
-    // [FIX #820] 导入后清除过期的会话绑定
-    state.token_manager.clear_all_sessions();
-
-    // [FIX #1166] 导入后立即加载
-    let _ = state.token_manager.load_accounts().await;
-
-    let current_id = state.account_service.get_current_id().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(Json(to_account_response(&account, &current_id)))
-}
-
-#[derive(Deserialize)]
-struct CustomDbRequest {
-    path: String,
-}
-
-async fn admin_import_custom_db(
-    State(state): State<AppState>,
-    Json(payload): Json<CustomDbRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    // [SECURITY] 禁止目录遍历
-    if payload.path.contains("..") {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "非法路径: 不允许目录遍历".to_string(),
-            }),
-        ));
-    }
-
-    let account = migration::import_from_custom_db_path(payload.path)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-
-    // [FIX #820] 导入后清除过期的会话绑定
-    state.token_manager.clear_all_sessions();
-
-    // [FIX #1166] 导入后立即加载
-    let _ = state.token_manager.load_accounts().await;
-
-    let current_id = state.account_service.get_current_id().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(Json(to_account_response(&account, &current_id)))
-}
-
-async fn admin_sync_account_from_db(
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let index = account::load_account_index().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    let current_target = index.current_target_ide.as_deref();
-    if current_target == Some("agy") {
-        return Ok(Json(None));
-    }
-
-    // 逻辑参考自 sync_account_from_db command
-    let db_refresh_token = match migration::get_refresh_token_from_db(current_target) {
-        Ok(token) => token,
-        Err(_e) => {
-            return Ok(Json(None));
-        }
-    };
-    let curr_account = account::get_current_account().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-
-    if let Some(acc) = curr_account {
-        if acc.token.refresh_token == db_refresh_token {
-            return Ok(Json(None));
-        }
-    }
-
-    let account = migration::import_from_db(current_target)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
-
-    let account_id = account.id.clone();
-    account::set_current_account_id_with_target(&account_id, current_target).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-
-    // [FIX #820] 同步后清除过期的会话绑定
-    state.token_manager.clear_all_sessions();
-
-    // [FIX #1166] 同步后立即重新加载 TokenManager
-    let _ = state.token_manager.load_accounts().await;
-
-    let current_id = state.account_service.get_current_id().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(Json(Some(to_account_response(&account, &current_id))))
-}
-
-// --- CLI Sync Handlers ---
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CliSyncStatusRequest {
-    app_type: crate::proxy::cli_sync::CliApp,
-    proxy_url: String,
-}
-
-async fn admin_get_cli_sync_status(
-    Json(payload): Json<CliSyncStatusRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::cli_sync::get_cli_sync_status(payload.app_type, payload.proxy_url)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CliSyncRequest {
-    app_type: crate::proxy::cli_sync::CliApp,
-    proxy_url: String,
-    api_key: String,
-    pub model: Option<String>,
-}
-
-async fn admin_execute_cli_sync(
-    Json(payload): Json<CliSyncRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::cli_sync::execute_cli_sync(
-        payload.app_type,
-        payload.proxy_url,
-        payload.api_key,
-        payload.model,
-    )
-    .await
-    .map(|_| StatusCode::OK)
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CliRestoreRequest {
-    app_type: crate::proxy::cli_sync::CliApp,
-}
-
-async fn admin_execute_cli_restore(
-    Json(payload): Json<CliRestoreRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::cli_sync::execute_cli_restore(payload.app_type)
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CliConfigContentRequest {
-    app_type: crate::proxy::cli_sync::CliApp,
-    file_name: Option<String>,
-}
-
-async fn admin_get_cli_config_content(
-    Json(payload): Json<CliConfigContentRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::cli_sync::get_cli_config_content(payload.app_type, payload.file_name)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
 }
 
 #[derive(Deserialize)]
@@ -4379,30 +3770,6 @@ async fn admin_clear_debug_console_logs() -> impl IntoResponse {
     StatusCode::OK
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpencodeSyncStatusRequest {
-    proxy_url: String,
-}
-
-async fn admin_get_opencode_sync_status(
-    Json(payload): Json<OpencodeSyncStatusRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::opencode_sync::get_opencode_sync_status(payload.proxy_url)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-async fn admin_get_opencode_families() -> impl IntoResponse {
-    Json(crate::proxy::opencode_sync::get_canonical_families())
-}
-
 async fn admin_get_proxy_models(State(state): State<AppState>) -> impl IntoResponse {
     let only_raw = *state.only_raw_quota_models.read().await;
     Json(
@@ -4413,436 +3780,6 @@ async fn admin_get_proxy_models(State(state): State<AppState>) -> impl IntoRespo
         )
         .await,
     )
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpencodeSyncRequest {
-    proxy_url: String,
-    api_key: String,
-    #[serde(default)]
-    sync_accounts: bool,
-    pub models: Option<Vec<crate::proxy::opencode_sync::ModelInput>>,
-}
-
-async fn admin_execute_opencode_sync(
-    Json(payload): Json<OpencodeSyncRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::opencode_sync::execute_opencode_sync(
-        payload.proxy_url,
-        payload.api_key,
-        Some(payload.sync_accounts),
-        payload.models,
-    )
-    .await
-    .map(|_| StatusCode::OK)
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpencodeOpenaiSyncRequest {
-    proxy_url: String,
-    api_key: String,
-    #[serde(default)]
-    provider_id: Option<String>,
-    #[serde(default)]
-    provider_name: Option<String>,
-    models: Option<Vec<crate::proxy::opencode_sync::ModelInput>>,
-}
-
-async fn admin_execute_opencode_openai_sync(
-    Json(payload): Json<OpencodeOpenaiSyncRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::opencode_sync::execute_opencode_openai_sync(
-        payload.proxy_url,
-        payload.api_key,
-        payload.provider_id,
-        payload.provider_name,
-        payload.models,
-    )
-    .await
-    .map(|_| StatusCode::OK)
-    .map_err(|e| {
-        let status = if crate::proxy::opencode_sync::is_provider_validation_error(&e) {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::INTERNAL_SERVER_ERROR
-        };
-        (status, Json(ErrorResponse { error: e }))
-    })
-}
-
-async fn admin_get_opencode_providers(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::opencode_sync::get_opencode_providers()
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpencodeRemoveProviderRequest {
-    provider_id: String,
-}
-
-async fn admin_execute_opencode_remove_provider(
-    Json(payload): Json<OpencodeRemoveProviderRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::opencode_sync::execute_opencode_remove_provider(payload.provider_id)
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
-            let status = if crate::proxy::opencode_sync::is_provider_validation_error(&e) {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(ErrorResponse { error: e }))
-        })
-}
-
-async fn admin_execute_opencode_restore(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::opencode_sync::execute_opencode_restore()
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GetOpencodeConfigRequest {
-    file_name: Option<String>,
-}
-
-async fn admin_get_opencode_config_content(
-    Json(payload): Json<GetOpencodeConfigRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let file_name = payload.file_name;
-    tokio::task::spawn_blocking(move || {
-        crate::proxy::opencode_sync::read_opencode_config_content(file_name)
-    })
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?
-    .map(Json)
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpencodeClearRequest {
-    proxy_url: Option<String>,
-    clear_legacy: Option<bool>,
-}
-
-async fn admin_execute_opencode_clear(
-    Json(payload): Json<OpencodeClearRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::opencode_sync::execute_opencode_clear(payload.proxy_url, payload.clear_legacy)
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-// ── Hermes Agent Sync Admin Handlers ──
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HermesSyncStatusRequest {
-    #[serde(default)]
-    proxy_url: Option<String>,
-}
-
-async fn admin_get_hermes_sync_status(
-    Json(payload): Json<HermesSyncStatusRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::hermes_sync::get_hermes_sync_status(payload.proxy_url)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HermesSyncRequest {
-    proxy_url: String,
-    api_key: String,
-    discover_models: bool,
-    #[serde(default)]
-    models: Vec<String>,
-    #[serde(default)]
-    activate: bool,
-    #[serde(default)]
-    default_model: Option<String>,
-}
-
-async fn admin_execute_hermes_sync(
-    Json(payload): Json<HermesSyncRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::hermes_sync::execute_hermes_sync(
-        payload.proxy_url,
-        payload.api_key,
-        payload.discover_models,
-        payload.models,
-        payload.activate,
-        payload.default_model,
-    )
-    .await
-    .map(|_| StatusCode::OK)
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })
-}
-
-async fn admin_execute_hermes_restore(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::hermes_sync::execute_hermes_restore()
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-async fn admin_execute_hermes_clear() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)>
-{
-    crate::proxy::hermes_sync::execute_hermes_clear()
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-async fn admin_get_hermes_config_content(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::hermes_sync::get_hermes_config_content()
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-// ── OpenClaw Sync Admin Handlers ──
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpenClawSyncStatusRequest {
-    #[serde(default)]
-    proxy_url: Option<String>,
-}
-
-async fn admin_get_openclaw_sync_status(
-    Json(payload): Json<OpenClawSyncStatusRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::openclaw_sync::get_openclaw_sync_status(payload.proxy_url)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OpenClawSyncRequest {
-    proxy_url: String,
-    api_key: String,
-    #[serde(default = "default_openclaw_target_version")]
-    target_version: String,
-    #[serde(default)]
-    models: Vec<String>,
-    #[serde(default)]
-    activate: bool,
-    #[serde(default)]
-    default_model: Option<String>,
-}
-
-fn default_openclaw_target_version() -> String {
-    "v2".to_string()
-}
-
-async fn admin_execute_openclaw_sync(
-    Json(payload): Json<OpenClawSyncRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::openclaw_sync::execute_openclaw_sync(
-        payload.proxy_url,
-        payload.api_key,
-        payload.target_version,
-        payload.models,
-        payload.activate,
-        payload.default_model,
-    )
-    .await
-    .map(|_| StatusCode::OK)
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })
-}
-
-async fn admin_execute_openclaw_restore(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::openclaw_sync::execute_openclaw_restore()
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-async fn admin_execute_openclaw_clear(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::openclaw_sync::execute_openclaw_clear()
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-async fn admin_get_openclaw_config_content(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::openclaw_sync::get_openclaw_config_content()
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-// ── Droid (Factory CLI) Sync Admin Handlers ──
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DroidSyncStatusRequest {
-    proxy_url: String,
-}
-
-async fn admin_get_droid_sync_status(
-    Json(payload): Json<DroidSyncStatusRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::droid_sync::get_droid_sync_status(payload.proxy_url)
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DroidSyncRequest {
-    custom_models: Vec<serde_json::Value>,
-}
-
-async fn admin_execute_droid_sync(
-    Json(payload): Json<DroidSyncRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::droid_sync::execute_droid_sync(payload.custom_models)
-        .await
-        .map(|count| Json(serde_json::json!({ "added": count })))
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-async fn admin_execute_droid_restore(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::droid_sync::execute_droid_restore()
-        .await
-        .map(|_| StatusCode::OK)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
-}
-
-async fn admin_get_droid_config_content(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    crate::proxy::droid_sync::get_droid_config_content()
-        .await
-        .map(Json)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })
 }
 
 #[cfg(test)]

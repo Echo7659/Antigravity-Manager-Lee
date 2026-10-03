@@ -116,82 +116,6 @@ mod tests {
     }
 
     #[test]
-    fn test_migrate_data_dir_rename_and_copy() {
-        let _guard = TEST_MUTEX.lock().unwrap();
-
-        let previous_env = std::env::var("ABV_DATA_DIR").ok();
-        let previous_pointer_env = std::env::var("ABV_DATA_DIR_POINTER_FILE").ok();
-
-        // 记录真实家目录指针，结尾断言它自始至终没被改动。
-        // 背景：`migrate_data_dir` 会写数据目录指针。如果测试让它写到真实的
-        // `~/.antigravity_tools_location`，那么测试一旦被中断（Ctrl-C / 超时 /
-        // 进程被杀），恢复逻辑不会执行，用户的数据目录就会被永久指向 /tmp 下的
-        // 临时目录 —— 应用下次启动会读到空数据目录，表现为「账号全部消失」。
-        let real_pointer = dirs::home_dir()
-            .expect("home")
-            .join(".antigravity_tools_location");
-        let real_pointer_before = fs::read_to_string(&real_pointer).ok();
-
-        let src = TestDataDir::new();
-        fs::write(src.path().join("marker.txt"), "hello").unwrap();
-
-        let dest_parent = TestDataDir::new();
-        let dest = dest_parent.path().join("moved_data");
-        // 指针文件也放进临时目录（复用已存在的 dest_parent，避免多建一个
-        // 时间戳目录而可能与 src 撞名）
-        let pointer_path = dest_parent.path().join("location");
-
-        std::env::set_var("ABV_DATA_DIR", src.path());
-        std::env::set_var("ABV_DATA_DIR_POINTER_FILE", &pointer_path);
-
-        let restore = || {
-            match &previous_env {
-                Some(value) => std::env::set_var("ABV_DATA_DIR", value),
-                None => std::env::remove_var("ABV_DATA_DIR"),
-            }
-            match &previous_pointer_env {
-                Some(value) => std::env::set_var("ABV_DATA_DIR_POINTER_FILE", value),
-                None => std::env::remove_var("ABV_DATA_DIR_POINTER_FILE"),
-            }
-            if let Ok(mut guard) = data_dir_override_slot().write() {
-                *guard = None;
-            }
-        };
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let resolved = migrate_data_dir(dest.clone()).unwrap();
-            assert!(resolved.join("marker.txt").exists());
-            assert!(!src.path().join("marker.txt").exists());
-            assert_eq!(
-                fs::read_to_string(resolved.join("marker.txt")).unwrap(),
-                "hello"
-            );
-            let shown = format_data_dir_path(&resolved);
-            assert!(
-                !shown.contains(r"\\?\"),
-                "migrated path must not keep Windows verbatim prefix: {shown}"
-            );
-            // 指针必须写在被重定向后的临时位置
-            assert_eq!(
-                fs::read_to_string(&pointer_path).unwrap().trim(),
-                format_data_dir_path(&resolved)
-            );
-        }));
-
-        let real_pointer_after = fs::read_to_string(&real_pointer).ok();
-        restore();
-
-        assert_eq!(
-            real_pointer_before, real_pointer_after,
-            "测试污染了真实的 ~/.antigravity_tools_location！"
-        );
-
-        if let Err(panic) = result {
-            std::panic::resume_unwind(panic);
-        }
-    }
-
-    #[test]
     fn test_load_account_index_with_bom_prefix() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let dir = TestDataDir::new();
@@ -429,7 +353,7 @@ mod tests {
     fn test_set_current_account_id_with_target() {
         let _guard = TEST_MUTEX.lock().unwrap();
         let dir = TestDataDir::new();
-        std::env::set_var("ABV_DATA_DIR", dir.path());
+        unsafe { std::env::set_var("ABV_DATA_DIR", dir.path()) };
 
         // Create a dummy account index with some accounts
         let now = chrono::Utc::now().timestamp();
@@ -467,7 +391,7 @@ mod tests {
         assert_eq!(index.current_target_ide, None);
 
         // Clean up environment variable
-        std::env::remove_var("ABV_DATA_DIR");
+        unsafe { std::env::remove_var("ABV_DATA_DIR") };
     }
 
     #[test]
@@ -555,7 +479,7 @@ mod tests {
         let dir = TestDataDir::new();
         let account_id = "live-limit-account";
         create_account_file(dir.path(), account_id, "live-limit@example.com");
-        std::env::set_var("ABV_DATA_DIR", dir.path());
+        unsafe { std::env::set_var("ABV_DATA_DIR", dir.path()) };
 
         let now = chrono::Utc::now().timestamp();
         let mut account = load_account(account_id).unwrap();
@@ -616,7 +540,7 @@ mod tests {
             .live_limited_models
             .contains_key("gemini-3.1-flash-image"));
         assert!(!updated.live_limited_models.contains_key("gemini-2.5-pro"));
-        std::env::remove_var("ABV_DATA_DIR");
+        unsafe { std::env::remove_var("ABV_DATA_DIR") };
     }
 
     #[test]
@@ -689,12 +613,6 @@ const DATA_DIR: &str = ".antigravity_tools";
 const LOCATION_POINTER_FILE: &str = ".antigravity_tools_location";
 const ACCOUNTS_INDEX: &str = "accounts.json";
 const ACCOUNTS_DIR: &str = "accounts";
-const DATA_DIR_POINTER_FILE: &str = "data_dir.txt";
-
-/// 获取数据目录自举指针文件路径（保存在系统标准配置目录下）
-pub fn get_data_dir_pointer_file() -> Option<PathBuf> {
-    dirs::config_dir().map(|p| p.join("antigravity-tools").join(DATA_DIR_POINTER_FILE))
-}
 
 static DATA_DIR_OVERRIDE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
 
@@ -706,10 +624,7 @@ fn data_dir_override_slot() -> &'static RwLock<Option<PathBuf>> {
 ///
 /// 可用 `ABV_DATA_DIR_POINTER_FILE` 覆盖（测试 / Docker 用）。
 ///
-/// 为什么必须支持覆盖：单元测试会调用 `migrate_data_dir`，它经由 `apply_data_dir`
-/// 写入这个指针。若指针固定指向真实的 `~/.antigravity_tools_location`，那么测试一旦
-/// 被中断（Ctrl-C、超时、崩溃、进程被杀），恢复逻辑就不会执行，指针会被永久留在
-/// 临时目录上 —— 应用下次启动就会读到一个空的数据目录，表现为「账号全部消失」。
+/// 服务器只读取已有指针，不重写路径或迁移目录。
 fn location_pointer_path() -> Result<PathBuf, String> {
     if let Ok(custom) = std::env::var("ABV_DATA_DIR_POINTER_FILE") {
         let trimmed = custom.trim();
@@ -784,42 +699,6 @@ pub fn format_data_dir_path(path: &Path) -> String {
     normalize_data_dir_path(path).to_string_lossy().into_owned()
 }
 
-fn resolve_existing_path(path: &Path) -> PathBuf {
-    let normalized = normalize_data_dir_path(path);
-    match normalized.canonicalize() {
-        Ok(canon) => normalize_data_dir_path(canon),
-        Err(_) => normalized,
-    }
-}
-
-fn path_compare_key(path: &Path) -> String {
-    let mut s = resolve_existing_path(path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    while s.len() > 1 && s.ends_with('/') {
-        s.pop();
-    }
-    #[cfg(windows)]
-    {
-        s = s.to_ascii_lowercase();
-    }
-    s
-}
-
-fn paths_equivalent(a: &Path, b: &Path) -> bool {
-    path_compare_key(a) == path_compare_key(b)
-}
-
-fn is_nested_data_dir(inner: &Path, outer: &Path) -> bool {
-    let inner_key = path_compare_key(inner);
-    let outer_key = path_compare_key(outer);
-    inner_key != outer_key && inner_key.starts_with(&(outer_key + "/"))
-}
-
-fn persist_clean_env(dir: &Path) {
-    std::env::set_var("ABV_DATA_DIR", format_data_dir_path(dir));
-}
-
 fn read_location_pointer() -> Option<PathBuf> {
     let path = location_pointer_path().ok()?;
     let content = fs::read_to_string(path).ok()?;
@@ -828,77 +707,16 @@ fn read_location_pointer() -> Option<PathBuf> {
         return None;
     }
     let cleaned = normalize_data_dir_path(trimmed);
-    if format_data_dir_path(&cleaned) != trimmed {
-        let _ = write_location_pointer(&cleaned);
-    }
     Some(cleaned)
-}
-
-fn write_location_pointer(dir: &Path) -> Result<(), String> {
-    let pointer = location_pointer_path()?;
-    fs::write(&pointer, format_data_dir_path(dir).as_bytes())
-        .map_err(|e| format!("写入数据目录指针失败: {}", e))
-}
-
-fn is_default_data_dir(dir: &Path) -> bool {
-    default_data_dir()
-        .map(|d| paths_equivalent(&d, dir) || d == dir)
-        .unwrap_or(false)
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::create_dir_all(dst).map_err(|e| format!("创建目标数据目录失败: {}", e))?;
-    for entry in fs::read_dir(src).map_err(|e| format!("读取原数据目录失败: {}", e))? {
-        let entry = entry.map_err(|e| format!("读取数据目录项失败: {}", e))?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("读取数据目录项类型失败: {}", e))?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else {
-            if let Some(parent) = to.parent() {
-                fs::create_dir_all(parent).map_err(|e| format!("创建目标子目录失败: {}", e))?;
-            }
-            fs::copy(&from, &to).map_err(|e| format!("复制文件失败 {}: {}", from.display(), e))?;
-        }
-    }
-    Ok(())
-}
-
-fn dir_is_empty(path: &Path) -> Result<bool, String> {
-    let mut entries = fs::read_dir(path).map_err(|e| format!("读取目标目录失败: {}", e))?;
-    Ok(entries.next().is_none())
-}
-
-fn apply_data_dir(dir: &Path) -> Result<(), String> {
-    let dir = normalize_data_dir_path(dir);
-    ensure_dir(&dir)?;
-    if is_default_data_dir(&dir) {
-        if let Ok(pointer) = location_pointer_path() {
-            let _ = fs::remove_file(pointer);
-        }
-    } else {
-        write_location_pointer(&dir)?;
-    }
-    if let Ok(mut guard) = data_dir_override_slot().write() {
-        *guard = Some(dir.clone());
-    }
-    persist_clean_env(&dir);
-    Ok(())
 }
 
 /// Get data directory path
 pub fn get_data_dir() -> Result<PathBuf, String> {
-    // 1. Process env (tests, Docker, and in-process override after migrate)
+    // 显式环境变量优先于已有目录指针。
     if let Ok(env_path) = std::env::var("ABV_DATA_DIR") {
         if !env_path.trim().is_empty() {
             let data_dir = normalize_data_dir_path(&env_path);
             ensure_dir(&data_dir)?;
-            if format_data_dir_path(&data_dir) != env_path {
-                persist_clean_env(&data_dir);
-            }
             return Ok(data_dir);
         }
     }
@@ -925,56 +743,6 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
     let data_dir = default_data_dir()?;
     ensure_dir(&data_dir)?;
     Ok(data_dir)
-}
-
-/// Move the data directory to `new_dir`, persist the location, and switch all runtime lookups.
-pub fn migrate_data_dir(new_dir: PathBuf) -> Result<PathBuf, String> {
-    let new_dir = normalize_data_dir_path(new_dir);
-    let new_dir = if new_dir.as_os_str().is_empty() {
-        return Err("目标数据目录不能为空".to_string());
-    } else if new_dir.is_absolute() {
-        new_dir
-    } else {
-        std::env::current_dir()
-            .map_err(|e| format!("无法解析相对路径: {}", e))?
-            .join(new_dir)
-    };
-
-    let old_dir = normalize_data_dir_path(get_data_dir()?);
-    if paths_equivalent(&old_dir, &new_dir) {
-        apply_data_dir(&old_dir)?;
-        return Ok(resolve_existing_path(&old_dir));
-    }
-
-    if is_nested_data_dir(&new_dir, &old_dir) {
-        return Err("不能把数据目录迁移到自身内部".to_string());
-    }
-
-    if new_dir.exists() {
-        if new_dir.is_file() {
-            return Err("目标路径已存在且不是目录".to_string());
-        }
-        if !dir_is_empty(&new_dir)? {
-            return Err("目标目录不是空文件夹，请选择空目录或新路径".to_string());
-        }
-        copy_dir_recursive(&old_dir, &new_dir)?;
-        let _ = fs::remove_dir_all(&old_dir);
-    } else if let Some(parent) = new_dir.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建目标父目录失败: {}", e))?;
-        match fs::rename(&old_dir, &new_dir) {
-            Ok(()) => {}
-            Err(_) => {
-                copy_dir_recursive(&old_dir, &new_dir)?;
-                let _ = fs::remove_dir_all(&old_dir);
-            }
-        }
-    } else {
-        return Err("目标路径无效".to_string());
-    }
-
-    let resolved = resolve_existing_path(&new_dir);
-    apply_data_dir(&resolved)?;
-    Ok(resolved)
 }
 
 /// Get accounts directory path
@@ -1541,132 +1309,6 @@ pub fn reorder_accounts(account_ids: &[String]) -> Result<(), String> {
     save_account_index(&index)
 }
 
-/// Switch current account (Core Logic)
-pub async fn switch_account(
-    account_id: &str,
-    target_ide: Option<&str>,
-    integration: &(impl modules::integration::SystemIntegration + ?Sized),
-) -> Result<(), String> {
-    use crate::modules::oauth;
-
-    let index = {
-        let _lock = ACCOUNT_INDEX_LOCK
-            .lock()
-            .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
-        load_account_index()?
-    };
-
-    // 1. Verify account exists
-    if !index.accounts.iter().any(|s| s.id == account_id) {
-        return Err(format!("Account not found: {}", account_id));
-    }
-
-    let mut account = load_account(account_id)?;
-    crate::modules::logger::log_info(&format!(
-        "Switching to account: {} (ID: {}) (target_ide: {:?})",
-        account.email, account.id, target_ide
-    ));
-
-    // 2. Ensure token is valid before switch. Surface clearer hints for known account-state failures.
-    let fresh_token = match oauth::ensure_fresh_token(&account.token, Some(&account.id)).await {
-        Ok(token) => token,
-        Err(e) => {
-            if is_account_access_blocked_message(&e) {
-                mark_validation_blocked(&mut account, &e);
-            }
-            return Err(format_switch_refresh_error(&e));
-        }
-    };
-
-    // If Token updated, save back to account file
-    if fresh_token.access_token != account.token.access_token {
-        account.token = fresh_token.clone();
-        save_account(&account)?;
-    }
-
-    ensure_enterprise_project_ready(&mut account).await?;
-
-    // [FIX] Ensure account has a device profile for isolation
-    if account.device_profile.is_none() {
-        crate::modules::logger::log_info(&format!(
-            "Account {} has no bound fingerprint, generating new one for isolation...",
-            account.email
-        ));
-        let new_profile = modules::device::generate_profile();
-        apply_profile_to_account(
-            &mut account,
-            new_profile.clone(),
-            Some("auto_generated".to_string()),
-            true,
-        )?;
-    }
-
-    // 3. Execute platform-specific system integration (Close proc, Inject DB, Start proc, etc.)
-    integration.on_account_switch(&account, target_ide).await?;
-
-    // 4. Update tool internal state
-    set_current_account_id_with_target(account_id, target_ide)?;
-
-    account.update_last_used();
-    save_account(&account)?;
-
-    crate::modules::logger::log_info(&format!(
-        "Account switch core logic completed: {}",
-        account.email
-    ));
-
-    Ok(())
-}
-
-fn is_enterprise_client(client_key: Option<&str>) -> bool {
-    client_key
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(|key| key.eq_ignore_ascii_case("antigravity_enterprise"))
-        .unwrap_or(false)
-}
-
-fn normalize_project_id(project_id: Option<&str>) -> Option<String> {
-    project_id
-        .map(str::trim)
-        .filter(|pid| !pid.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-async fn ensure_enterprise_project_ready(account: &mut Account) -> Result<(), String> {
-    if !is_enterprise_client(account.token.oauth_client_key.as_deref()) {
-        return Ok(());
-    }
-
-    if normalize_project_id(account.token.project_id.as_deref()).is_some() {
-        return Ok(());
-    }
-
-    crate::modules::logger::log_warn(&format!(
-        "Account {} is using enterprise OAuth client but missing project_id. Trying to resolve before switch...",
-        account.email
-    ));
-
-    match crate::proxy::project_resolver::fetch_project_id(&account.token.access_token).await {
-        Ok(project_id) => {
-            crate::modules::logger::log_info(&format!(
-                "Resolved enterprise project_id for {}: {}",
-                account.email, project_id
-            ));
-            account.token.project_id = Some(project_id);
-            save_account(account)?;
-            Ok(())
-        }
-        Err(e) => {
-            crate::modules::logger::log_warn(&format!(
-                "Account {} is currently missing enterprise project_id and auto-resolve failed ({}). Allowing switch to proceed, but certain enterprise features may be limited.",
-                account.email, e
-            ));
-            Ok(())
-        }
-    }
-}
-
 fn is_rate_limit_error(err: &crate::error::AppError) -> bool {
     match err {
         crate::error::AppError::Network(_, Some(status)) => *status == 429,
@@ -1709,55 +1351,6 @@ fn is_validation_required_error(err: &crate::error::AppError) -> bool {
         || text.contains("validation required")
 }
 
-fn is_account_access_blocked_message(message: &str) -> bool {
-    let text = message.to_lowercase();
-    text.contains("verify your account")
-        || text.contains("further action is required")
-        || text.contains("validation_url")
-        || text.contains("appeal_url")
-        || text.contains("validation required")
-        || text.contains("unauthorized_client")
-        || text.contains("invalid_client")
-        || text.contains("invalid_grant")
-        || text.contains("resource_exhausted")
-        || text.contains("resource has been exhausted")
-}
-
-fn format_switch_refresh_error(message: &str) -> String {
-    let lower = message.to_lowercase();
-
-    if lower.contains("unauthorized_client")
-        || lower.contains("invalid_client")
-        || lower.contains("invalid_grant")
-    {
-        return format!(
-            "Token refresh failed: OAuth client is not authorized for this account. Please sign in again in Antigravity-Manager and complete authorization/verification. Raw error: {}",
-            message
-        );
-    }
-
-    if lower.contains("verify your account")
-        || lower.contains("further action is required")
-        || lower.contains("validation_url")
-        || lower.contains("appeal_url")
-        || lower.contains("validation required")
-    {
-        return format!(
-            "Token refresh failed: account requires additional verification. Please finish verification in Antigravity, then retry account switch. Raw error: {}",
-            message
-        );
-    }
-
-    if lower.contains("resource_exhausted") || lower.contains("resource has been exhausted") {
-        return format!(
-            "Token refresh failed: account is rate-limited or temporarily restricted (RESOURCE_EXHAUSTED). Please retry later. Raw error: {}",
-            message
-        );
-    }
-
-    format!("Token refresh failed: {}", message)
-}
-
 fn format_rate_limit_block_reason(err: &crate::error::AppError) -> String {
     format!(
         "Account is temporarily rate-limited or risk-controlled (RESOURCE_EXHAUSTED). Please cool down and retry later. Raw error: {}",
@@ -1797,7 +1390,7 @@ fn clear_validation_blocked(account: &mut Account) {
     }
 }
 
-/// Get device profile info: current storage.json + account bound profile
+/// 返回账号指纹、历史版本和原始指纹。
 #[derive(Debug, Serialize)]
 pub struct DeviceProfiles {
     pub current_storage: Option<DeviceProfile>,
@@ -1807,27 +1400,22 @@ pub struct DeviceProfiles {
 }
 
 pub fn get_device_profiles(account_id: &str) -> Result<DeviceProfiles, String> {
-    // In headless/Docker mode, storage.json may not exist - handle gracefully
-    let current = crate::modules::device::get_storage_path(None)
-        .ok()
-        .and_then(|path| crate::modules::device::read_profile(&path).ok());
     let account = load_account(account_id)?;
     Ok(DeviceProfiles {
-        current_storage: current,
+        current_storage: None,
         bound_profile: account.device_profile.clone(),
         history: account.device_history.clone(),
         baseline: crate::modules::device::load_global_original(),
     })
 }
 
-/// Bind device profile and write to storage.json immediately
+/// 生成指纹并绑定到账号。
 pub fn bind_device_profile(account_id: &str, mode: &str) -> Result<DeviceProfile, String> {
     use crate::modules::device;
 
     let profile = match mode {
-        "capture" => device::read_profile(&device::get_storage_path(None)?)?,
         "generate" => device::generate_profile(),
-        _ => return Err("mode must be 'capture' or 'generate'".to_string()),
+        _ => return Err("mode must be 'generate'".to_string()),
     };
 
     let mut account = load_account(account_id)?;
@@ -1925,22 +1513,7 @@ pub fn delete_device_version(account_id: &str, version_id: &str) -> Result<(), S
     save_account(&account)?;
     Ok(())
 }
-/// Apply account bound device profile to storage.json
-pub fn apply_device_profile(account_id: &str) -> Result<DeviceProfile, String> {
-    use crate::modules::device;
-    let mut account = load_account(account_id)?;
-    let profile = account
-        .device_profile
-        .clone()
-        .ok_or("Account has no bound device profile")?;
-    let storage_path = device::get_storage_path(None)?;
-    device::write_profile(&storage_path, &profile)?;
-    account.update_last_used();
-    save_account(&account)?;
-    Ok(profile)
-}
-
-/// Restore earliest storage.json backup (approximate "original" state)
+/// 恢复当前账号保存的原始指纹。
 pub fn restore_original_device() -> Result<String, String> {
     if let Some(current_id) = get_current_account_id()? {
         if let Ok(mut account) = load_account(&current_id) {

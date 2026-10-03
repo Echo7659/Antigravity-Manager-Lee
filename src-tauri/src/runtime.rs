@@ -49,7 +49,6 @@ impl ServerRuntime {
             monitor,
             proxy_config.experimental.clone(),
             proxy_config.debug_logging.clone(),
-            Arc::new(crate::commands::cloudflared::CloudflaredState::new()),
             proxy_config.proxy_pool.clone(),
             proxy_config.only_raw_quota_models,
             proxy_config.image_scheduler.clone(),
@@ -65,8 +64,6 @@ impl ServerRuntime {
     pub async fn shutdown(mut self) {
         self.server.set_running(false).await;
         self.server.stop();
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.server.cloudflared_state.stop())
-            .await;
         self.server
             .token_manager
             .graceful_shutdown(Duration::from_secs(2))

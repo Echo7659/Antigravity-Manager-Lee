@@ -1,0 +1,14 @@
+[
+  ["GET", "/proxy/cloudflared/status"],
+  ["POST", "/proxy/opencode/status"],
+  ["GET", "/system/autostart/status"],
+  ["POST", "/system/updates/check"],
+  ["POST", "/system/open-folder"],
+  ["POST", "/accounts/import/db"],
+  ["POST", "/accounts/import/db-custom"],
+  ["POST", "/accounts/sync/db"],
+  ["POST", "/proxy/cli/status"],
+  ["POST", "/proxy/hermes/status"],
+  ["POST", "/proxy/openclaw/status"],
+  ["POST", "/proxy/droid/status"]
+]

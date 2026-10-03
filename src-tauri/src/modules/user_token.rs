@@ -22,16 +22,12 @@ pub struct UpdateTokenRequest {
     pub curfew_end: Option<Option<String>>,
 }
 
-// 命令实现
-
 /// 列出所有令牌
-#[tauri::command]
 pub async fn list_user_tokens() -> Result<Vec<UserToken>, String> {
     user_token_db::list_tokens()
 }
 
 /// 创建新令牌
-#[tauri::command]
 pub async fn create_user_token(request: CreateTokenRequest) -> Result<UserToken, String> {
     user_token_db::create_token(
         request.username,
@@ -45,7 +41,6 @@ pub async fn create_user_token(request: CreateTokenRequest) -> Result<UserToken,
 }
 
 /// 更新令牌
-#[tauri::command]
 pub async fn update_user_token(id: String, request: UpdateTokenRequest) -> Result<(), String> {
     user_token_db::update_token(
         &id,
@@ -59,19 +54,16 @@ pub async fn update_user_token(id: String, request: UpdateTokenRequest) -> Resul
 }
 
 /// 删除令牌
-#[tauri::command]
 pub async fn delete_user_token(id: String) -> Result<(), String> {
     user_token_db::delete_token(&id)
 }
 
 /// 续期令牌
-#[tauri::command]
 pub async fn renew_user_token(id: String, expires_type: String) -> Result<(), String> {
     user_token_db::renew_token(&id, &expires_type)
 }
 
 /// 获取令牌 IP 绑定
-#[tauri::command]
 pub async fn get_token_ip_bindings(token_id: String) -> Result<Vec<TokenIpBinding>, String> {
     user_token_db::get_token_ips(&token_id)
 }
@@ -85,7 +77,6 @@ pub struct UserTokenStats {
 }
 
 /// 获取简单的统计信息
-#[tauri::command]
 pub async fn get_user_token_summary() -> Result<UserTokenStats, String> {
     let tokens = user_token_db::list_tokens()?;
     let active_tokens = tokens.iter().filter(|t| t.enabled).count();

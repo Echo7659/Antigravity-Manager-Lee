@@ -1,4 +1,3 @@
-use crate::modules::cloudflared::CloudflaredConfig;
 use crate::proxy::ProxyConfig;
 use serde::{Deserialize, Serialize};
 
@@ -11,19 +10,8 @@ pub struct AppConfig {
     pub refresh_interval: i32, // minutes
     pub auto_sync: bool,
     pub sync_interval: i32, // minutes
-    pub default_export_path: Option<String>,
     #[serde(default)]
     pub proxy: ProxyConfig,
-    pub antigravity_executable: Option<String>, // [NEW] Manually specified Antigravity executable path
-    pub antigravity_ide_executable: Option<String>, // [NEW] Manually specified Antigravity IDE executable path
-    pub antigravity_cli_executable: Option<String>, // [NEW] Manually specified Antigravity CLI (agy) path
-    pub antigravity_args: Option<Vec<String>>,      // [NEW] Antigravity startup arguments
-    #[serde(default)]
-    pub auto_launch: bool,     // Launch on startup
-    /// Login-item launches stay in the tray. Missing values stay on so existing
-    /// autostart entries, which already pass `--minimized`, keep that behavior.
-    #[serde(default = "default_quiet_autostart")]
-    pub quiet_autostart: bool,
     #[serde(default)]
     pub scheduled_warmup: ScheduledWarmupConfig, // [NEW] Scheduled warmup configuration
     #[serde(default)]
@@ -35,19 +23,11 @@ pub struct AppConfig {
     #[serde(default)]
     pub hidden_menu_items: Vec<String>, // Hidden menu item path list
     #[serde(default)]
-    pub cloudflared: CloudflaredConfig, // [NEW] Cloudflared configuration
-    #[serde(default)]
-    pub lightweight_mode: bool, // [NEW] Lightweight mode: destroy webview on minimize/close to tray
-    #[serde(default)]
     pub suggestion_delete_thinking_store: Option<bool>, // [NEW] 建议删除历史思考块缓存开关
     #[serde(default)]
     pub thinking_cleanup_dismissed: Option<bool>, // [NEW] 用户是否已确认/忽略该建议
     #[serde(default)]
     pub dismissed_thinking_cleanup_version: Option<String>, // [NEW] 用户已确认或忽略建议的目标版本号
-}
-
-fn default_quiet_autostart() -> bool {
-    true
 }
 
 /// Scheduled warmup configuration
@@ -204,21 +184,12 @@ impl AppConfig {
             refresh_interval: 15,
             auto_sync: false,
             sync_interval: 5,
-            default_export_path: None,
             proxy: ProxyConfig::default(),
-            antigravity_executable: None,
-            antigravity_ide_executable: None,
-            antigravity_cli_executable: None,
-            antigravity_args: None,
-            auto_launch: false,
-            quiet_autostart: true,
             scheduled_warmup: ScheduledWarmupConfig::default(),
             quota_protection: QuotaProtectionConfig::default(),
             pinned_quota_models: PinnedQuotaModelsConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             hidden_menu_items: Vec::new(),
-            cloudflared: CloudflaredConfig::default(),
-            lightweight_mode: false,
             suggestion_delete_thinking_store: None,
             thinking_cleanup_dismissed: None,
             dismissed_thinking_cleanup_version: None,
@@ -237,6 +208,17 @@ mod tests {
     use super::AppConfig;
 
     #[test]
+    fn legacy_desktop_fields_are_ignored() {
+        let config: AppConfig = serde_json::from_str(include_str!(
+            "../../tests/fixtures/legacy-desktop-config.json"
+        ))
+        .unwrap();
+        assert_eq!(config.language, "zh");
+        let saved = serde_json::to_value(config).unwrap();
+        assert!(saved.get("auto_launch").is_none());
+    }
+
+    #[test]
     fn saved_language_is_preserved_when_loading_config() {
         let mut config = AppConfig::new();
         for language in ["en", "zh", "zh-TW", "ru"] {
@@ -245,19 +227,5 @@ mod tests {
             let restored: AppConfig = serde_json::from_str(&saved).unwrap();
             assert_eq!(restored.language, language);
         }
-    }
-
-    #[test]
-    fn quiet_autostart_defaults_to_true_when_missing() {
-        let mut config = AppConfig::new();
-        config.quiet_autostart = false;
-        let mut value = serde_json::to_value(&config).unwrap();
-        value.as_object_mut().unwrap().remove("quiet_autostart");
-        let restored: AppConfig = serde_json::from_value(value).unwrap();
-        assert!(restored.quiet_autostart);
-
-        let saved = serde_json::to_string(&config).unwrap();
-        let restored: AppConfig = serde_json::from_str(&saved).unwrap();
-        assert!(!restored.quiet_autostart);
     }
 }

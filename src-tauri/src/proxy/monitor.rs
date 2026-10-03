@@ -61,7 +61,7 @@ pub(crate) mod prompt_log_tests {
         pub(crate) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let previous = std::env::var_os("ABV_DATA_DIR");
-            std::env::set_var("ABV_DATA_DIR", dir.path());
+            unsafe { std::env::set_var("ABV_DATA_DIR", dir.path()) };
             Self {
                 _dir: dir,
                 previous,
@@ -71,9 +71,9 @@ pub(crate) mod prompt_log_tests {
     impl Drop for TestDataDir {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
-                std::env::set_var("ABV_DATA_DIR", previous);
+                unsafe { std::env::set_var("ABV_DATA_DIR", previous) };
             } else {
-                std::env::remove_var("ABV_DATA_DIR");
+                unsafe { std::env::remove_var("ABV_DATA_DIR") };
             }
         }
     }

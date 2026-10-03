@@ -12,9 +12,6 @@ pub enum AppError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Tauri error: {0}")]
-    Tauri(#[from] tauri::Error),
-
     #[error("OAuth error: {0}")]
     OAuth(String),
 
@@ -42,7 +39,7 @@ impl From<rquest::Error> for AppError {
     }
 }
 
-// Implement Serialize so it can be used as a return value for Tauri commands
+// 管理 API 将错误序列化为可展示的消息。
 impl Serialize for AppError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

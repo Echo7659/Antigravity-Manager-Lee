@@ -1,12 +1,6 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
-/// URL to fetch the latest Antigravity version
-const VERSION_URL: &str = "https://antigravity-auto-updater-974169037036.us-central1.run.app";
-
-/// Second fallback: Official Changelog page
-const CHANGELOG_URL: &str = "https://antigravity.google/changelog";
-
 /// Known stable configuration (for Docker/Headless fallback)
 /// Antigravity 4.3.0 uses Electron 39.2.3 which corresponds to Chrome 132.0.6834.160
 pub const KNOWN_STABLE_VERSION: &str = "4.3.0";
@@ -57,141 +51,8 @@ pub fn compare_semver(v1: &str, v2: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-/// Version source for logging
-#[derive(Debug, PartialEq)]
-enum VersionSource {
-    LocalInstallation,
-    KnownStableFallback,
-    RemoteAPI,
-    #[allow(dead_code)]
-    ChangelogWeb,
-    #[allow(dead_code)]
-    CargoToml,
-}
-
-/// Helper struct for version info
-struct VersionConfig {
-    version: String,
-    electron: String,
-    chrome: String,
-}
-
-/// Try to fetch the latest Antigravity version from the remote update server.
-/// Runs in a dedicated OS thread to avoid blocking Tokio's async runtime.
-/// Returns None on any network/parse failure — always non-fatal, 5s timeout.
-fn try_fetch_remote_version() -> Option<String> {
-    // Spawn a dedicated OS thread so that `reqwest::blocking` never touches
-    // the Tokio thread-pool and cannot trigger the "Cannot block the current
-    // thread from within an asynchronous execution context" panic.
-    let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
-
-    std::thread::spawn(move || {
-        let result = (|| -> Option<String> {
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(5))
-                .build()
-                .ok()?;
-
-            // 1. Try primary update URL
-            if let Ok(resp) = client.get(VERSION_URL).send() {
-                if let Ok(text) = resp.text() {
-                    if let Some(ver) = parse_version(&text) {
-                        tracing::debug!(remote_version = %ver, "Fetched remote version from VERSION_URL");
-                        return Some(ver);
-                    }
-                }
-            }
-
-            // 2. Try changelog page as secondary fallback
-            if let Ok(resp) = client.get(CHANGELOG_URL).send() {
-                if let Ok(text) = resp.text() {
-                    if let Some(ver) = parse_version(&text) {
-                        tracing::debug!(remote_version = %ver, "Fetched remote version from CHANGELOG_URL");
-                        return Some(ver);
-                    }
-                }
-            }
-
-            tracing::debug!("Unable to fetch remote version; will rely on local/stable floor");
-            None
-        })();
-
-        let _ = tx.send(result);
-    });
-
-    // Wait up to 6 seconds (slightly over the client timeout) for the thread
-    rx.recv_timeout(std::time::Duration::from_secs(6))
-        .unwrap_or(None)
-}
-
-/// Smart version resolution strategy:
-///   best = max(Local Installation, Remote Latest, Known Stable Fallback)
-///
-/// This guarantees that even when:
-///   - The local Antigravity install is outdated, OR
-///   - Local detection fails (Docker / headless / non-standard path),
-/// ...we always report a version >= the current minimum required by Google's API.
-fn resolve_version_config() -> (VersionConfig, VersionSource) {
-    // Floor: static known-stable value (updated with each release of this project)
-    let mut best_version = KNOWN_STABLE_VERSION.to_string();
-    let mut source = VersionSource::KnownStableFallback;
-
-    // 1. Try Local Installation
-    if let Ok(local_ver) = crate::modules::version::get_antigravity_version(None) {
-        let local_parsed = parse_version(&local_ver.short_version)
-            .or_else(|| parse_version(&local_ver.bundle_version));
-
-        if let Some(local_v) = local_parsed {
-            if compare_semver(&local_v, &best_version) > std::cmp::Ordering::Equal {
-                // Local is newer than the floor — use it
-                tracing::debug!(
-                    local_version = %local_v,
-                    "Local installation version is newer than known-stable floor; using local"
-                );
-                best_version = local_v;
-                source = VersionSource::LocalInstallation;
-            } else {
-                // Local is older than or equal to the floor (e.g. user hasn't updated yet)
-                tracing::info!(
-                    local_version = %local_v,
-                    floor_version = %best_version,
-                    "Local Antigravity version is older than known-stable floor; \
-                     using floor to avoid upstream model rejection"
-                );
-                // source stays KnownStableFallback — the local version is intentionally ignored
-            }
-        }
-    }
-
-    // 2. Try Remote Version (best-effort; failure is silently ignored)
-    if let Some(remote_v) = try_fetch_remote_version() {
-        if compare_semver(&remote_v, &best_version) > std::cmp::Ordering::Equal {
-            tracing::info!(
-                remote_version = %remote_v,
-                previous_best = %best_version,
-                "Remote version is newer than current best; upgrading fingerprint version"
-            );
-            best_version = remote_v;
-            source = VersionSource::RemoteAPI;
-        }
-    }
-
-    (
-        VersionConfig {
-            version: best_version,
-            electron: KNOWN_STABLE_ELECTRON.to_string(),
-            chrome: KNOWN_STABLE_CHROME.to_string(),
-        },
-        source,
-    )
-}
-
-/// Current resolved Antigravity version (e.g., "4.3.0")
-/// Always >= KNOWN_STABLE_VERSION, and >= remote latest when reachable.
-pub static CURRENT_VERSION: LazyLock<String> = LazyLock::new(|| {
-    let (config, _) = resolve_version_config();
-    config.version
-});
+/// 服务器使用固定版本下限，不探测桌面安装或请求更新服务。
+pub static CURRENT_VERSION: LazyLock<String> = LazyLock::new(|| KNOWN_STABLE_VERSION.to_string());
 
 /// Native OAuth Authorization User-Agent
 pub static NATIVE_OAUTH_USER_AGENT: LazyLock<String> =

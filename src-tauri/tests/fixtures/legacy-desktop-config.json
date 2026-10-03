@@ -1,0 +1,13 @@
+{
+  "language": "zh",
+  "theme": "dark",
+  "auto_refresh": true,
+  "refresh_interval": 15,
+  "auto_sync": false,
+  "sync_interval": 5,
+  "auto_launch": true,
+  "cloudflared": { "mode": "quick" },
+  "lightweight_mode": true,
+  "antigravity_executable": "/obsolete/application",
+  "quiet_autostart": true
+}
