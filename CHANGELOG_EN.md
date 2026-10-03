@@ -1,3 +1,18 @@
+## v4.9.1-lee.1
+
+2026-10-04. Upstream base: 4.9.1. Lee release: 4.9.1-lee.1, using the stable main channel.
+
+- Integrate upstream v4.9.1 (`6a360c3a1d54bb2385818a3ebb05579832735cee`), preserving lightweight-model forwarding, background summaries and 3-second SSE heartbeats (Fixes #3577, Thanks to @Xyloz3n; PR #3578 and PR #3579, Thanks to @EricZhou05). Original upstream commits, authorship and historical changelogs are retained.
+- Run one Linux Rust/Axum server with a React Web panel. Remove the desktop runtime, local client configuration synchronization, Cloudflared and promotional entry points. Preserve the four-protocol Gemini pipeline, account import/OAuth, proxy pools, management authentication and persisted configuration; existing accounts, credentials, proxy bindings and SQLite data retain their original mount.
+- Build the model catalog from successful Google account snapshots with an 86,400-second freshness window and last-known-good fallback when no fresh snapshot exists. Unknown model IDs remain pass-through.
+- Route Opus 5.5 only to Ultra or paid Pro explicitly identified by `loadCodeAssist.paidTier`; trial Pro and Pro without paid evidence are excluded before existing ranking and retry logic. Failed refreshes retain last-known paid evidence.
+- Use adaptive thinking for Opus 5.5, removing disabled-thinking and manual-budget parameters and returning explicit client errors for forced tool choice. Local cost estimates per million tokens are $4 input, $20 output and $0.20 cache read; unknown models remain unpriced.
+- Preserve at most six distinct accounts per request, no failed-account reuse, quota guards, ranking, weekly reserves, first-response timeouts, live proxy updates and staggered health checks. Token and cost accounting remain enabled when detailed request logging is disabled.
+- Separate upstream base and complete Lee release versions in release gates, enforce main/beta ancestry and exact bilingual headings, and permit latest only for stable tags including Lee releases. Images record the complete version and source commit; deployment bundles pin the digest.
+- Historical attribution: Thanks to @lbjlaq, @jeikl, @JeikCode, @Avlaak (PR #3518), @a3339530357 (PR #3574 / Fixes #3573), @brushax, @buluw, @relifenoxiao, @ddmixi, and contributors credited in the preserved historical entries. Lee changes are maintained by @Echo7659.
+
+These notes describe source behavior, not completed GitHub CI, image or production verification. Real Ultra/paid-Pro requests, token/cost records and data preservation require separate acceptance on the exact release commit and digest.
+
 ## v4.8.1-lee.3
 
 Merge official v4.8.1; preserve six-account failover, quota guards, usage accounting, timeouts and dashboard fixes. Thanks to @jeikl, @Avlaak and upstream contributors (PR #3518).

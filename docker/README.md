@@ -8,7 +8,9 @@
 
 镜像名称：`ghcr.io/echo7659/antigravity-manager-lee`。发布 compose 按 digest 固定镜像，不自动跟随 latest。
 
-正式标签 `vX.Y.Z` 必须属于 `origin/main`；预览标签 `vX.Y.Z-beta.N` 必须属于 `origin/beta`。标签、Web/Rust/lockfile 版本及中英 changelog 中的版本标题必须完全一致。CI 在任何镜像推送前验证这些条件和标签指向的精确 commit。main/beta 分支构建只发布 SHA 镜像；只有通过校验的 main 正式标签更新镜像 latest 和 GitHub Latest Release。beta 发布设置 prerelease=true、makeLatest=false，并保留完整 beta 标签作为镜像及部署归档名称。
+正式标签 `vX.Y.Z` 或 `vX.Y.Z-lee.N` 必须属于 `origin/main`；预览标签 `vX.Y.Z-beta.N` 或 `vX.Y.Z-lee.N-beta.N` 必须属于 `origin/beta`。标签、Web/Rust/lockfile 版本及中英 changelog 中的版本标题必须完全一致。CI 在任何镜像推送前验证这些条件和标签指向的精确 commit。main/beta 分支构建只发布 SHA 镜像；只有通过校验的 main 正式标签更新镜像 latest 和 GitHub Latest Release。beta 发布设置 prerelease=true、makeLatest=false，并保留完整 beta 标签作为镜像及部署归档名称。
+
+当前上游基础版本为 `4.9.1`，Lee 正式版本为 `4.9.1-lee.1`。镜像 OCI version 与 smoke 检查使用完整 Lee 版本；OCI revision 使用精确源 commit，部署 manifest 同时记录 `base_version` 和 `release_version`。
 
 本地可用 `python3 scripts/test_release_metadata.py` 验证通道、命名与交叉分支拒绝行为；该临时 Git fixture 不创建仓库正式标签，也不推送镜像。源码测试和 fixture 不能替代 Linux 镜像构建、容器运行与真实业务验收。
 
@@ -65,7 +67,7 @@ docker compose --env-file docker/.env -f docker/docker-compose.release.yml logs 
 curl --fail http://127.0.0.1:8045/health
 ```
 
-CI 对无账号临时容器运行 `scripts/ci_smoke.py --base-url http://127.0.0.1:18045 --version 4.9.1`。检查涵盖 health/version、管理接口未鉴权拒绝与已鉴权成功、动态模型目录、静态页面与资源、已删除 API 返回 404。默认测试密码为 ci-smoke-only，可用 `--admin-password` 覆盖。该检查要求账号列表为空，不应对生产数据运行。
+CI 对无账号临时容器运行 `scripts/ci_smoke.py --base-url http://127.0.0.1:18045 --version 4.9.1-lee.1`。检查涵盖 health/version、管理接口未鉴权拒绝与已鉴权成功、动态模型目录、静态页面与资源、已删除 API 返回 404。默认测试密码为 ci-smoke-only，可用 `--admin-password` 覆盖。该检查要求账号列表为空，不应对生产数据运行。
 
 镜像构建在最终运行层执行 ldd 检查，缺失动态库时停止构建。容器 health check 运行同一二进制的 `--health-check`。HTTP 健康不代表真实上游请求成功，账号资格、模型请求与费用统计需单独验收。
 

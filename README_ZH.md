@@ -1,4 +1,4 @@
-# Antigravity Manager Lee (v4.9.1)
+# Antigravity Manager Lee (v4.9.1-lee.1)
 
 面向 Linux 服务器的 Rust/Axum 服务与 React Web 管理面板。支持 OpenAI Responses、OpenAI Chat Completions、Anthropic Claude 和 Google Gemini 四种协议，统一转换到 Gemini 流水线处理。
 
@@ -17,7 +17,7 @@
 
 发布镜像为 **Linux/amd64**，名称固定为 `ghcr.io/echo7659/antigravity-manager-lee`。从目标 commit 的成功 CI 记录中取得精确镜像 digest。
 
-正式标签 `vX.Y.Z` 必须属于 `origin/main`，预览标签 `vX.Y.Z-beta.N` 必须属于 `origin/beta`。CI 在任何镜像推送前校验标签、各版本文件及中英 changelog 版本标题。只有 main 正式标签更新 latest；beta 标记为 prerelease 且不更新 latest，分支构建仅发布 SHA 镜像。
+正式标签 `vX.Y.Z` 和 `vX.Y.Z-lee.N` 必须属于 `origin/main`，预览标签 `vX.Y.Z-beta.N` 和 `vX.Y.Z-lee.N-beta.N` 必须属于 `origin/beta`。CI 在任何镜像推送前校验标签、各版本文件及中英 changelog 版本标题。只有 main 正式标签更新 latest；beta 标记为 prerelease 且不更新 latest，分支构建仅发布 SHA 镜像。
 
 复制 `docker/.env.example` 为 `docker/.env`，填写 `API_KEY`、`WEB_PASSWORD` 和 `IMAGE_DIGEST=sha256:...`。已有部署必须先将 `ABV_HOST_DATA_DIR` 指向原有数据目录的绝对路径。
 
@@ -50,11 +50,13 @@ cargo +1.96.0 check --locked --manifest-path src-tauri/Cargo.toml --all-targets
 cargo +1.96.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ```
 
-CI 还执行状态、配置及协议兼容性定向测试，并在 Linux 镜像完成 health、鉴权、模型目录、Web 资源和删除 API 的 404 检查后发布 digest。应用版本与历史贡献者署名保持不变。
+CI 在镜像构建前执行状态、配置、模型目录、Opus 5.5、统计与协议兼容性定向测试；镜像发布还需通过 health、鉴权、模型目录、Web 资源和删除 API 的 404 检查。这些门禁配置不代表当前版本已经通过 CI 或生产验收。
 
 ## 📝 更新日志
 
-> 最新版本 **v4.9.1**（2026-10-02）：修复 `gemini-3.1-flash-lite` 误重定向至已故 2.5 系列导致 503 报错的严重问题并恢复健康直传，将后台摘要压缩任务重定向至存活轻量模型，从公开目录清理 2.5 全系列并平滑重定向至 `gemini-3.6-flash-medium`（Fixes #3577，感谢 @Xyloz3n）；收紧下游 SSE 流式思考心跳至 3 秒防止长推理提前断开连接（PR #3578，感谢 @EricZhou05）。
+- **v4.9.1-lee.1**：同步上游 4.9.1，运行架构收敛为 Linux/Web，移除桌面集成、本机客户端同步、Cloudflared 和推广入口。动态目录保留 24 小时新鲜度及最近成功快照回退；Opus 5.5 只调度 Ultra 或有明确付费证据的 Pro，并使用 adaptive thinking。每百万 Token 本地估算价格为输入 $4、输出 $20、cache read $0.20。保留六个不同账号重试及独立于详细日志的 Token/成本统计。Thanks to @jeikl 及上游贡献者，逐项归属见[更新日志](CHANGELOG.md)。CI、容器和生产验收分别记录。
+
+> 上游基础版本 **v4.9.1**（2026-10-02）：恢复轻量模型路由和后台摘要（Fixes #3577，Thanks to @Xyloz3n）；思考 SSE 心跳调整为 3 秒并同步文档（PR #3578、PR #3579，Thanks to @EricZhou05）。
 
 👉 **[查看完整更新日志 CHANGELOG.md →](CHANGELOG.md)**
 

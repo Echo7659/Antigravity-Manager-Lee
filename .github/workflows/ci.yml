@@ -40,6 +40,8 @@ jobs:
           bash scripts/check_server_only.sh
           python3 scripts/test_ci_smoke.py
           python3 scripts/test_release_metadata.py
+          node --test scripts/test_bump_version.mjs
+          node scripts/bump-version.mjs --check
       - name: Install native build dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake clang libclang-dev perl golang-go git ca-certificates
       - name: Test and build Web panel
@@ -69,6 +71,12 @@ jobs:
           cargo test --locked --manifest-path src-tauri/Cargo.toml admin_model_catalog_ -- --test-threads=1
           cargo test --locked --manifest-path src-tauri/Cargo.toml legacy_desktop_fields_are_ignored -- --test-threads=1
           cargo test --locked --manifest-path src-tauri/Cargo.toml --lib modules::proxy_db:: -- --test-threads=1
+      - name: Test model catalog, Opus eligibility, thinking and usage
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml model_catalog_ -- --test-threads=1
+          cargo test --locked --manifest-path src-tauri/Cargo.toml opus_5_5_ -- --test-threads=1
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib modules::token_stats:: -- --test-threads=1
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib proxy::monitor:: -- --test-threads=1
       - name: Test request normalization
         run: cargo test --locked --manifest-path "$RUNNER_TEMP/compat-tests/Cargo.toml" --lib request_compat
       - name: Test usage, streams and account failover
@@ -106,6 +114,9 @@ jobs:
         with:
           images: ${{ steps.release_meta.outputs.image }}
           flavor: latest=false
+          labels: |
+            org.opencontainers.image.version=${{ steps.release_meta.outputs.release_version }}
+            org.opencontainers.image.revision=${{ github.sha }}
           tags: |
             type=raw,value=latest,enable=${{ steps.release_meta.outputs.make_latest == 'true' }}
             type=sha,format=long
@@ -123,15 +134,19 @@ jobs:
           build-args: |
             BUILD_JOBS=2
             SOURCE_REVISION=${{ github.sha }}
+            RELEASE_VERSION=${{ steps.release_meta.outputs.release_version }}
           cache-from: type=gha,scope=lee-amd64
           cache-to: type=gha,scope=lee-amd64,mode=max
       - name: Validate container HTTP endpoints
         env:
           LOCAL_IMAGE: ${{ steps.release_meta.outputs.local_image }}
-          BASE_VERSION: ${{ steps.release_meta.outputs.base_version }}
+          RELEASE_VERSION: ${{ steps.release_meta.outputs.release_version }}
+          SOURCE_REVISION: ${{ github.sha }}
         run: |
+          test "$(docker image inspect "$LOCAL_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.version"}}')" = "$RELEASE_VERSION"
+          test "$(docker image inspect "$LOCAL_IMAGE" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_REVISION"
           docker run -d --name antigravity-ci-smoke -p 127.0.0.1:18045:8045 -e API_KEY=ci-api-only -e WEB_PASSWORD=ci-smoke-only -e ABV_BIND_LOCAL_ONLY=false "$LOCAL_IMAGE"
-          python3 scripts/ci_smoke.py --version "$BASE_VERSION"
+          python3 scripts/ci_smoke.py --version "$RELEASE_VERSION"
           for attempt in $(seq 1 45); do
             status=$(docker inspect --format '{{.State.Health.Status}}' antigravity-ci-smoke)
             if [ "$status" = healthy ]; then break; fi

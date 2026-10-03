@@ -7,7 +7,7 @@ import subprocess
 import tomllib
 
 NUMBER = r'(?:0|[1-9]\d*)'
-VERSION_PATTERN = rf'{NUMBER}\.{NUMBER}\.{NUMBER}(?:-beta\.{NUMBER})?'
+VERSION_PATTERN = rf'{NUMBER}\.{NUMBER}\.{NUMBER}(?:-lee\.{NUMBER})?(?:-beta\.{NUMBER})?'
 
 
 def git(root, *args):
@@ -24,7 +24,7 @@ def validate_source(root, revision):
     rust_lock_versions = [package['version'] for package in rust_packages if package['name'] == 'antigravity-tools']
     assert rust_lock_versions == [version], 'Rust lockfile version must match the manifest'
     assert version == rust_version == lock['version'] == lock['packages']['']['version'], 'Web, Rust and lockfile versions must match'
-    assert re.fullmatch(VERSION_PATTERN, version), 'Only stable or beta.N versions are supported'
+    assert re.fullmatch(VERSION_PATTERN, version), 'Only stable, lee.N and beta.N versions are supported'
     channel = 'beta' if '-beta.' in version else 'stable'
     branch = 'beta' if channel == 'beta' else 'main'
     ancestor = subprocess.run(
@@ -63,7 +63,8 @@ def metadata(root, env):
     assert re.fullmatch(r'[a-z0-9_.-]+/[a-z0-9_.-]+', repository)
     return {
         'image': 'ghcr.io/' + repository,
-        'base_version': version,
+        'base_version': version.split('-')[0],
+        'release_version': version,
         'local_image': 'antigravity-lee-ci:' + revision,
         'channel': channel,
         'prerelease': str(channel == 'beta').lower(),

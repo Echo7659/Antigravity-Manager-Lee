@@ -33,7 +33,9 @@ RUN ldd /app/antigravity-tools > /tmp/linked-libraries && \
     cat /tmp/linked-libraries && ! grep -q 'not found' /tmp/linked-libraries && \
     rm /tmp/linked-libraries
 ARG SOURCE_REVISION=unknown
+ARG RELEASE_VERSION=unknown
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
+LABEL org.opencontainers.image.version="${RELEASE_VERSION}"
 LABEL org.opencontainers.image.source="https://github.com/Echo7659/Antigravity-Manager-Lee"
 ENV ABV_DIST_PATH=/app/dist RUST_LOG=info PORT=8045 ABV_BIND_LOCAL_ONLY=false
 EXPOSE 8045

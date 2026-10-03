@@ -1,4 +1,4 @@
-# Antigravity Manager Lee (v4.9.1)
+# Antigravity Manager Lee (v4.9.1-lee.1)
 
 A Linux server and Web management panel built on Rust, Axum and React. It normalizes OpenAI Responses, OpenAI Chat Completions, Anthropic Claude and Google Gemini requests into a shared Gemini pipeline.
 
@@ -17,7 +17,7 @@ A Linux server and Web management panel built on Rust, Axum and React. It normal
 
 Published images target **Linux/amd64** at `ghcr.io/echo7659/antigravity-manager-lee`. Use a digest from a successful CI run for the exact source commit.
 
-Stable tags `vX.Y.Z` must belong to `origin/main`; beta tags `vX.Y.Z-beta.N` must belong to `origin/beta`. CI validates the exact tag, manifest versions and bilingual changelog before any image push. Only stable main tags update latest; beta releases are prereleases and never become latest. Branch builds publish SHA images only.
+Stable tags `vX.Y.Z` and `vX.Y.Z-lee.N` must belong to `origin/main`; beta tags `vX.Y.Z-beta.N` and `vX.Y.Z-lee.N-beta.N` must belong to `origin/beta`. CI validates the exact tag, manifest versions and bilingual changelog before any image push. Only stable main tags update latest; beta releases are prereleases and never become latest. Branch builds publish SHA images only.
 
 Copy `docker/.env.example` to `docker/.env`, then set `API_KEY`, `WEB_PASSWORD` and `IMAGE_DIGEST=sha256:...`. For existing deployments, set `ABV_HOST_DATA_DIR` to the existing absolute data path before starting.
 
@@ -50,13 +50,15 @@ cargo +1.96.0 check --locked --manifest-path src-tauri/Cargo.toml --all-targets
 cargo +1.96.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ```
 
-CI also runs focused state/configuration and protocol compatibility tests, builds the Linux image, verifies container health, authentication, model catalog, Web assets and removed-route 404, then publishes the image digest. Application version and historical contributor attribution remain unchanged.
+CI also runs focused state/configuration, model catalog, Opus 5.5, usage and protocol compatibility tests before building the Linux image. Publication requires container health, authentication, model catalog, Web assets and removed-route 404 checks. These configured gates do not imply the current release has passed CI or production acceptance.
 
 ## 📝 Changelog
 
+- **v4.9.1-lee.1**: Upstream 4.9.1 with a Linux/Web-only runtime; desktop integration, local client sync, Cloudflared and promotions removed. The 24-hour dynamic catalog retains last-known-good fallback. Opus 5.5 requires Ultra or evidenced paid Pro and uses adaptive thinking; estimated prices per million tokens are $4 input, $20 output and $0.20 cache read. Six-account failover and logging-independent token/cost statistics remain. Thanks to @jeikl and upstream contributors; individual attribution is preserved in the [changelog](CHANGELOG_EN.md). CI, container and production acceptance are tracked separately.
+
 - **v4.8.1-lee.3**: Official 4.8.1 with retained reliability and dashboard fixes. [Reconciliation](docs/UPSTREAM_4_8_1.md). Thanks to @jeikl, @Avlaak and upstream contributors.
 
-> Latest upstream version **v4.9.1** (2026-10-02): Restored `gemini-3.1-flash-lite` routing and Layer-3 background compression; retained legacy-model forwarding to `gemini-3.6-flash-medium` (Fixes #3577, thanks to @Xyloz3n). Thinking SSE heartbeats now run every 3 seconds (PR #3578, thanks to @EricZhou05). Lee account failover, quota protection and usage statistics are preserved.
+> Upstream base **v4.9.1** (2026-10-02): Restored lightweight-model routing and background summaries (Fixes #3577, Thanks to @Xyloz3n), with 3-second thinking SSE heartbeats and documentation alignment (PR #3578, PR #3579, Thanks to @EricZhou05).
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

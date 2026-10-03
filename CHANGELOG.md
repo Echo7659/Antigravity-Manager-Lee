@@ -1,3 +1,18 @@
+## v4.9.1-lee.1
+
+2026-10-04。上游基础版本为 4.9.1，Lee 正式发布版本为 4.9.1-lee.1；使用 main 正式通道。
+
+- 同步上游 v4.9.1（`6a360c3a1d54bb2385818a3ebb05579832735cee`），保留轻量模型直传、后台摘要与 3 秒 SSE 心跳修复（Fixes #3577，Thanks to @Xyloz3n；PR #3578、PR #3579，Thanks to @EricZhou05）。上游原始提交、作者和历史更新日志继续保留。
+- 运行架构收敛为 Linux Rust/Axum 服务与 React Web 面板，移除桌面运行时、本机客户端配置同步、Cloudflared 和推广入口。保留四协议 Gemini 流水线、账号导入/OAuth、代理池、管理鉴权和持久化配置；原账号、凭据、代理绑定与 SQLite 数据继续使用原挂载。
+- 模型目录来自 Google 账号成功快照，新鲜期为 86,400 秒；无新鲜快照时回退到最近成功历史目录，未知模型 ID 保持透传。
+- Opus 5.5 只调度 Ultra 或 `loadCodeAssist.paidTier` 明确识别的付费 Pro；试用 Pro 和缺少付费证据的 Pro 不参与。资格过滤先于既有排序与重试，账号刷新失败时保留上次有效付费证据。
+- Opus 5.5 使用 adaptive thinking，移除关闭 thinking 与手工 budget 参数，强制 tool choice 返回明确客户端错误。每百万 Token 的本地成本估算为输入 $4、输出 $20、cache read $0.20；未知模型不虚构价格。
+- 保留单次请求最多六个不同账号、失败账号不重用、配额保护、账号排名、周配额预留、首响应超时、代理热更新与错峰健康检查。详细调用日志关闭时仍记录 Token 和成本统计。
+- 发布门禁区分基础版本和完整 Lee 版本，校验 main/beta 来源及双语标题；正式 Lee 标签可更新 latest，beta 标签永不更新 latest。镜像保留完整版本和精确 commit 标签，部署包固定 digest。
+- 历史归属：Thanks to @lbjlaq、@jeikl、@JeikCode、@Avlaak（PR #3518）、@a3339530357（PR #3574 / Fixes #3573）、@brushax、@buluw、@relifenoxiao、@ddmixi，以及历史条目中逐项署名的贡献者。Lee 改动由 @Echo7659 维护。
+
+本条目描述源码行为，不代表 GitHub CI、镜像构建或生产验收已经完成。真实 Ultra/付费 Pro 请求、Token/成本记录和数据保留需在精确发布 commit 与 digest 上分别验收。
+
 ## v4.8.1-lee.3
 
 同步官方 v4.8.1，保留六账号重试、额度保护、用量统计、超时控制及仪表盘修复。感谢 @jeikl、@Avlaak 和上游贡献者（PR #3518）。

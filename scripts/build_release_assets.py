@@ -22,7 +22,7 @@ assert compose.count(image_line) == 1, 'Release compose image declaration change
 compose = compose.replace(image_line, '    image: ' + reference)
 (output / 'docker-compose.yml').write_text(compose)
 (output / '.env.example').write_text((root / 'docker/.env.example').read_text().replace('IMAGE_DIGEST=', 'IMAGE_DIGEST=' + digest))
-manifest = {'release': tag, 'base_version': version, 'channel': channel, 'source_revision': os.environ['GITHUB_SHA'], 'image': reference, 'platform': 'linux/amd64'}
+manifest = {'release': tag, 'base_version': version.split('-')[0], 'release_version': version, 'channel': channel, 'source_revision': os.environ['GITHUB_SHA'], 'image': reference, 'platform': 'linux/amd64'}
 (output / 'image-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 (output / 'README.md').write_text(f'''# Antigravity Manager Lee {tag}
 
@@ -46,13 +46,14 @@ with tarfile.open(archive, 'w:gz') as bundle:
 
 - Release: `{tag}`
 - Base application: `{manifest['base_version']}`
+- Lee application version: `{manifest['release_version']}`
 - Source: `{manifest['source_revision']}`
 - Platform: `linux/amd64`
 - Image: `{reference}`
 
 This release contains one Linux server and Web panel image. It preserves account scheduling, four-protocol normalization, dynamic model catalogs, proxy pools, quota protection, usage statistics and management authentication.
 
-Upstream attribution and version history are preserved in `CHANGELOG.md` and `CHANGELOG_EN.md`. Thanks to lbjlaq/Antigravity-Manager contributors, @jeikl and @Avlaak (PR #3518); see `docs/UPSTREAM_4_8_1.md` for reconciliation details.
+Upstream attribution and version history are preserved in `CHANGELOG.md` and `CHANGELOG_EN.md`. Thanks to lbjlaq/Antigravity-Manager contributors, @jeikl and @Avlaak (PR #3518), @Xyloz3n (Fixes #3577) and @EricZhou05 (PR #3578, PR #3579). See the complete changelogs for individual historical attribution.
 
 The attached deployment bundle pins the tested image digest and contains no credentials. Existing deployments must retain their data mounts and secrets.
 ''')

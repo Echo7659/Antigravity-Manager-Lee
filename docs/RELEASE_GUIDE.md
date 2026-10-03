@@ -6,10 +6,12 @@
 
 | 通道 | 分支与来源约束 | 版本 / 标签 | 发布行为 |
 | --- | --- | --- | --- |
-| 正式版 | `main`；commit 必须属于 `origin/main` | `X.Y.Z` / `vX.Y.Z` | 正式标签才更新 GHCR latest 与 GitHub Latest Release |
-| 预览版 | `beta`；commit 必须属于 `origin/beta` | `X.Y.Z-beta.N` / `vX.Y.Z-beta.N` | prerelease=true、makeLatest=false，不更新 latest |
+| 正式版 | `main`；commit 必须属于 `origin/main` | `X.Y.Z` 或 `X.Y.Z-lee.N`，标签加 `v` | 正式标签才更新 GHCR latest 与 GitHub Latest Release |
+| 预览版 | `beta`；commit 必须属于 `origin/beta` | `X.Y.Z-beta.N` 或 `X.Y.Z-lee.N-beta.N`，标签加 `v` | prerelease=true、makeLatest=false，不更新 latest |
 
-“属于”表示 commit 在对应远程分支的 Git 历史中可达，不要求已发布标签一直停留在不断前进的分支末端。版本号各数字段不得带前导零；beta 序号必须完整。发布门禁只接受表中的两种格式。
+“属于”表示 commit 在对应远程分支的 Git 历史中可达，不要求已发布标签一直停留在不断前进的分支末端。版本号各数字段不得带前导零；Lee 和 beta 序号必须完整。发布门禁只接受表中格式。`-lee.N` 表示 Lee 正式修订，不能仅因含 `-` 就当作 beta。
+
+当前基础版本 `base_version=4.9.1`，完整发布版本 `release_version=4.9.1-lee.1`，标签为 `v4.9.1-lee.1`。manifest、设置页、容器 smoke 与 OCI version 使用完整发布版本；部署包同时记录基础版本和完整发布版本，OCI revision 保留精确 commit。
 
 main/beta 的 push 与 PR 都触发测试；PR 不发布镜像。合法分支构建仅发布 SHA 镜像，不创建 GitHub Release。完整版本标签通过校验后，才发布对应标签镜像与 Release。手动触发工作流也必须满足相同的分支、版本和来源约束。
 
@@ -26,10 +28,10 @@ main/beta 的 push 与 PR 都触发测试；PR 不发布镜像。合法分支构
 | 补丁升级；已有 beta 转同号正式版 | `npm run bump patch` | main |
 | 次版本 / 主版本升级 | `npm run bump minor` / `npm run bump major` | main |
 | 开启下一补丁预览或递增 beta 序号 | `npm run bump beta` | beta |
-| 指定正式版本 | `npm run bump X.Y.Z` | main；将占位符替换为目标版本 |
-| 指定预览版本 | `npm run bump X.Y.Z-beta.N` | beta；填写完整数字序号 |
+| 指定正式版本 | `npm run bump X.Y.Z` 或 `npm run bump X.Y.Z-lee.N` | main；将占位符替换为目标版本 |
+| 指定预览版本 | `npm run bump X.Y.Z-beta.N` 或 `npm run bump X.Y.Z-lee.N-beta.N` | beta；填写完整数字序号 |
 
-可先追加 `-- --dry-run` 检查拟更新内容。脚本的分支提示不等于发布授权，也不能代替严格发布门禁；即使脚本接受某个输入，发布仍必须符合上表格式。确认目标版本高于当前已发布版本，禁止复用既有标签。
+可先追加 `-- --dry-run` 检查拟更新目标。`node scripts/bump-version.mjs --check 4.9.1` 只读核对基础版本及所有服务端版本字段，也可传完整发布版本。脚本会在写入前检查必需文件和字段一致性，不执行编译、推送或发布；严格分支来源约束由发布门禁执行。确认目标版本高于当前已发布版本，禁止复用既有标签。`beta` 递增已有预览序号；`patch` 将 beta 转为同号正式版并保留 Lee 序号。显式指定 Lee beta 可保留当前基础版本。
 
 同步目标为：
 
@@ -65,6 +67,8 @@ beta 内容只进入两份 changelog，不写入正式版 README 摘要。当前
 ```sh
 bash scripts/check_server_only.sh
 python3 scripts/test_release_metadata.py
+node --test scripts/test_bump_version.mjs
+node scripts/bump-version.mjs --check
 python3 scripts/test_ci_smoke.py
 npm ci --legacy-peer-deps
 npm run test:dashboard
@@ -76,8 +80,9 @@ cargo +1.96.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets
 
 CI 还在镜像发布前执行：
 
-- `server_runtime_`、`admin_model_catalog_`、`legacy_desktop_fields_are_ignored` 定向测试；
+- `server_runtime_`、`admin_model_catalog_`、`model_catalog_`、`opus_5_5_`、`legacy_desktop_fields_are_ignored` 定向测试；
 - `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib modules::proxy_db:: -- --test-threads=1`；
+- `modules::token_stats::` 与 `proxy::monitor::` 串行定向测试；
 - 由 `scripts/prepare_compat_tests.py` 从当前源码生成的独立兼容性 harness，覆盖 `request_compat`、`compat_` 与 `proxy::pipeline`。
 
 状态与数据库测试使用临时数据并串行执行；不对生产数据运行测试。采用定向回归，不要求本地全量测试。若本机缺少容器运行环境或空间不足，记录未执行项，由 Linux CI 完成镜像验证；不能把脚本 fixture 通过写成容器验收通过。
@@ -126,7 +131,7 @@ git push origin "$release_tag"
 标签发布生成：
 
 - `antigravity-manager-lee-<完整 tag>-deployment.tar.gz`；
-- `image-manifest.json`，记录完整 tag、版本、通道、精确源 commit、平台与镜像 digest；
+- `image-manifest.json`，记录完整 tag、`base_version`、`release_version`、通道、精确源 commit、平台与镜像 digest；
 - `SHA256SUMS`，用于校验部署归档。
 
 归档包含固定镜像 digest 的 compose、空凭据模板、manifest 与部署说明，不包含业务数据或真实密钥。发布验收必须核对 Actions 成功记录、Release 附件、归档校验值以及 `ghcr.io/echo7659/antigravity-manager-lee@sha256:...`；不能只核对可变镜像标签。

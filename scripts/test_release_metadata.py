@@ -3,13 +3,14 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 
-from release_metadata import metadata
+from release_metadata import VERSION_PATTERN, metadata
 
 SOURCE = pathlib.Path(__file__).resolve().parents[1]
 
@@ -63,6 +64,34 @@ class ReleaseChannelTests(unittest.TestCase):
         env = self.fixture('4.9.2-beta.0', 'beta')
         result = metadata(self.root, env)
         self.assertEqual((result['prerelease'], result['make_latest']), ('true', 'false'))
+
+    def test_lee_tag_is_stable_and_preserves_upstream_base(self):
+        result = metadata(self.root, self.fixture('4.9.1-lee.1', 'main'))
+        self.assertEqual((result['base_version'], result['release_version']), ('4.9.1', '4.9.1-lee.1'))
+        self.assertEqual((result['channel'], result['prerelease'], result['make_latest']), ('stable', 'false', 'true'))
+
+    def test_lee_beta_tag_is_never_latest(self):
+        result = metadata(self.root, self.fixture('4.9.1-lee.1-beta.2', 'beta'))
+        self.assertEqual((result['base_version'], result['release_version']), ('4.9.1', '4.9.1-lee.1-beta.2'))
+        self.assertEqual((result['channel'], result['prerelease'], result['make_latest']), ('beta', 'true', 'false'))
+
+    def test_lee_stable_cannot_publish_from_beta(self):
+        with self.assertRaisesRegex(AssertionError, 'origin/main'):
+            metadata(self.root, self.fixture('4.9.1-lee.1', 'beta'))
+
+    def test_lee_beta_cannot_publish_from_main(self):
+        with self.assertRaisesRegex(AssertionError, 'origin/beta'):
+            metadata(self.root, self.fixture('4.9.1-lee.1-beta.2', 'main'))
+
+    def test_unsupported_release_suffix_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, 'versions are supported'):
+            metadata(self.root, self.fixture('4.9.1-cleaned', 'main'))
+
+    def test_release_grammar_rejects_incomplete_and_noncanonical_suffixes(self):
+        for version in ['4.9.1-rc.1', '4.9.1-lee', '4.9.1-beta', '4.9.1-lee.01',
+                        '4.9.1-lee.1-beta.01', '4.9.1-beta.1-lee.1', '04.9.1', '4.9.1+local']:
+            with self.subTest(version=version):
+                self.assertIsNone(re.fullmatch(VERSION_PATTERN, version))
 
     def test_stable_source_only_on_beta_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, 'origin/main'):
@@ -120,6 +149,8 @@ class ReleaseChannelTests(unittest.TestCase):
         )
         manifest = json.loads((output / 'image-manifest.json').read_text())
         self.assertEqual(manifest['release'], 'v' + version)
+        self.assertEqual(manifest['base_version'], version.split('-')[0])
+        self.assertEqual(manifest['release_version'], version)
         self.assertEqual(manifest['channel'], 'beta' if branch == 'beta' else 'stable')
         self.assertTrue(manifest['image'].endswith('@' + digest))
         archive = output / f'antigravity-manager-lee-v{version}-deployment.tar.gz'
@@ -130,6 +161,12 @@ class ReleaseChannelTests(unittest.TestCase):
 
     def test_stable_bundle_preserves_tag_digest_and_checksum(self):
         self.assert_bundle('4.9.1', 'main')
+
+    def test_lee_bundle_preserves_tag_digest_and_checksum(self):
+        self.assert_bundle('4.9.1-lee.1', 'main')
+
+    def test_lee_beta_bundle_preserves_tag_digest_and_checksum(self):
+        self.assert_bundle('4.9.1-lee.1-beta.2', 'beta')
 
 
 if __name__ == '__main__':
