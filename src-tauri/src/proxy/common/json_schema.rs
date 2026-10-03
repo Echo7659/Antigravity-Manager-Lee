@@ -834,13 +834,18 @@ mod tests {
                 "location": {
                     "type": "string",
                     "minLength": 1,
-                    "format": "city"
+                    "format": "city",
+                    "description": "The city and state, e.g. San Francisco, CA"
                 },
                 // 模拟属性名冲突：pattern 是一个 Object 属性，不应被移除
                 "pattern": {
                     "type": "object",
                     "properties": {
-                        "regex": { "type": "string", "pattern": "^[a-z]+$" }
+                        "regex": {
+                            "type": "string",
+                            "pattern": "^[a-z]+$",
+                            "description": "Regex pattern"
+                        }
                     }
                 },
                 "unit": {
@@ -1601,11 +1606,8 @@ mod tests {
         assert!(schema.get("properties").is_some());
         assert_eq!(schema["properties"]["foo"]["type"], "string");
 
-        // 验证描述中增加了类型提示 (注意: null 分支在清洗后变为了带 (nullable) 标记的 string，因此去重后为 string | object)
-        assert!(schema["description"]
-            .as_str()
-            .unwrap()
-            .contains("Accepts: string | object"));
+        // 联合类型只做结构降级，不凭空合成客户端未提供的描述。
+        assert!(schema.get("description").is_none());
     }
 
     #[test]
@@ -1726,14 +1728,11 @@ mod tests {
     #[test]
     fn test_sanitize_description() {
         let multi_line = "This is a tool description\nwith multiple lines\r\nand   extra   spaces.";
-        assert_eq!(
-            sanitize_description(multi_line),
-            "This is a tool description with multiple lines and extra spaces."
-        );
+        assert_eq!(sanitize_description(multi_line), multi_line);
 
-        let overlong = "a".repeat(3000);
+        let overlong = "a".repeat(MAX_DESCRIPTION_LENGTH + 100);
         let sanitized = sanitize_description(&overlong);
-        assert!(sanitized.len() <= MAX_DESCRIPTION_LENGTH);
+        assert!(sanitized.chars().count() <= MAX_DESCRIPTION_LENGTH);
         assert!(sanitized.ends_with("... [truncated]"));
     }
 
@@ -1747,6 +1746,6 @@ mod tests {
         clean_json_schema(&mut schema);
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"], json!({}));
-        assert_eq!(schema["description"], "Some description with newlines");
+        assert_eq!(schema["description"], "Some description\nwith newlines");
     }
 }

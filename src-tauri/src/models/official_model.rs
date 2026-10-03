@@ -269,6 +269,7 @@ mod tests {
     #[test]
     fn flexible_string_accepts_string_number_and_null() {
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct Sample {
             #[serde(default, deserialize_with = "de_flexible_string")]
             thinking_level: Option<String>,
