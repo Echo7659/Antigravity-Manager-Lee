@@ -51,7 +51,7 @@ impl AccountService {
         let access_token = token_res.access_token.clone();
         match modules::quota::fetch_quota(&access_token, &email_for_log, Some(&account.id)).await {
             Ok((quota_data, new_project_id)) => {
-                account.quota = Some(quota_data);
+                account.update_quota(quota_data);
                 if let Some(pid) = new_project_id {
                     account.token.project_id = Some(pid);
                 }

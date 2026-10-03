@@ -4048,14 +4048,18 @@ impl TokenManager {
                 let content = std::fs::read_to_string(&entry.value().account_path).ok()?;
                 let account: serde_json::Value = serde_json::from_str(&content).ok()?;
                 let quota = account.get("quota")?;
-                let timestamp = quota.get("last_updated")?.as_i64().filter(|t| *t > 0)?;
-                quota.get("models")?.as_array()?.iter().find(|model| {
+                let catalog = quota
+                    .get("last_successful_catalog")
+                    .filter(|snapshot| !snapshot.is_null())
+                    .unwrap_or(quota);
+                let timestamp = catalog.get("last_updated")?.as_i64().filter(|t| *t > 0)?;
+                catalog.get("models")?.as_array()?.iter().find(|model| {
                     model
-                        .get("name")
-                        .and_then(|v| v.as_str())
+                        .as_str()
+                        .or_else(|| model.get("name").and_then(|v| v.as_str()))
                         .is_some_and(|name| !name.trim().is_empty())
                 })?;
-                Some((timestamp, (entry.key().clone(), quota.clone())))
+                Some((timestamp, (entry.key().clone(), catalog.clone())))
             })
             .collect();
         snapshots.sort_by(|(left_time, (left_id, _)), (right_time, (right_id, _))| {
@@ -4066,7 +4070,10 @@ impl TokenManager {
         for (_, quota) in select_catalog_snapshots(snapshots, now) {
             if let Some(raw_models) = quota.get("models").and_then(|v| v.as_array()) {
                 for model in raw_models {
-                    if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
+                    if let Some(name) = model
+                        .as_str()
+                        .or_else(|| model.get("name").and_then(|v| v.as_str()))
+                    {
                         let id = name.trim().to_ascii_lowercase();
                         if !id.is_empty() {
                             models.insert(id);
@@ -5113,6 +5120,85 @@ mod tests {
         assert!(
             !crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
                 .contains_key("retired-catalog-test-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_keeps_last_success_after_empty_quota_update() {
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let data_dir = crate::modules::account::get_data_dir().unwrap();
+        let accounts_dir = data_dir.join("accounts");
+        std::fs::create_dir(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mut account: crate::models::Account =
+            serde_json::from_value(weekly_quota_account(now)).unwrap();
+        let mut first = account.quota.clone().unwrap();
+        first.models.truncate(1);
+        first.models[0].name = "claude-sonnet-4-7".to_string();
+        first.model_forwarding_rules.insert(
+            "retired-last-known-good".to_string(),
+            "claude-sonnet-4-7".to_string(),
+        );
+        // Existing account files have no dedicated catalog snapshot yet.
+        account.quota = Some(first);
+        let path = accounts_dir.join("weekly-test.json");
+        std::fs::write(&path, serde_json::to_string(&account).unwrap()).unwrap();
+        let manager = TokenManager::new(data_dir);
+        manager.load_accounts().await.unwrap();
+        assert!(manager
+            .get_all_collected_models()
+            .contains("claude-sonnet-4-7"));
+
+        let mut empty = crate::models::QuotaData::new();
+        empty.last_updated = now + 1;
+        crate::modules::account::update_account_quota("weekly-test", empty).unwrap();
+        account = crate::modules::account::load_account("weekly-test").unwrap();
+        assert!(account.quota.as_ref().unwrap().models.is_empty());
+        assert!(account
+            .quota
+            .as_ref()
+            .unwrap()
+            .model_forwarding_rules
+            .is_empty());
+        manager.reload_account("weekly-test").await.unwrap();
+        assert!(manager
+            .get_all_collected_models()
+            .contains("claude-sonnet-4-7"));
+        assert_eq!(
+            crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
+                .get("retired-last-known-good")
+                .unwrap()
+                .value(),
+            "claude-sonnet-4-7"
+        );
+
+        let mut second_empty = crate::models::QuotaData::new();
+        second_empty.last_updated = now + 2;
+        crate::modules::account::update_account_quota("weekly-test", second_empty).unwrap();
+        manager.reload_account("weekly-test").await.unwrap();
+        assert!(manager
+            .get_all_collected_models()
+            .contains("claude-sonnet-4-7"));
+
+        let mut recovered: crate::models::QuotaData =
+            serde_json::from_value(weekly_quota_account(now + 3)["quota"].clone()).unwrap();
+        recovered.models.truncate(1);
+        recovered.models[0].name = "gemini-3.8-flash-high".to_string();
+        crate::modules::account::update_account_quota("weekly-test", recovered).unwrap();
+        account = crate::modules::account::load_account("weekly-test").unwrap();
+        assert!(account
+            .quota
+            .as_ref()
+            .unwrap()
+            .last_successful_catalog
+            .is_none());
+        manager.reload_account("weekly-test").await.unwrap();
+        let recovered_models = manager.get_all_collected_models();
+        assert!(recovered_models.contains("gemini-3.8-flash-high"));
+        assert!(!recovered_models.contains("claude-sonnet-4-7"));
+        assert!(
+            !crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
+                .contains_key("retired-last-known-good")
         );
     }
 

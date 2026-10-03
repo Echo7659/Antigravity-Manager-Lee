@@ -78,6 +78,18 @@ pub struct ModelQuota {
     pub supported_mime_types: Option<std::collections::HashMap<String, bool>>,
 }
 
+/// 模型目录的最后一次成功观测，不包含动态额度状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelCatalogSnapshot {
+    /// 成功观测时间，单位为 Unix 秒。
+    pub last_updated: i64,
+    /// 上游返回的具体模型 ID。
+    pub models: Vec<String>,
+    /// 同次观测返回的淘汰模型转发规则。
+    #[serde(default)]
+    pub model_forwarding_rules: std::collections::HashMap<String, String>,
+}
+
 /// 配额数据结构
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaData {
@@ -94,6 +106,9 @@ pub struct QuotaData {
     /// 模型淘汰重定向规则表 (old_model_id -> new_model_id)
     #[serde(default)]
     pub model_forwarding_rules: std::collections::HashMap<String, String>,
+    /// 空模型响应后继续供目录使用的最后一次成功观测。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_catalog: Option<ModelCatalogSnapshot>,
     /// 按模型组的配额摘要 (weekly + 5h 双窗口),来自 retrieveUserQuotaSummary
     #[serde(default)]
     pub quota_groups: Option<Vec<QuotaGroup>>,
@@ -108,12 +123,36 @@ impl QuotaData {
             forbidden_reason: None,
             subscription_tier: None,
             model_forwarding_rules: std::collections::HashMap::new(),
+            last_successful_catalog: None,
             quota_groups: None,
         }
     }
 
     pub fn add_model(&mut self, model: ModelQuota) {
         self.models.push(model);
+    }
+
+    /// 返回当前配额中的模型目录观测；空模型响应不构成成功目录观测。
+    pub(crate) fn current_catalog_snapshot(&self) -> Option<ModelCatalogSnapshot> {
+        let models: Vec<_> = self
+            .models
+            .iter()
+            .map(|model| model.name.trim())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        (self.last_updated > 0 && !models.is_empty()).then(|| ModelCatalogSnapshot {
+            last_updated: self.last_updated,
+            models,
+            model_forwarding_rules: self.model_forwarding_rules.clone(),
+        })
+    }
+
+    /// 返回已保存的成功观测，兼容尚未写入独立目录字段的旧账号数据。
+    pub(crate) fn catalog_snapshot(&self) -> Option<ModelCatalogSnapshot> {
+        self.last_successful_catalog
+            .clone()
+            .or_else(|| self.current_catalog_snapshot())
     }
 
     /// 确保当前配额具备有效的订阅等级 (ULTRA/PRO/FREE)

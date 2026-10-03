@@ -2169,6 +2169,7 @@ pub fn mark_account_forbidden(account_id: &str, reason: &str) -> Result<(), Stri
             is_forbidden: true,
             forbidden_reason: Some(reason.to_string()),
             model_forwarding_rules: std::collections::HashMap::new(),
+            last_successful_catalog: None,
             quota_groups: None,
         });
     }

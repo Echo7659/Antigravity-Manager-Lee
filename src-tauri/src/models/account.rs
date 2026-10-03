@@ -181,6 +181,15 @@ impl Account {
                 quota.subscription_tier = existing.subscription_tier.clone();
             }
         }
+        if quota.current_catalog_snapshot().is_some() {
+            quota.last_successful_catalog = None;
+        } else {
+            quota.last_successful_catalog = self
+                .quota
+                .as_ref()
+                .and_then(QuotaData::catalog_snapshot)
+                .or(quota.last_successful_catalog);
+        }
         quota.ensure_subscription_tier();
         self.quota = Some(quota);
     }

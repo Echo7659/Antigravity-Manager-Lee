@@ -276,8 +276,9 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
 
     // 3. 图像模型保底
     if m.contains("image") {
-        return m == "gemini-3-pro-image"
-            || model_version(m, "gemini-").is_some_and(|version| version >= (3, 1));
+        return !m.contains("preview")
+            && (m == "gemini-3-pro-image"
+                || model_version(m, "gemini-").is_some_and(|version| version >= (3, 1)));
     }
 
     // 4. Gemini Pro 系列：以官方最新为准 (3.1 Pro)，淘汰 2.5 Pro 及以下历史旧模型
@@ -1118,6 +1119,9 @@ mod tests {
         // Image models
         assert!(is_model_compliant_with_baseline("gemini-3.1-flash-image"));
         assert!(is_model_compliant_with_baseline("gemini-4.0-flash-image"));
+        assert!(!is_model_compliant_with_baseline(
+            "gemini-3.1-pro-image-preview"
+        ));
         assert!(is_model_compliant_with_baseline("gemini-3-pro-image"));
 
         // Internal models
