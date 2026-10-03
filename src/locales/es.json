@@ -99,7 +99,6 @@
     "switch_to_malay": "Cambiar a Malayo",
     "switch_to_malay_short": "MY",
     "user_token": "Tokens de usuario",
-    "apikey_fun": "Estación de tránsito",
     "logout": "Cerrar sesión",
     "more": "More"
   },
@@ -1382,49 +1381,6 @@
     "expires_custom": "Custom Time",
     "custom_expires_at": "Custom Expiration At",
     "hint_custom_expires": "Set precise expiration timestamp for this token"
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN Hub",
-    "eyebrow": "Hub",
-    "description": "El API Hub oficial de Antigravity Tools, que proporciona servicios de API de modelos grandes estables, abiertos y rentables. Admite modelos populares como Claude, OpenAI y Gemini. Ideal para configuración unificada en Codex, Gemini CLI, Claude Code y otras herramientas de desarrollo.",
-    "viewNow": "Ver ahora",
-    "usage": {
-      "remainingAmount": "Restante",
-      "usedAmount": "Usado",
-      "todayRequests": "Solicitudes de hoy",
-      "todayTokens": "Tokens de hoy",
-      "totalRequests": "Total de solicitudes",
-      "totalTokens": "Total de tokens"
-    },
-    "keyManager": {
-      "title": "Gestión de claves",
-      "desc": "Guarde las API Keys de uso frecuente. Haga clic para cambiar y consultar el saldo automáticamente.",
-      "lastRemainingLabel": "Último saldo",
-      "lastRemaining": "${{value}}",
-      "notQueried": "No consultado",
-      "addedAt": "Agregado el",
-      "empty": "No hay claves guardadas."
-    },
-    "queryTitle": "Consulta de cuota de clave",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "Pegue su API Key...",
-    "queryButton": "Actualizar",
-    "cli": {
-      "quickConfig": "Configuración local en un clic",
-      "syncDesc": "Sincronizar con la configuración estándar oficial",
-      "codexTooltip": "Sync API Key & BaseURL to Antigravity Codex",
-      "claudeTooltip": "Sincronizar API Key y BaseURL con Claude Code",
-      "opencodeTooltip": "Sincronizar API Key, BaseURL y modelos con OpenCode"
-    },
-    "models": {
-      "title": "Modelos disponibles",
-      "empty": "No se devolvieron modelos para la API Key actual."
-    },
-    "errors": {
-      "parseFormat": "Error de formato de análisis: {{err}}",
-      "fetchFailed": "Error al obtener datos: {{err}}",
-      "queryFailed": "Error al obtener cuotas o modelos válidos. Compruebe si la API Key y la Base URL son correctas."
-    }
   },
   "suggestion_delete_thinking": {
     "title": "Recomendación de actualización",

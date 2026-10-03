@@ -99,7 +99,6 @@
     "switch_to_malay": "マレー語に切り替え",
     "switch_to_malay_short": "MY",
     "user_token": "ユーザートークン",
-    "apikey_fun": "Transit Station",
     "logout": "ログアウト",
     "more": "その他"
   },
@@ -1382,49 +1381,6 @@
     "expires_custom": "カスタム時間",
     "custom_expires_at": "カスタム有効期限",
     "hint_custom_expires": "Tokenの正確な有効期限日時を設定"
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN ハブ",
-    "eyebrow": "ハブ",
-    "description": "Antigravity Tools 公式提携ハブ。安定かつ高コストパフォーマンスのAPIサービスを提供します。Claude、OpenAI、Geminiなどのモデルをサポート。",
-    "viewNow": "今すぐ見る",
-    "usage": {
-      "remainingAmount": "残高",
-      "usedAmount": "使用済み",
-      "todayRequests": "本日のリクエスト",
-      "todayTokens": "本日のトークン",
-      "totalRequests": "総リクエスト",
-      "totalTokens": "総トークン"
-    },
-    "keyManager": {
-      "title": "キー管理",
-      "desc": "よく使うAPIキーを保存し、クリックで切り替えて残高を確認します。",
-      "lastRemainingLabel": "前回残高",
-      "lastRemaining": "${{value}}",
-      "notQueried": "未確認",
-      "addedAt": "追加日時",
-      "empty": "保存されたキーはありません"
-    },
-    "queryTitle": "キー残高照会",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "APIキーを貼り付け...",
-    "queryButton": "更新",
-    "cli": {
-      "quickConfig": "ワンクリック開発環境設定",
-      "syncDesc": "公式標準設定に同期",
-      "codexTooltip": "Codexに同期",
-      "claudeTooltip": "Claude Codeに同期",
-      "opencodeTooltip": "API Key、BaseURL、モデルを OpenCode に同期"
-    },
-    "models": {
-      "title": "利用可能なモデル",
-      "empty": "モデルリストがありません"
-    },
-    "errors": {
-      "parseFormat": "パースエラー: {{err}}",
-      "fetchFailed": "取得失敗: {{err}}",
-      "queryFailed": "データの取得に失敗しました。キーを確認してください。"
-    }
   },
   "suggestion_delete_thinking": {
     "title": "バージョン更新のお知らせ",

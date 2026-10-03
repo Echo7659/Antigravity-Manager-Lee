@@ -98,7 +98,6 @@
     "switch_to_malay": "切換到馬來語",
     "switch_to_malay_short": "MY",
     "user_token": "用戶 Token",
-    "apikey_fun": "Transit Station",
     "logout": "Logout",
     "more": "更多"
   },
@@ -1376,65 +1375,6 @@
     "expires_custom": "自訂時間",
     "custom_expires_at": "自訂到期時間",
     "hint_custom_expires": "設定 Token 的精確到期時間點"
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN 中轉站",
-    "eyebrow": "中轉站",
-    "description": "Antigravity Tools 官方合作中轉站，提供穩定、開放、高性價比的大模型 API 服務。支援 Claude、OpenAI、Gemini 等主流模型。透過專屬連結註冊，可享最高充值永久 95 折優惠。",
-    "viewNow": "立即查看",
-    "usage": {
-      "remainingAmount": "剩餘額度",
-      "usedAmount": "已用額度",
-      "todayRequests": "今日請求",
-      "todayTokens": "今日 Token",
-      "totalRequests": "總請求",
-      "totalTokens": "總 Token"
-    },
-    "keyManager": {
-      "title": "金鑰管理",
-      "desc": "儲存常用 API Key，點擊即可切換並自動查詢額度。",
-      "lastRemainingLabel": "上次餘額",
-      "lastRemaining": "${{value}}",
-      "notQueried": "未查詢",
-      "addedAt": "新增於",
-      "empty": "暫無儲存的金鑰。"
-    },
-    "queryTitle": "金鑰額度查詢",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "貼上你的 API Key...",
-    "queryButton": "重新整理",
-    "cli": {
-      "quickConfig": "一鍵配置本地開發環境",
-      "syncDesc": "同步至官方標準配置",
-      "codexTooltip": "將 API Key 同步至 Antigravity Codex",
-      "claudeTooltip": "將 API Key 同步至 Claude Code",
-      "opencodeTooltip": "將 API Key、BaseURL 與模型同步至 OpenCode"
-    },
-    "models": {
-      "title": "可用模型",
-      "empty": "輸入 API Key 並查詢以取得可用模型清單。",
-      "emptyFromKey": "尚未取得模型。請點擊重新整理以取得模型清單。"
-    },
-    "errors": {
-      "parseFormat": "解析格式異常: {{err}}",
-      "fetchFailed": "取得失敗: {{err}}",
-      "queryFailed": "無法取得有效的額度資料，請確認 API Key 是否有效。"
-    },
-    "opencode": {
-      "modelsRequired": "請先重新整理此金鑰以載入可用模型，再啟用其 OpenCode 設定。",
-      "active": "已同步",
-      "modified": "有差異",
-      "inactive": "未啟用",
-      "syncedToast": "已同步至 OpenCode: {{name}}",
-      "removedToast": "已從 OpenCode 移除設定檔 {{name}}",
-      "clickToRemove": "OpenCode 設定檔已啟用且一致。點擊停用（移除設定檔）",
-      "clickToUpdate": "設定或模型存在差異。點擊更新",
-      "clickToActivate": "點擊以在 OpenCode 中啟用獨立設定檔",
-      "syncedActiveTooltip": "OpenCode: 設定完全相符（已啟用）。點擊停用／移除",
-      "partialTooltip": "OpenCode: 設定或模型存在差異。點擊同步"
-    },
-    "syncSuccess": "成功同步至 {{app}}",
-    "syncError": "同步失敗: {{error}}"
   },
   "errors": {
     "stream": {

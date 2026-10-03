@@ -97,7 +97,6 @@
     "switch_to_malay": "切换到马来语",
     "switch_to_malay_short": "MY",
     "user_token": "用户 Token",
-    "apikey_fun": "中转站",
     "logout": "登出",
     "more": "更多"
   },
@@ -1447,65 +1446,6 @@
     "expires_custom": "自定义时间",
     "custom_expires_at": "自定义到期时间",
     "hint_custom_expires": "设置 Token 的精确到期时间点"
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN 中转站",
-    "eyebrow": "中转站",
-    "description": "Antigravity Tools 官方合作中转站，为用户提供稳定、开放、高性价比的大模型 API 接入服务。支持 Claude、OpenAI、Gemini 等主流模型，适合在 Codex、Gemini CLI、Claude Code 及其他开发工具中统一配置使用。通过 Antigravity Tools 专属链接注册，可享受最高充值永久 95 折优惠。",
-    "viewNow": "立即查看",
-    "usage": {
-      "remainingAmount": "剩余额度",
-      "usedAmount": "已用额度",
-      "todayRequests": "今日请求",
-      "todayTokens": "今日 Token",
-      "totalRequests": "总请求",
-      "totalTokens": "总 Token"
-    },
-    "keyManager": {
-      "title": "密钥管理",
-      "desc": "保存常用 API Key，点击即可切换并自动查询额度。",
-      "lastRemainingLabel": "上次余额",
-      "lastRemaining": "${{value}}",
-      "notQueried": "未查询",
-      "addedAt": "添加于",
-      "empty": "暂无保存的密钥。"
-    },
-    "queryTitle": "密钥额度查询",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "粘贴你的 API Key...",
-    "queryButton": "刷新",
-    "cli": {
-      "quickConfig": "一键配置本地开发环境",
-      "syncDesc": "同步至官方标准配置",
-      "codexTooltip": "将 API Key 与 BaseURL 同步至 Codex / ChatGPT CLI",
-      "claudeTooltip": "将 API Key 与 BaseURL 同步至 Claude Code",
-      "opencodeTooltip": "将 API Key、BaseURL 和模型同步至 OpenCode"
-    },
-    "models": {
-      "title": "可用模型",
-      "empty": "输入 API Key 并查询以获取可用模型列表。",
-      "emptyFromKey": "暂未获取到模型。请点击刷新以获取模型列表。"
-    },
-    "errors": {
-      "parseFormat": "解析格式异常: {{err}}",
-      "fetchFailed": "获取失败: {{err}}",
-      "queryFailed": "无法获取有效的额度数据或模型列表，请确认 API Key 是否有效，以及接口地址是否正确。"
-    },
-    "opencode": {
-      "modelsRequired": "请先刷新此密钥以加载可用模型，再激活其 OpenCode 配置。",
-      "active": "已同步",
-      "modified": "有差异",
-      "inactive": "未激活",
-      "syncedToast": "已同步至 OpenCode: {{name}}",
-      "removedToast": "已从 OpenCode 移除配置 {{name}}",
-      "clickToRemove": "OpenCode 配置已激活且一致。点击取消激活（移除配置）",
-      "clickToUpdate": "设置或模型存在差异。点击更新",
-      "clickToActivate": "点击以在 OpenCode 中激活独立配置",
-      "syncedActiveTooltip": "OpenCode: 配置完全匹配（已激活）。点击取消激活/移除",
-      "partialTooltip": "OpenCode: 设置或模型存在差异。点击更新"
-    },
-    "syncSuccess": "成功同步至 {{app}}",
-    "syncError": "同步失败: {{error}}"
   },
   "suggestion_delete_thinking": {
     "title": "版本更新提示",

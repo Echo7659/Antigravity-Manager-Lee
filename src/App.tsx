@@ -10,7 +10,6 @@ import TokenStats from './pages/TokenStats';
 import Security from './pages/Security';
 import ThemeManager from './components/common/ThemeManager';
 import UserToken from './pages/UserToken';
-import { ApiKeyFun } from './pages/ApiKeyFun';
 import SuggestionDeleteThinkingModal from './components/common/SuggestionDeleteThinkingModal';
 import DebugConsole from './components/debug/DebugConsole';
 import { useEffect, startTransition } from 'react';
@@ -46,10 +45,6 @@ const router = createBrowserRouter([
       {
         path: 'user-token',
         element: <UserToken />,
-      },
-      {
-        path: 'apikey-fun',
-        element: <ApiKeyFun />,
       },
       {
         path: 'security',

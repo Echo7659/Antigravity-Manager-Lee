@@ -13,6 +13,18 @@ for (const path of await sourceFiles('src')) {
     const source = await readFile(path, 'utf8');
     assert.doesNotMatch(source, /@tauri-apps|isTauri\(/, path);
 }
+for (const path of ['src/App.tsx', 'src/components/navbar/Navbar.tsx', 'src/pages/Settings.tsx']) {
+    const source = await readFile(path, 'utf8');
+    assert.doesNotMatch(source, /apikey-fun|nav\.apikey_fun|ApiKeyFun/, `Removed promotion entry: ${path}`);
+}
+for (const file of (await readdir('src/locales')).filter(file => file.endsWith('.json'))) {
+    const locale = JSON.parse(await readFile(`src/locales/${file}`, 'utf8'));
+    assert.equal(Object.hasOwn(locale, 'apiKeyFun'), false, `${file}: removed promotion namespace`);
+    assert.equal(Object.hasOwn(locale.nav ?? {}, 'apikey_fun'), false, `${file}: removed promotion menu label`);
+}
+assert.equal((await sourceFiles('src')).some(path => path.endsWith('/ApiKeyFun.tsx')), false);
+assert.match(await readFile('src/App.tsx', 'utf8'), /path: 'api-proxy'/);
+assert.match(await readFile('src/pages/Settings.tsx', 'utf8'), /<ProxyPoolSettings\b/);
 await assert.rejects(request('unknown_command'), /Unsupported command: unknown_command/);
 assert.deepEqual(await readJsonFile(new File(['{"accounts":[]}'], 'accounts.json')), { accounts: [] });
 await assert.rejects(readJsonFile(new File(['invalid'], 'accounts.json')), SyntaxError);

@@ -99,7 +99,6 @@
     "switch_to_malay": "Switch to Malay",
     "switch_to_malay_short": "MY",
     "user_token": "User Tokens",
-    "apikey_fun": "Transit Station",
     "logout": "Logout",
     "more": "More"
   },
@@ -1481,65 +1480,6 @@
     "expires_custom": "Custom Time",
     "custom_expires_at": "Custom Expiration At",
     "hint_custom_expires": "Set precise expiration timestamp for this token"
-  },
-  "apiKeyFun": {
-    "title": "APIKEY.FUN Hub",
-    "eyebrow": "Hub",
-    "description": "The official Antigravity Tools API Hub, providing stable, open, and cost-effective large model API services. Supports mainstream models like Claude, OpenAI, and Gemini. Ideal for unified configuration in Codex, Gemini CLI, Claude Code, and other development tools.",
-    "viewNow": "View Now",
-    "usage": {
-      "remainingAmount": "Remaining",
-      "usedAmount": "Used",
-      "todayRequests": "Today's Requests",
-      "todayTokens": "Today's Tokens",
-      "totalRequests": "Total Requests",
-      "totalTokens": "Total Tokens"
-    },
-    "keyManager": {
-      "title": "Key Management",
-      "desc": "Save frequently used API Keys. Click to switch and query balance automatically.",
-      "lastRemainingLabel": "Last Balance",
-      "lastRemaining": "${{value}}",
-      "notQueried": "Not queried",
-      "addedAt": "Added at",
-      "empty": "No saved keys."
-    },
-    "queryTitle": "Key Quota Query",
-    "apiKeyLabel": "API Key",
-    "apiKeyPlaceholder": "Paste your API Key...",
-    "queryButton": "Refresh",
-    "cli": {
-      "quickConfig": "One-Click Local Dev Setup",
-      "syncDesc": "Sync to official standard configuration",
-      "codexTooltip": "Sync API Key & BaseURL to Codex / ChatGPT CLI",
-      "claudeTooltip": "Sync API Key & BaseURL to Claude Code",
-      "opencodeTooltip": "Sync API Key, BaseURL and models to OpenCode"
-    },
-    "models": {
-      "title": "Available Models",
-      "empty": "Enter key and query to load available models.",
-      "emptyFromKey": "No models returned yet. Query to fetch models."
-    },
-    "errors": {
-      "parseFormat": "Parse format error: {{err}}",
-      "fetchFailed": "Fetch failed: {{err}}",
-      "queryFailed": "Failed to get valid quota or models. Please check if the API Key and Base URL are correct."
-    },
-    "opencode": {
-      "modelsRequired": "Refresh this key to load available models before activating its OpenCode profile.",
-      "active": "Active",
-      "modified": "Modified",
-      "inactive": "Inactive",
-      "syncedToast": "Synced to OpenCode: {{name}}",
-      "removedToast": "Removed from OpenCode: {{name}}",
-      "clickToRemove": "OpenCode profile is active and synced. Click to deactivate/remove",
-      "clickToUpdate": "Settings or models differ. Click to update",
-      "clickToActivate": "Click to activate separate profile in OpenCode",
-      "syncedActiveTooltip": "OpenCode: profile is active and fully synced. Click to deactivate",
-      "partialTooltip": "OpenCode: settings or models differ. Click to sync"
-    },
-    "syncSuccess": "Successfully synced to {{app}}",
-    "syncError": "Failed to sync: {{error}}"
   },
   "suggestion_delete_thinking": {
     "title": "Update Recommendation",
