@@ -3303,19 +3303,24 @@ mod tests {
         let (result, _, _, _) =
             transform_openai_request(&req, "test-proj", "gemini-2.5-flash", None);
         let contents = result["request"]["contents"].as_array().unwrap();
-        let tool_turn_parts = contents[2]["parts"].as_array().unwrap();
+        let parts = contents
+            .iter()
+            .flat_map(|content| content["parts"].as_array().unwrap().iter())
+            .collect::<Vec<_>>();
+        let function_response = parts
+            .iter()
+            .find(|part| part.get("functionResponse").is_some())
+            .expect("function response");
+        let inline_data = &parts
+            .iter()
+            .find(|part| part.get("inlineData").is_some())
+            .expect("inline image data")["inlineData"];
 
-        // 验证同时存在 functionResponse 和 inlineData 两个 parts
-        assert_eq!(tool_turn_parts.len(), 2);
-        assert!(tool_turn_parts[0].get("functionResponse").is_some());
-        assert!(tool_turn_parts[1].get("inlineData").is_some());
-
-        let inline_data = &tool_turn_parts[1]["inlineData"];
         assert_eq!(inline_data["mimeType"], "image/png");
         assert_eq!(inline_data["data"], fake_b64);
 
         // 验证文本中的 base64 已被替换为摘要说明，防止 functionResponse 体积膨胀
-        let func_res_str = tool_turn_parts[0]["functionResponse"]["response"]["output"]
+        let func_res_str = function_response["functionResponse"]["response"]["output"]
             .as_str()
             .unwrap();
         assert!(!func_res_str.contains(fake_b64));

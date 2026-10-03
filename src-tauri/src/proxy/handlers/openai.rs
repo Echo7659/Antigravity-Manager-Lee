@@ -1124,10 +1124,9 @@ data: {"type":"response.failed","response":{"status":"failed","error":{"code":"u
             .find(|part| part.get("inlineData").is_some())
             .expect("inline image data");
 
-        assert_eq!(
-            function_response["functionResponse"]["response"]["result"],
-            "image generated"
-        );
+        let response = &function_response["functionResponse"]["response"];
+        assert_eq!(response["output"], "image generated");
+        assert!(response.get("result").is_none());
         assert!(!function_response.to_string().contains("data:image/"));
         assert_eq!(inline_data["inlineData"]["mimeType"], "image/png");
         assert_eq!(inline_data["inlineData"]["data"], "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==");

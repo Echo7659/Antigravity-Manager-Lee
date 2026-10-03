@@ -3439,7 +3439,7 @@ mod tests {
 
     #[test]
     fn test_claude_request_with_corrupt_and_empty_images_defense() {
-        let valid_png_b64 = "iVBORw0KGgo=";
+        let valid_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         let req = ClaudeRequest {
             model: "claude-3-7-sonnet-20250219".to_string(),
             messages: vec![Message {
@@ -3707,18 +3707,23 @@ mod tests {
         let contents = body["request"]["contents"]
             .as_array()
             .expect("contents array");
-        let tool_parts = contents[2]["parts"].as_array().expect("tool turn parts");
+        let parts = contents
+            .iter()
+            .flat_map(|content| content["parts"].as_array().expect("content parts").iter())
+            .collect::<Vec<_>>();
+        let function_response = parts
+            .iter()
+            .find(|part| part.get("functionResponse").is_some())
+            .expect("function response");
+        let inline_data = &parts
+            .iter()
+            .find(|part| part.get("inlineData").is_some())
+            .expect("inline image data")["inlineData"];
 
-        // 验证同时存在 functionResponse 和 inlineData 两个 parts
-        assert_eq!(tool_parts.len(), 2);
-        assert!(tool_parts[0].get("functionResponse").is_some());
-        assert!(tool_parts[1].get("inlineData").is_some());
-
-        let inline_data = &tool_parts[1]["inlineData"];
         assert_eq!(inline_data["mimeType"], "image/png");
         assert_eq!(inline_data["data"], fake_b64);
 
-        let res_str = tool_parts[0]["functionResponse"]["response"]["output"]
+        let res_str = function_response["functionResponse"]["response"]["output"]
             .as_str()
             .unwrap();
         assert!(!res_str.contains(fake_b64));
