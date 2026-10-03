@@ -394,6 +394,31 @@ pub async fn get_proxy_status(state: State<'_, ProxyServiceState>) -> Result<Pro
     }
 }
 
+/// 返回与代理协议模型列表一致的模型 ID。
+#[tauri::command]
+pub async fn get_proxy_models(state: State<'_, ProxyServiceState>) -> Result<Vec<String>, String> {
+    let runtime = state
+        .instance
+        .read()
+        .await
+        .as_ref()
+        .map(|instance| (instance.axum_server.clone(), instance.token_manager.clone()));
+    if let Some((server, token_manager)) = runtime {
+        return Ok(server.list_models(&token_manager).await);
+    }
+
+    let config = crate::modules::config::load_app_config()?;
+    let token_manager = TokenManager::new(crate::modules::account::get_data_dir()?);
+    token_manager.load_accounts().await?;
+    let mapping = RwLock::new(config.proxy.custom_mapping);
+    Ok(crate::proxy::common::model_mapping::get_all_dynamic_models(
+        &mapping,
+        Some(&token_manager),
+        config.proxy.only_raw_quota_models,
+    )
+    .await)
+}
+
 /// 获取反代服务统计
 #[tauri::command]
 pub async fn get_proxy_stats(state: State<'_, ProxyServiceState>) -> Result<ProxyStats, String> {

@@ -487,6 +487,17 @@ pub struct AxumServer {
 }
 
 impl AxumServer {
+    /// 返回代理当前使用的模型目录。
+    pub async fn list_models(&self, token_manager: &TokenManager) -> Vec<String> {
+        let only_raw = *self.only_raw_quota_models.read().await;
+        crate::proxy::common::model_mapping::get_all_dynamic_models(
+            &self.custom_mapping,
+            Some(token_manager),
+            only_raw,
+        )
+        .await
+    }
+
     pub async fn update_only_raw_quota_models(&self, only_raw: bool) {
         let mut r = self.only_raw_quota_models.write().await;
         *r = only_raw;
@@ -828,6 +839,7 @@ impl AxumServer {
             .route("/stats/accounts", get(admin_get_token_stats_by_account))
             .route("/stats/models", get(admin_get_token_stats_by_model))
             .route("/config", get(admin_get_config).post(admin_save_config))
+            .route("/proxy/models", get(admin_get_proxy_models))
             .route("/proxy/cli/status", post(admin_get_cli_sync_status))
             .route("/proxy/cli/sync", post(admin_execute_cli_sync))
             .route("/proxy/cli/restore", post(admin_execute_cli_restore))
@@ -4331,6 +4343,18 @@ async fn admin_get_opencode_sync_status(
 
 async fn admin_get_opencode_families() -> impl IntoResponse {
     Json(crate::proxy::opencode_sync::get_canonical_families())
+}
+
+async fn admin_get_proxy_models(State(state): State<AppState>) -> impl IntoResponse {
+    let only_raw = *state.only_raw_quota_models.read().await;
+    Json(
+        crate::proxy::common::model_mapping::get_all_dynamic_models(
+            &state.custom_mapping,
+            Some(&state.token_manager),
+            only_raw,
+        )
+        .await,
+    )
 }
 
 #[derive(Deserialize)]

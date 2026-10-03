@@ -14,11 +14,7 @@ pub async fn service_status_middleware(
     let path = request.uri().path();
 
     // Always allow Admin API, internal endpoints and Auth callback
-    if path.starts_with("/api/")
-        || path.starts_with("/internal/")
-        || path == "/auth/callback"
-        || path == "/health"
-    {
+    if is_status_exempt(path) {
         return next.run(request).await;
     }
 
@@ -36,4 +32,22 @@ pub async fn service_status_middleware(
     }
 
     next.run(request).await
+}
+
+fn is_status_exempt(path: &str) -> bool {
+    path.starts_with("/api/")
+        || path.starts_with("/internal/")
+        || path == "/auth/callback"
+        || path == "/health"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_status_exempt;
+
+    #[test]
+    fn admin_models_remain_available_when_proxy_is_stopped() {
+        assert!(is_status_exempt("/api/proxy/models"));
+        assert!(!is_status_exempt("/v1/models"));
+    }
 }

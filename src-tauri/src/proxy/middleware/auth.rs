@@ -239,6 +239,42 @@ pub struct UserTokenIdentity {
 mod tests {
     use super::*;
     use crate::proxy::ProxyAuthMode;
+    use axum::{middleware::from_fn_with_state, routing::get, Router};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn admin_model_catalog_requires_admin_password() {
+        let security = Arc::new(RwLock::new(ProxySecurityConfig {
+            auth_mode: ProxyAuthMode::Off,
+            api_key: "proxy-key".to_string(),
+            admin_password: Some("admin-key".to_string()),
+            allow_lan_access: true,
+            port: 8045,
+            security_monitor: crate::proxy::config::SecurityMonitorConfig::default(),
+        }));
+        let app = Router::new()
+            .route("/api/proxy/models", get(|| async { StatusCode::OK }))
+            .layer(from_fn_with_state(security, admin_auth_middleware));
+
+        let unauthorized = Request::builder()
+            .uri("/api/proxy/models")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unauthorized).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let authorized = Request::builder()
+            .uri("/api/proxy/models")
+            .header("Authorization", "Bearer admin-key")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(authorized).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
 
     #[tokio::test]
     async fn test_admin_auth_with_password() {
