@@ -145,6 +145,53 @@ async fn probe_health(port: u16) -> bool {
     )
 }
 
+async fn select_shutdown_signal(
+    interrupt: impl std::future::Future<Output = Result<(), String>>,
+    terminate: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    tokio::select! {
+        result = interrupt => result,
+        result = terminate => result,
+    }
+}
+
+async fn shutdown_signal() -> Result<(), String> {
+    let interrupt = async { tokio::signal::ctrl_c().await.map_err(|e| e.to_string()) };
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|e| e.to_string())?;
+        select_shutdown_signal(interrupt, async {
+            terminate
+                .recv()
+                .await
+                .ok_or_else(|| "SIGTERM signal stream closed".to_string())
+        })
+        .await
+    }
+    #[cfg(not(unix))]
+    {
+        select_shutdown_signal(interrupt, std::future::pending()).await
+    }
+}
+
+/// 退出事件到达后结束显式持有的任务，并关闭 HTTP 监听和账号池任务。
+async fn shutdown_after_signal(
+    runtime: ServerRuntime,
+    scheduler: tokio::task::JoinHandle<()>,
+    watchdog: tokio::task::JoinHandle<()>,
+    signal: impl std::future::Future<Output = Result<(), String>>,
+) -> Result<(), String> {
+    let result = signal.await;
+    scheduler.abort();
+    let _ = scheduler.await;
+    watchdog.abort();
+    let _ = watchdog.await;
+    runtime.shutdown().await;
+    result
+}
+
 pub async fn run() -> Result<(), String> {
     if std::env::args().any(|arg| arg == "--health-check") {
         let port = std::env::var("PORT")
@@ -195,13 +242,7 @@ pub async fn run() -> Result<(), String> {
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
     });
-    let result = tokio::signal::ctrl_c().await.map_err(|e| e.to_string());
-    scheduler.abort();
-    let _ = scheduler.await;
-    watchdog.abort();
-    let _ = watchdog.await;
-    runtime.shutdown().await;
-    result
+    shutdown_after_signal(runtime, scheduler, watchdog, shutdown_signal()).await
 }
 
 #[cfg(test)]
@@ -407,5 +448,57 @@ pub(crate) mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn server_runtime_sigint_and_sigterm_share_shutdown_and_release_listener() {
+        for terminate in [false, true] {
+            let fixture = ServerFixture::new().await;
+            let port = fixture.config.proxy.port;
+            let ServerFixture {
+                runtime,
+                previous_dir,
+                dir,
+                ..
+            } = fixture;
+            let server = runtime.server.clone();
+            let scheduler = tokio::spawn(std::future::pending::<()>());
+            let watchdog = tokio::spawn(std::future::pending::<()>());
+            let scheduler_status = scheduler.abort_handle();
+            let watchdog_status = watchdog.abort_handle();
+            let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
+            let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel();
+            if terminate {
+                terminate_tx.send(()).unwrap();
+            } else {
+                interrupt_tx.send(()).unwrap();
+            }
+            let signal = super::select_shutdown_signal(
+                async { interrupt_rx.await.map_err(|e| e.to_string()) },
+                async { terminate_rx.await.map_err(|e| e.to_string()) },
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                super::shutdown_after_signal(runtime, scheduler, watchdog, signal),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(server.is_stopped());
+            assert!(scheduler_status.is_finished());
+            assert!(watchdog_status.is_finished());
+            assert!(
+                tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                    .await
+                    .is_err()
+            );
+            unsafe {
+                match previous_dir {
+                    Some(value) => std::env::set_var("ABV_DATA_DIR", value),
+                    None => std::env::remove_var("ABV_DATA_DIR"),
+                }
+            }
+            drop(dir);
+        }
     }
 }

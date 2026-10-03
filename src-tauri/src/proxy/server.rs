@@ -1254,6 +1254,47 @@ impl AxumServer {
 #[cfg(test)]
 mod admin_model_catalog_tests {
     #[tokio::test]
+    async fn admin_account_switch_preserves_preferred_account_and_clears_sessions() {
+        let fixture = crate::runtime::tests::ServerFixture::new().await;
+        let manager = fixture.runtime.server.token_manager.clone();
+        let mut other = crate::modules::account::load_account("fixture-account").unwrap();
+        other.id = "other-account".into();
+        other.email = "other@example.test".into();
+        crate::modules::account::save_account(&other).unwrap();
+
+        for preferred in [None, Some("fixture-account".to_string())] {
+            manager.set_preferred_account(preferred.clone()).await;
+            manager.commit_session("existing-session", "fixture-account");
+            fixture
+                .client
+                .post(format!("{}/api/accounts/switch", fixture.url))
+                .bearer_auth("fixture-key")
+                .json(&serde_json::json!({"accountId":"other-account"}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            assert_eq!(manager.get_preferred_account().await, preferred);
+            assert!(!manager.abandon_session("existing-session", "fixture-account"));
+            let current: serde_json::Value = fixture
+                .client
+                .get(format!("{}/api/accounts/current", fixture.url))
+                .bearer_auth("fixture-key")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(current["id"], "other-account");
+        }
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn admin_model_catalog_saving_config_updates_mapping_and_raw_mode() {
         let fixture = crate::runtime::tests::ServerFixture::new().await;
         fixture.stop_proxy().await;
@@ -1677,12 +1718,8 @@ async fn admin_switch_account(
         Ok(()) => {
             logger::log_info(&format!("[API] Account switch successful: {}", account_id));
 
-            // [FIX #1166] 账号切换后立即同步内存状态
+            // 当前账号切换使既有会话重新选路，不改变专用固定账号设置。
             state.token_manager.clear_all_sessions();
-            state
-                .token_manager
-                .set_preferred_account(Some(account_id))
-                .await;
 
             Ok(StatusCode::OK)
         }
