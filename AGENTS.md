@@ -3,24 +3,23 @@
 - **Architecture**: This project is a gateway that aggregates four AI protocols — OpenAI Responses, OpenAI Chat Completions, Anthropic Claude, and Google Gemini — and outputs Antigravity-style Gemini protocol format.
 - **Pipeline First**: Keep the pipeline strictly decoupled from specific protocols. The four protocols function purely as Gemini adapters. Adapters are restricted to parameter normalization, payload transformation, protocol divergence adaptation, and edge cases unsolvable within the pipeline stage. The pipeline stage uniformly handles the converted Gemini payloads, including thinking block backfilling, thinking budget filtering and backfilling, unified context structural alignment, prefix stability, and the sanitization of risky prompts and request headers.
 - **Backend Fix Strategy**: Prioritize protocol-agnostic, generic fixes within the pipeline rather than localized adapter modifications. Treat adapter-level patches as a last resort only when a generic pipeline solution is infeasible or degrades compatibility.
-- **UI Design & Headless Compatibility**:
+- **Web Design & Headless Compatibility**:
   - **Minimalist & Contextual UI**: Prioritize user-friendly, non-intrusive interactions. Reuse existing design conventions (e.g., pill toggle buttons, badge switches, or contextual setting panels) placed strictly within their most relevant sections rather than scattering unrelated controls.
-  - **Headless & CLI Parity**: Ensure GUI configurations maintain functional parity across headless servers, CLI environments, and cross-platform environments. Provide configuration file fields, environment variable overrides, or dedicated CLI flags/commands for essential settings.
-  - **Cross-Platform Compatibility**: Evaluate every code addition and dependency change for seamless cross-platform support.
+  - **Headless & API Parity**: Ensure Web configurations remain available to Linux headless deployments through configuration files, environment variables, or HTTP APIs.
+  - **Linux Compatibility**: Evaluate every code addition and dependency for the server-only Linux runtime. Do not reintroduce desktop, tray, local-client synchronization, or workstation integration dependencies.
 - **Code Quality**: Prioritize root-cause, future-proof fixes rather than hardcoded logic, dead code, or speculative changes. Prioritize generalized solutions that cover entire classes of problems rather than one-off patches.
   - *Model Routing Example*: Prioritize wildcard patterns (e.g., `gemini-*-flash-*`) to anticipate future model releases rather than exact string matches.
   - *Prompt Sanitization Example*: For agent-client prompt sanitization, prioritize regex-based pattern matching over static keyword replacement, ensuring full coverage without stripping pipeline system prompts or user queries.
 - **Formatting & CI Discipline**:
-  - **Unit Testing**: Keep focused — run targeted tests for touched modules locally; CI compiles test targets without executing them. Skip tests for trivial edits (constants, prompts, or config tweaks). No need to run the full suite locally.
-  - **Local Test Discretion**: For strings, constants, hardcoded values, or other trivial edits, ask after the task whether a small functional check is wanted rather than testing on your own. Self-test only when four or more core backend or frontend interaction files are involved; hardcoded-only edits do not count as core-file changes. In general, follow the user's preference on whether to test.
+  - **Unit Testing**: Run targeted tests for touched modules locally. For broad core changes, also run the full Rust suite serially because some fixtures temporarily override process-level data directories. CI executes the release-targeted tests; trivial documentation or constant-only edits do not require unrelated test suites.
   - **Pre-flight Checks**: Run the essentials before submitting PRs or release tags:
     - `cd src-tauri && cargo fmt -- --check` (for Rust edits)
     - `cd src-tauri && cargo clippy --all-targets --all-features` (comprehensive Rust gate, already includes compilation — no separate `cargo check` needed)
     - `npm run build` (when `src/` or frontend configs changed)
-    - Rely on CI for full-app compilation (`tauri build`) and full test execution. Local pre-flight covers fmt + clippy + frontend build only.
+    - Rely on CI for the final `linux/amd64` image build and container HTTP smoke test. The project has no Tauri desktop build.
 - **Release Channels & Discipline**:
   - **Release Channel Separation**:
-    - **Stable Releases (正式版)**: Exclusively on `main`. Deploys official production packages, updates Docker/GitHub `latest` tags, and services automatic update channels.
+    - **Stable Releases (正式版)**: Exclusively on `main`. Branch builds publish images tagged with the full commit SHA; a validated stable version tag updates Docker/GitHub `latest` and creates the formal release. Deployments pin the verified image digest.
     - **Preview Releases (预览版 / Beta)**: Exclusively on `beta`. Independently builds and publishes pre-releases (`makeLatest: false`, `prerelease: true`) without touching production update channels.
   - **Maintainer Staging Protocol**:
     - When introducing new changes (features, major refactors, non-trivial fixes), prompt and confirm with maintainers whether to implement and test on `beta` branch first.
