@@ -3320,7 +3320,7 @@ async fn handle_oauth_callback(
                         <div class="icon">✅</div>
                         <h1>Authorization Successful</h1>
                         <p>You can close this window now. The application should refresh automatically.</p>
-                        
+
                         <div class="fallback-box">
                             <span class="fallback-title">💡 Did it not refresh?</span>
                             <span class="fallback-text">If the application is running in a container or remote environment, you may need to manually copy the link below:</span>
