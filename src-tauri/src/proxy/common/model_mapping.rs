@@ -93,13 +93,14 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
 
 /// 旧客户端仍在请求带点号的 Claude 版本（`claude-opus-4.6`、`claude-sonnet-4.5`、
 /// `claude-open-4.x`）。服务端目录只认连字符形态（`claude-opus-4-6` 等）。
-/// 这里只改写 Claude ID：去掉供应商标前缀，把短版本号里的点换成连字符。
+/// 这里只改写 Claude ID：移除连续的受支持前缀，把短版本号里的点换成连字符。
 pub fn canonicalize_upstream_model_id(input: &str) -> String {
     let mut id = input.trim().to_lowercase();
-    for prefix in ["anthropic/", "models/"] {
-        if let Some(rest) = id.strip_prefix(prefix) {
-            id = rest.to_string();
-        }
+    while let Some(rest) = id
+        .strip_prefix("anthropic/")
+        .or_else(|| id.strip_prefix("models/"))
+    {
+        id = rest.to_string();
     }
     if id.contains("claude-open-") {
         id = id.replace("claude-open-", "claude-opus-");
@@ -508,11 +509,48 @@ mod opus_route_tests {
     use super::*;
 
     #[test]
+    fn opus_5_5_canonical_prefixes_are_idempotent() {
+        for prefix in [
+            "",
+            "anthropic/",
+            "models/",
+            "anthropic/models/",
+            "models/anthropic/",
+            "anthropic/anthropic/",
+            "models/models/",
+            "models/anthropic/models/anthropic/",
+        ] {
+            for model in ["claude-opus-5.5", "claude-opus-5-5"] {
+                let input = format!("{prefix}{model}");
+                let canonical = canonicalize_upstream_model_id(&input);
+                assert_eq!(canonical, "claude-opus-5-5", "{input}");
+                assert_eq!(canonicalize_upstream_model_id(&canonical), canonical);
+            }
+        }
+        for model in [
+            "future-model-9",
+            "provider/future-model-9",
+            "models/future-model-9",
+            "models/anthropic/future-model-9",
+            "custom/FutureModel",
+            "models/models/gemini-3.8-flash",
+        ] {
+            assert_eq!(canonicalize_upstream_model_id(model), model);
+        }
+        assert_eq!(
+            canonicalize_upstream_model_id("provider/claude-opus-5.5"),
+            "provider/claude-opus-5-5"
+        );
+    }
+
+    #[test]
     fn opus_5_5_protocol_configured_targets_are_canonical_before_selection() {
         let aliases = [
             "claude-opus-5-5",
             "anthropic/claude-opus-5-5",
             "claude-opus-5.5",
+            "models/anthropic/claude-opus-5.5",
+            "models/models/anthropic/anthropic/claude-opus-5.5",
         ];
         for alias in aliases {
             let mapping = HashMap::from([("client-opus".to_string(), alias.to_string())]);
@@ -530,7 +568,8 @@ mod opus_route_tests {
             );
         }
         let key = "test-opus-retired-canonical";
-        DYNAMIC_MODEL_FORWARDING_RULES.insert(key.into(), "anthropic/claude-opus-5.5".into());
+        DYNAMIC_MODEL_FORWARDING_RULES
+            .insert(key.into(), "models/anthropic/claude-opus-5.5".into());
         let direct = resolve_model_route(key, &HashMap::new());
         let chained = resolve_model_route(
             "client-opus",

@@ -66,16 +66,17 @@ async fn opus_5_5_protocol_handlers_reject_alias_forced_tools_before_account_sel
     let state = empty_state();
     let retired = "opus-handler-retired-test";
     crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
-        .insert(retired.into(), "anthropic/claude-opus-5.5".into());
-    state
-        .custom_mapping
-        .write()
-        .await
-        .insert("client-opus".into(), "anthropic/claude-opus-5.5".into());
+        .insert(retired.into(), "models/anthropic/claude-opus-5.5".into());
+    state.custom_mapping.write().await.insert(
+        "client-opus".into(),
+        "models/anthropic/claude-opus-5.5".into(),
+    );
     for model in [
         "claude-opus-5-5",
         "anthropic/claude-opus-5-5",
         "claude-opus-5.5",
+        "models/anthropic/claude-opus-5.5",
+        "models/models/anthropic/anthropic/claude-opus-5.5",
         "client-opus",
         retired,
     ] {

@@ -41,9 +41,15 @@ fn opus_5_5_protocol_forced_tools_across_adapters() {
     ];
     for config in configs {
         let body = json!({"request":{"toolConfig":config}});
-        let error =
-            super::InboundThinkingPipeline::validate_request_constraints(MODEL, &body).unwrap_err();
-        assert!(error.contains("forced tool choice"));
+        for model in [
+            MODEL,
+            "models/anthropic/claude-opus-5.5",
+            "models/models/anthropic/anthropic/claude-opus-5.5",
+        ] {
+            let error = super::InboundThinkingPipeline::validate_request_constraints(model, &body)
+                .unwrap_err();
+            assert!(error.contains("forced tool choice"));
+        }
         assert!(
             super::InboundThinkingPipeline::validate_request_constraints("future-model-9", &body)
                 .is_ok()

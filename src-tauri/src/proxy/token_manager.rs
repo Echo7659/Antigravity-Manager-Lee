@@ -4315,6 +4315,8 @@ mod tests {
                 "claude-opus-5-5-20261001",
                 "anthropic/claude-opus-5-5",
                 "claude-opus-5.5",
+                "models/anthropic/claude-opus-5.5",
+                "models/models/anthropic/anthropic/claude-opus-5.5",
             ] {
                 assert_eq!(is_model_account_eligible(&token, model), eligible);
             }

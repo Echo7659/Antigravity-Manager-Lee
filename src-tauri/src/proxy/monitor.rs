@@ -97,7 +97,7 @@ pub(crate) mod prompt_log_tests {
             "client-opus",
             &std::collections::HashMap::from([(
                 "client-opus".into(),
-                "anthropic/claude-opus-5.5".into(),
+                "models/anthropic/claude-opus-5.5".into(),
             )]),
         ));
         log.account_email = Some("opus@example.test".into());
