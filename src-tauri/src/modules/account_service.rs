@@ -1,14 +1,18 @@
 use crate::models::{Account, TokenData};
 use crate::modules;
 
-/// 账号服务层 - 彻底解除对 Tauri 运行时的依赖
+/// 账号管理服务；当前账号选择保存在服务内存中。
 pub struct AccountService {
-    pub integration: crate::modules::integration::SystemManager,
+    current_account_id: std::sync::RwLock<Option<String>>,
 }
 
 impl AccountService {
-    pub fn new(integration: crate::modules::integration::SystemManager) -> Self {
-        Self { integration }
+    pub fn new() -> Self {
+        Self {
+            current_account_id: std::sync::RwLock::new(
+                modules::get_current_account_id().ok().flatten(),
+            ),
+        }
     }
 
     /// 添加账号逻辑
@@ -86,7 +90,10 @@ impl AccountService {
     /// 删除账号逻辑
     pub fn delete_account(&self, account_id: &str) -> Result<(), String> {
         modules::delete_account(account_id)?;
-        self.integration.update_tray();
+        let mut current = self.current_account_id.write().map_err(|e| e.to_string())?;
+        if current.as_deref() == Some(account_id) {
+            *current = None;
+        }
         Ok(())
     }
 
@@ -94,9 +101,11 @@ impl AccountService {
     pub async fn switch_account(
         &self,
         account_id: &str,
-        target_ide: Option<&str>,
+        _target_ide: Option<&str>,
     ) -> Result<(), String> {
-        modules::account::switch_account(account_id, target_ide, &self.integration).await
+        modules::account::load_account(account_id)?;
+        *self.current_account_id.write().map_err(|e| e.to_string())? = Some(account_id.to_string());
+        Ok(())
     }
 
     /// 列表获取
@@ -106,7 +115,11 @@ impl AccountService {
 
     /// 获取当前 ID
     pub fn get_current_id(&self) -> Result<Option<String>, String> {
-        modules::get_current_account_id()
+        Ok(self
+            .current_account_id
+            .read()
+            .map_err(|e| e.to_string())?
+            .clone())
     }
 
     // --- OAuth 逻辑 ---
@@ -115,31 +128,19 @@ impl AccountService {
         &self,
         oauth_client_key: Option<String>,
     ) -> Result<String, String> {
-        let handle = match &self.integration {
-            modules::integration::SystemManager::Desktop(h) => Some(h.clone()),
-            modules::integration::SystemManager::Headless => None,
-        };
-        modules::oauth_server::prepare_oauth_url(handle, oauth_client_key).await
+        modules::oauth_server::prepare_oauth_url(oauth_client_key).await
     }
 
     pub async fn start_oauth_login(
         &self,
         oauth_client_key: Option<String>,
     ) -> Result<Account, String> {
-        let handle = match &self.integration {
-            modules::integration::SystemManager::Desktop(h) => Some(h.clone()),
-            modules::integration::SystemManager::Headless => None,
-        };
-        let token_res = modules::oauth_server::start_oauth_flow(handle, oauth_client_key).await?;
+        let token_res = modules::oauth_server::start_oauth_flow(oauth_client_key).await?;
         self.process_oauth_token(token_res).await
     }
 
     pub async fn complete_oauth_login(&self) -> Result<Account, String> {
-        let handle = match &self.integration {
-            modules::integration::SystemManager::Desktop(h) => Some(h.clone()),
-            modules::integration::SystemManager::Headless => None,
-        };
-        let token_res = modules::oauth_server::complete_oauth_flow(handle).await?;
+        let token_res = modules::oauth_server::complete_oauth_flow().await?;
         self.process_oauth_token(token_res).await
     }
 
@@ -189,9 +190,6 @@ impl AccountService {
             user_info.get_display_name(),
             token_data,
         )?;
-
-        // 发送 UI 更新通知 (通过 integration)
-        self.integration.update_tray();
 
         Ok(account)
     }

@@ -159,7 +159,6 @@ pub struct AppState {
     pub experimental: Arc<RwLock<crate::proxy::config::ExperimentalConfig>>,
     pub debug_logging: Arc<RwLock<crate::proxy::config::DebugLoggingConfig>>,
     pub switching: Arc<RwLock<bool>>, // [NEW] 账号切换状态，用于防止并发切换
-    pub integration: crate::modules::integration::SystemManager, // [NEW] 系统集成层实现
     pub account_service: Arc<crate::modules::account_service::AccountService>, // [NEW] 账号管理服务层
     pub security: Arc<RwLock<crate::proxy::ProxySecurityConfig>>,              // [NEW] 安全配置状态
     pub cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>, // [NEW] Cloudflared 插件状态
@@ -488,11 +487,11 @@ pub struct AxumServer {
 
 impl AxumServer {
     /// 返回代理当前使用的模型目录。
-    pub async fn list_models(&self, token_manager: &TokenManager) -> Vec<String> {
+    pub async fn list_models(&self) -> Vec<String> {
         let only_raw = *self.only_raw_quota_models.read().await;
         crate::proxy::common::model_mapping::get_all_dynamic_models(
             &self.custom_mapping,
-            Some(token_manager),
+            Some(&self.token_manager),
             only_raw,
         )
         .await
@@ -586,7 +585,6 @@ impl AxumServer {
         experimental_config: crate::proxy::config::ExperimentalConfig,
         debug_logging: crate::proxy::config::DebugLoggingConfig,
 
-        integration: crate::modules::integration::SystemManager,
         cloudflared_state: Arc<crate::commands::cloudflared::CloudflaredState>,
         proxy_pool_config: crate::proxy::config::ProxyPoolConfig, // [NEW]
         only_raw_quota_models: bool,
@@ -643,10 +641,7 @@ impl AxumServer {
             experimental: experimental_state.clone(),
             debug_logging: debug_logging_state.clone(),
             switching: Arc::new(RwLock::new(false)),
-            integration: integration.clone(),
-            account_service: Arc::new(crate::modules::account_service::AccountService::new(
-                integration.clone(),
-            )),
+            account_service: Arc::new(crate::modules::account_service::AccountService::new()),
             security: security_state.clone(),
             cloudflared_state: cloudflared_state.clone(),
             is_running: is_running_state.clone(),
@@ -1256,6 +1251,32 @@ impl AxumServer {
     }
 }
 
+#[cfg(test)]
+mod admin_model_catalog_tests {
+    #[tokio::test]
+    async fn admin_model_catalog_saving_config_updates_mapping_and_raw_mode() {
+        let fixture = crate::runtime::tests::ServerFixture::new().await;
+        fixture.stop_proxy().await;
+        let mut config = fixture.config.clone();
+        config.proxy.only_raw_quota_models = false;
+        config
+            .proxy
+            .custom_mapping
+            .insert("my-model".into(), "gemini-3.8-flash".into());
+        fixture.save_config(&config).await;
+        let before = fixture.snapshot_data_files();
+        assert!(fixture
+            .get_model_ids()
+            .await
+            .contains(&"my-model".to_string()));
+        assert_eq!(before, fixture.snapshot_data_files());
+        config.proxy.only_raw_quota_models = true;
+        fixture.save_config(&config).await;
+        assert_eq!(fixture.get_model_ids().await, vec!["gemini-3.8-flash"]);
+        fixture.shutdown().await;
+    }
+}
+
 /// 绑定单个地址（IPv4 或指定 IPv6 专用）
 fn bind_single_socket(
     socket_addr: std::net::SocketAddr,
@@ -1658,12 +1679,10 @@ async fn admin_switch_account(
 
             // [FIX #1166] 账号切换后立即同步内存状态
             state.token_manager.clear_all_sessions();
-            if let Err(e) = state.token_manager.load_accounts().await {
-                logger::log_error(&format!(
-                    "[API] Failed to reload accounts after switch: {}",
-                    e
-                ));
-            }
+            state
+                .token_manager
+                .set_preferred_account(Some(account_id))
+                .await;
 
             Ok(StatusCode::OK)
         }
@@ -1683,6 +1702,7 @@ struct AccountRefreshQuery {
 }
 
 async fn admin_refresh_all_quotas(
+    State(state): State<AppState>,
     Query(query): Query<AccountRefreshQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let protection_enabled = config::load_app_config()
@@ -1694,11 +1714,11 @@ async fn admin_refresh_all_quotas(
     } else {
         "[API] Starting refresh of all account quotas"
     });
-    let result = if protected_only {
-        account::refresh_protected_quotas_logic().await
-    } else {
-        account::refresh_all_quotas_logic().await
-    };
+    let result = crate::modules::quota_refresh::refresh_quotas_detailed(
+        &state.token_manager,
+        protected_only,
+    )
+    .await;
     let stats = result.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1948,6 +1968,7 @@ async fn admin_save_config(
         let mut mapping = state.custom_mapping.write().await;
         *mapping = new_config.clone().proxy.custom_mapping;
     }
+    *state.only_raw_quota_models.write().await = new_config.proxy.only_raw_quota_models;
 
     // 更新上游代理
     {
@@ -2068,7 +2089,7 @@ async fn admin_trigger_proxy_health_check(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let manager = state.proxy_pool_manager.clone();
-    tauri::async_runtime::spawn(async move { manager.health_check().await })
+    tokio::spawn(async move { manager.health_check().await })
         .await
         .map_err(|error| {
             (
@@ -2958,13 +2979,13 @@ async fn admin_save_update_settings(Json(settings): Json<serde_json::Value>) -> 
 }
 
 async fn admin_is_auto_launch_enabled() -> impl IntoResponse {
-    // Note: Autostart requires tauri::AppHandle, which is not available in Axum State easily.
+    // 进程自启动由服务器的进程管理器配置。
     // For now, return false in Web mode.
     Json(false)
 }
 
 async fn admin_toggle_auto_launch(Json(_payload): Json<serde_json::Value>) -> impl IntoResponse {
-    // Note: Autostart requires tauri::AppHandle.
+    // 进程自启动由服务器的进程管理器配置。
     StatusCode::NOT_IMPLEMENTED
 }
 

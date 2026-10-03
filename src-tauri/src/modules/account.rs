@@ -2188,9 +2188,6 @@ pub fn mark_account_forbidden(account_id: &str, reason: &str) -> Result<(), Stri
         save_account_index(&index)?;
     }
 
-    // 4. Notify frontend to refresh account list
-    crate::modules::log_bridge::emit_accounts_refreshed();
-
     Ok(())
 }
 

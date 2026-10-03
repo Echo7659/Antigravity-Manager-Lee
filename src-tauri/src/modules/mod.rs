@@ -18,6 +18,7 @@ pub mod oauth_server;
 pub mod process;
 pub mod proxy_db;
 pub mod quota;
+pub mod quota_refresh;
 pub mod scheduler;
 pub mod security_db;
 pub mod startup_quiet;

@@ -358,22 +358,29 @@ pub async fn get_all_dynamic_models(
     token_manager: Option<&crate::proxy::token_manager::TokenManager>,
     only_raw_quota_models: bool,
 ) -> Vec<String> {
-    use std::collections::HashSet;
-    let mut model_ids: HashSet<_> = token_manager
+    let collected = token_manager
         .map(|tm| tm.get_all_collected_models())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let mapping = custom_mapping.read().await;
+    model_ids_from_catalog(collected, &mapping, only_raw_quota_models)
+}
+
+/// 将目录快照和自定义映射合成对外模型 ID，不限定快照来源。
+pub fn model_ids_from_catalog(
+    collected: impl IntoIterator<Item = String>,
+    custom_mapping: &HashMap<String, String>,
+    only_raw_quota_models: bool,
+) -> Vec<String> {
+    use std::collections::HashSet;
+    let mut model_ids: HashSet<_> = collected
         .into_iter()
         .filter(|id| is_model_compliant_with_baseline(id))
         .collect();
 
     // 配置允许时追加用户自定义映射名称。
     if !only_raw_quota_models {
-        // 2. 获取所有自定义映射模型 (Custom)
-        {
-            let mapping = custom_mapping.read().await;
-            for key in mapping.keys() {
-                model_ids.insert(key.clone());
-            }
+        for key in custom_mapping.keys() {
+            model_ids.insert(key.clone());
         }
     }
 

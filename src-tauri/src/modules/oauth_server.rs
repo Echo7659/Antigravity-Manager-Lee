@@ -1,10 +1,10 @@
 use crate::modules::oauth;
 use std::sync::{Mutex, OnceLock};
-use tauri::Url;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
+use url::Url;
 
 struct OAuthFlowState {
     auth_url: String,
@@ -45,7 +45,6 @@ fn oauth_fail_html() -> &'static str {
 }
 
 async fn ensure_oauth_flow_prepared(
-    app_handle: Option<tauri::AppHandle>,
     requested_client_key: Option<String>,
 ) -> Result<String, String> {
     if let Ok(mut state) = get_oauth_flow_state().lock() {
@@ -148,12 +147,10 @@ async fn ensure_oauth_flow_prepared(
 
     // Start listeners immediately: even if the user authorizes before clicking "Start OAuth",
     // the browser can still hit our callback and finish the flow.
-    let app_handle_for_tasks = app_handle.clone();
 
     if let Some(l4) = ipv4_listener {
         let tx = code_tx.clone();
         let mut rx = cancel_rx.clone();
-        let app_handle = app_handle_for_tasks.clone();
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = tokio::select! {
                 res = l4.accept() => res.map_err(|e| format!("failed_to_accept_connection: {}", e)),
@@ -241,10 +238,6 @@ async fn ensure_oauth_flow_prepared(
                 let _ = stream.write_all(response_html.as_bytes()).await;
                 let _ = stream.flush().await;
 
-                if let Some(h) = app_handle {
-                    use tauri::Emitter;
-                    let _ = h.emit("oauth-callback-received", ());
-                }
                 let _ = tx.send(result).await;
             }
         });
@@ -253,7 +246,6 @@ async fn ensure_oauth_flow_prepared(
     if let Some(l6) = ipv6_listener {
         let tx = code_tx.clone();
         let mut rx = cancel_rx;
-        let app_handle = app_handle_for_tasks;
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = tokio::select! {
                 res = l6.accept() => res.map_err(|e| format!("failed_to_accept_connection: {}", e)),
@@ -335,10 +327,6 @@ async fn ensure_oauth_flow_prepared(
                 let _ = stream.write_all(response_html.as_bytes()).await;
                 let _ = stream.flush().await;
 
-                if let Some(h) = app_handle {
-                    use tauri::Emitter;
-                    let _ = h.emit("oauth-callback-received", ());
-                }
                 let _ = tx.send(result).await;
             }
         });
@@ -357,21 +345,12 @@ async fn ensure_oauth_flow_prepared(
         });
     }
 
-    // Send event to frontend (for display/copying link)
-    if let Some(h) = app_handle {
-        use tauri::Emitter;
-        let _ = h.emit("oauth-url-generated", &auth_url);
-    }
-
     Ok(auth_url)
 }
 
 /// Pre-generate OAuth URL (does not open browser, does not block waiting for callback)
-pub async fn prepare_oauth_url(
-    app_handle: Option<tauri::AppHandle>,
-    oauth_client_key: Option<String>,
-) -> Result<String, String> {
-    ensure_oauth_flow_prepared(app_handle, oauth_client_key).await
+pub async fn prepare_oauth_url(oauth_client_key: Option<String>) -> Result<String, String> {
+    ensure_oauth_flow_prepared(oauth_client_key).await
 }
 
 /// Cancel current OAuth flow
@@ -386,19 +365,10 @@ pub fn cancel_oauth_flow() {
 
 /// Start OAuth flow and wait for callback, then exchange token
 pub async fn start_oauth_flow(
-    app_handle: Option<tauri::AppHandle>,
     oauth_client_key: Option<String>,
 ) -> Result<oauth::TokenResponse, String> {
     // Ensure URL + listener are ready (this way if the user authorizes first, it won't get stuck)
-    let auth_url = ensure_oauth_flow_prepared(app_handle.clone(), oauth_client_key).await?;
-
-    if let Some(h) = app_handle {
-        // Open default browser
-        use tauri_plugin_opener::OpenerExt;
-        h.opener()
-            .open_url(&auth_url, None::<String>)
-            .map_err(|e| format!("failed_to_open_browser: {}", e))?;
-    }
+    ensure_oauth_flow_prepared(oauth_client_key).await?;
 
     // Take code_rx to wait for it
     let (mut code_rx, redirect_uri, client_key) = {
@@ -434,11 +404,9 @@ pub async fn start_oauth_flow(
 /// Завершить OAuth flow без открытия браузера.
 /// Предполагается, что пользователь открыл ссылку вручную (или ранее была открыта),
 /// а мы только ждём callback и обмениваем code на token.
-pub async fn complete_oauth_flow(
-    app_handle: Option<tauri::AppHandle>,
-) -> Result<oauth::TokenResponse, String> {
+pub async fn complete_oauth_flow() -> Result<oauth::TokenResponse, String> {
     // Ensure URL + listeners exist
-    let _ = ensure_oauth_flow_prepared(app_handle, None).await?;
+    let _ = ensure_oauth_flow_prepared(None).await?;
 
     // Take receiver to wait for code
     let (mut code_rx, redirect_uri, client_key) = {

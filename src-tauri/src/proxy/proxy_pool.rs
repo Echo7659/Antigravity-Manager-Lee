@@ -681,7 +681,7 @@ impl ProxyPoolManager {
 
     /// 启动健康检查循环
     pub fn start_health_check_loop(self: Arc<Self>) {
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             let batch_size = env_usize("ABV_PROXY_HEALTH_BATCH_SIZE", 25, 1, 200);
             let concurrency = env_usize("ABV_PROXY_HEALTH_CONCURRENCY", 5, 1, 20);
             let start_delay_secs =

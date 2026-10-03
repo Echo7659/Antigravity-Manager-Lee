@@ -66,9 +66,7 @@ pub async fn add_account(
     _email: String,
     refresh_token: String,
 ) -> Result<Account, String> {
-    let service = modules::account_service::AccountService::new(
-        crate::modules::integration::SystemManager::Desktop(app.clone()),
-    );
+    let service = modules::account_service::AccountService::new();
 
     let mut account = service.add_account(&refresh_token).await?;
 
@@ -92,9 +90,7 @@ pub async fn delete_account(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     account_id: String,
 ) -> Result<(), String> {
-    let service = modules::account_service::AccountService::new(
-        crate::modules::integration::SystemManager::Desktop(app.clone()),
-    );
+    let service = modules::account_service::AccountService::new();
     service.delete_account(&account_id)?;
 
     if let Some(instance) = proxy_state.instance.read().await.as_ref() {
@@ -161,9 +157,7 @@ pub async fn switch_account(
     account_id: String,
     target_ide: Option<String>,
 ) -> Result<(), String> {
-    let service = modules::account_service::AccountService::new(
-        crate::modules::integration::SystemManager::Desktop(app.clone()),
-    );
+    let service = modules::account_service::AccountService::new();
 
     service
         .switch_account(&account_id, target_ide.as_deref())
@@ -582,9 +576,7 @@ pub async fn start_oauth_login(
     oauth_client_key: Option<String>,
 ) -> Result<Account, String> {
     modules::logger::log_info("开始 OAuth 授权流程...");
-    let service = modules::account_service::AccountService::new(
-        crate::modules::integration::SystemManager::Desktop(app_handle.clone()),
-    );
+    let service = modules::account_service::AccountService::new();
 
     let mut account = service.start_oauth_login(oauth_client_key).await?;
 
@@ -604,9 +596,7 @@ pub async fn start_oauth_login(
 #[tauri::command]
 pub async fn complete_oauth_login(app_handle: tauri::AppHandle) -> Result<Account, String> {
     modules::logger::log_info("完成 OAuth 授权流程 (manual)...");
-    let service = modules::account_service::AccountService::new(
-        crate::modules::integration::SystemManager::Desktop(app_handle.clone()),
-    );
+    let service = modules::account_service::AccountService::new();
 
     let mut account = service.complete_oauth_login().await?;
 
@@ -628,9 +618,7 @@ pub async fn prepare_oauth_url(
     app_handle: tauri::AppHandle,
     oauth_client_key: Option<String>,
 ) -> Result<String, String> {
-    let service = modules::account_service::AccountService::new(
-        crate::modules::integration::SystemManager::Desktop(app_handle.clone()),
-    );
+    let service = modules::account_service::AccountService::new();
     service.prepare_oauth_url(oauth_client_key).await
 }
 

@@ -127,10 +127,9 @@ fn cached_weekly_warmup_candidate(
 
 /// Start smart weekly scheduler
 pub fn start_scheduler(
-    app_handle: Option<tauri::AppHandle>,
-    proxy_state: crate::commands::proxy::ProxyServiceState,
-) {
-    tauri::async_runtime::spawn(async move {
+    token_manager: std::sync::Arc<crate::proxy::TokenManager>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         logger::log_info(
             "[Scheduler] Weekly Reset Warmup Scheduler started. Monitoring 7-day quota windows...",
         );
@@ -139,9 +138,11 @@ pub fn start_scheduler(
         let mut interval = time::interval(Duration::from_secs(60));
         let mut last_protection_refresh: Option<time::Instant> = None;
         let mut last_warmup_scan: Option<time::Instant> = None;
+        let mut warmups = tokio::task::JoinSet::new();
 
         loop {
             interval.tick().await;
+            while warmups.try_join_next().is_some() {}
 
             // Load configuration
             let Ok(app_config) = config::load_app_config() else {
@@ -158,12 +159,7 @@ pub fn start_scheduler(
                     last_protection_refresh.is_none_or(|last| last.elapsed() >= refresh_interval);
                 if refresh_due {
                     last_protection_refresh = Some(time::Instant::now());
-                    match crate::commands::refresh_protected_quotas_internal(
-                        &proxy_state,
-                        app_handle.clone(),
-                    )
-                    .await
-                    {
+                    match super::quota_refresh::refresh_quotas(&token_manager, true).await {
                         Ok(stats) => logger::log_info(&format!(
                             "[Scheduler] Weekly reserve refresh completed: {} success, {} failed",
                             stats.success, stats.failed
@@ -327,10 +323,9 @@ pub fn start_scheduler(
                     tasks_to_run.len()
                 ));
 
-                let handle_for_warmup = app_handle.clone();
-                let state_for_warmup = proxy_state.clone();
+                let token_manager = token_manager.clone();
 
-                tokio::spawn(async move {
+                warmups.spawn(async move {
                     for (acc_id, email, model, token, pid, history_key) in tasks_to_run {
                         logger::log_info(&format!(
                             "[WeeklyWarmup] 🚀 Triggering weekly warmup for {} @ {}",
@@ -358,13 +353,8 @@ pub fn start_scheduler(
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     }
 
-                    // Refresh UI
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    let _ = crate::commands::refresh_all_quotas_internal(
-                        &state_for_warmup,
-                        handle_for_warmup,
-                    )
-                    .await;
+                    let _ = super::quota_refresh::refresh_quotas(&token_manager, false).await;
                 });
             }
 
@@ -376,7 +366,7 @@ pub fn start_scheduler(
                 history.retain(|_, &mut ts| ts > cutoff);
             }
         }
-    });
+    })
 }
 
 /// Trigger immediate smart warmup check for a single account (e.g. on manual trigger / recovered event)
