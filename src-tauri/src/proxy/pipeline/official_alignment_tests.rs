@@ -299,7 +299,9 @@ mod tests {
         };
         use crate::proxy::pipeline::inbound::ClientThinkingSwitch;
 
-        let _lock = TEST_CONFIG_LOCK.lock().unwrap();
+        let _lock = TEST_CONFIG_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         update_thinking_budget_config(ThinkingBudgetConfig::default());
 
         struct ResetGuard;

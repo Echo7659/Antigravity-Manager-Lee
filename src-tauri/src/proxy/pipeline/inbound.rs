@@ -1917,13 +1917,14 @@ mod tests {
         );
 
         let parts = contents[0]["parts"].as_array().expect("parts array");
-        assert!(parts[0]
-            .get("thought")
-            .and_then(Value::as_bool)
-            .unwrap_or(false));
-        assert_eq!(parts[0]["text"], "分析了案例数据，准备调用工具。");
-        assert_eq!(parts[1]["text"], "正在执行检查。");
-        assert!(parts[2].get("functionCall").is_some());
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "正在执行检查。");
+        assert!(parts[0].get("thought").is_none());
+        assert_eq!(parts[1]["functionCall"]["name"], "inspect");
+        assert_eq!(
+            parts[1]["thoughtSignature"],
+            crate::proxy::thinking_store::SENTINEL_SIGNATURE
+        );
     }
 
     #[test]
@@ -2066,9 +2067,10 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert!(parts[0].get("functionCall").is_some());
         assert!(parts[0].get("thought").is_none());
-        assert!(
-            parts[0].get("thoughtSignature").is_none(),
-            "FunctionCall must NOT fall back to rejected sentinel signature"
+        assert_eq!(
+            parts[0]["thoughtSignature"],
+            crate::proxy::thinking_store::SENTINEL_SIGNATURE,
+            "Rejected foreign signatures must fall back to the Gemini validator sentinel"
         );
     }
 
@@ -2415,20 +2417,10 @@ mod tests {
         );
 
         let parts = contents[0]["parts"].as_array().expect("parts array");
-        // 1. 首位成功提升为 thought: true 的思考块
-        assert_eq!(parts[0]["thought"], true);
-        assert_eq!(parts[0]["text"], thought_text);
-        // 铁律 I4：Gemini 目标的思考块**绝不**携带签名。
-        // 哨兵（skip_thought_signature_validator）不属于 Antigravity 协议 ——
-        // 官方 3 份报文 23 处签名里出现 0 次。
-        assert!(
-            parts[0].get("thoughtSignature").is_none(),
-            "Gemini 目标的思考块不得携带签名（I4）"
-        );
-
-        // 2. 正文部件已干净剔除 <think>...</think> 标签与换行，仅保留真实回答
-        assert_eq!(parts[1]["text"], visible_answer);
-        assert!(parts[1].get("thought").is_none());
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], visible_answer);
+        assert!(parts[0].get("thought").is_none());
+        assert!(parts[0].get("thoughtSignature").is_none());
     }
 
     // ============ 工具回执（functionResponse）role 归一化 ============

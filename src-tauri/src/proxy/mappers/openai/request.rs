@@ -2182,7 +2182,7 @@ mod tests {
         assert_eq!(max_output_tokens, 57344);
     }
     #[test]
-    fn test_vertex_ai_drops_sentinel_injection() {
+    fn test_vertex_ai_backfills_sentinel_for_unsigned_function_call() {
         // [FIX #1650] Verify sentinel signature injection for Vertex AI models
         let req = OpenAIRequest {
             model: "claude-3-7-sonnet-thinking".to_string(), // Triggers is_thinking_model
@@ -2223,11 +2223,10 @@ mod tests {
             .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
             .expect("Should find functionCall part");
 
-        // 铁律：functionCall **绝不**携带哨兵 —— 官方报文 0/23 处出现哨兵，
-        // 它不属于 Antigravity 协议；签名归位统一交给流水线终审 `place_turn_signature`。
-        assert!(
-            tool_part.get("thoughtSignature").is_none(),
-            "functionCall must not carry a sentinel signature"
+        assert_eq!(
+            tool_part["thoughtSignature"],
+            crate::proxy::thinking_store::SENTINEL_SIGNATURE,
+            "Unsigned Gemini functionCall must receive the validator sentinel"
         );
     }
 
@@ -2270,12 +2269,10 @@ mod tests {
                 .find(|p: &&serde_json::Value| p.get("functionCall").is_some())
                 .expect(&format!("[{model}] Should find functionCall part"));
 
-            // 铁律：无缓存签名时**留空**（字段缺席），绝不发明哨兵。
-            // 官方报文里哨兵出现 0 次；签名缺失是被上游容忍的（在飞轮即缺席），
-            // 且该轮签名由流水线终审 `place_turn_signature` 按锚点归位。
-            assert!(
-                tool_part.get("thoughtSignature").is_none(),
-                "[{model}] functionCall must not carry a sentinel signature when unsigned"
+            assert_eq!(
+                tool_part["thoughtSignature"],
+                crate::proxy::thinking_store::SENTINEL_SIGNATURE,
+                "[{model}] unsigned functionCall must receive the validator sentinel"
             );
         }
     }
@@ -2541,19 +2538,16 @@ mod tests {
             .iter()
             .find(|c| c["role"] == "model")
             .expect("model turn");
-        let thought = model_msg["parts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p.get("thought") == Some(&serde_json::json!(true)))
-            .expect("thought part");
-        // Reasoning content is preserved (Anthropic alignment)
-        assert_eq!(thought["text"], client_thought);
-        assert!(
-            thought.get("thoughtSignature").is_none(),
-            "Gemini thought parts do not carry signatures"
-        );
+        let parts = model_msg["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "a1");
+        assert!(parts[0].get("thought").is_none());
+        assert!(parts[0].get("thoughtSignature").is_none());
         let dumped = serde_json::to_string(&result).unwrap();
+        assert!(
+            !dumped.contains(client_thought),
+            "client reasoning content must not be forwarded in Gemini history"
+        );
         assert!(
             !dumped.contains("fake_client_sig_that_must_be_ignored"),
             "invalid client signature must not be forwarded"
@@ -2916,16 +2910,17 @@ mod tests {
         };
         let resp_parts = model_parts(&resp_result);
         let chat_parts = model_parts(&chat_result);
-        let thought = resp_parts
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p.get("thought") == Some(&json!(true)))
-            .unwrap();
-        assert_eq!(thought["text"], client_thought);
-        assert!(thought.get("thoughtSignature").is_none());
         assert_eq!(resp_parts, chat_parts);
+        let parts = resp_parts.as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "assistant answer");
+        assert!(parts[0].get("thought").is_none());
+        assert!(parts[0].get("thoughtSignature").is_none());
         let dumped = serde_json::to_string(&resp_parts).unwrap();
+        assert!(
+            !dumped.contains(client_thought),
+            "Gemini history must not forward client reasoning content"
+        );
         assert!(
             !dumped.contains(&valid_client_sig),
             "a signature that fails Gemini validation must not survive on either protocol"

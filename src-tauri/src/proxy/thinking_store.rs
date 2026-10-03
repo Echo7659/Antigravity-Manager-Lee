@@ -3854,9 +3854,10 @@ mod tests {
         })];
         finalize_gemini_contents_thinking(&mut contents, true);
         let parts = contents[0]["parts"].as_array().unwrap();
-        assert_eq!(parts[0]["thought"], true);
-        assert!(parts[0].get("thoughtSignature").is_none());
-        assert_eq!(parts[1]["thoughtSignature"], real_sig);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["functionCall"]["name"], "read_file");
+        assert_eq!(parts[0]["thoughtSignature"], real_sig);
+        assert!(parts[0].get("thought").is_none());
     }
 
     #[test]
@@ -4465,7 +4466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_finalize_thinking_disabled_keeps_unsigned_function_call_unsigned_for_gemini() {
+    fn test_finalize_thinking_disabled_backfills_unsigned_function_call_for_gemini() {
         let mut contents = vec![json!({
             "role": "model",
             "parts": [
@@ -4486,19 +4487,15 @@ mod tests {
             Some("gemini-3.8-flash-tiered"),
         );
 
-        // 官方报文里哨兵出现 0 次；缺失签名被上游容忍（在飞轮即缺席）。
-        // 因此无签名的 functionCall 保持「字段缺席」，绝不发明占位符。
+        // Gemini functionCall 无真实签名时使用验签哨兵，与当前轮是否启用思考无关。
         let parts = contents[0]["parts"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
-        assert!(
-            parts[0].get("thoughtSignature").is_none()
-                && parts[0].get("thought_signature").is_none(),
-            "Unsigned functionCall must stay unsigned when sent to Gemini — never invent a sentinel"
-        );
+        assert_eq!(parts[0]["thoughtSignature"], SENTINEL_SIGNATURE);
+        assert!(parts[0].get("thought_signature").is_none());
     }
 
     #[test]
-    fn test_finalize_does_not_invent_signature_for_unsigned_function_call() {
+    fn test_finalize_backfills_sentinel_for_unsigned_function_call() {
         let tool_id = "call_finalize_cache_777";
         let mut contents = vec![json!({
             "role": "model",
@@ -4522,21 +4519,17 @@ mod tests {
         );
 
         let parts = contents[0]["parts"].as_array().unwrap();
-        // 终审门禁：不查库、不发明签名。官方 functionCall 轮是"纯净"的
-        // （33 个 model 轮里 thought × functionCall 共现 0 次），因此不得注入占位思考块。
+        // 终审不注入占位思考块，但会为无签名的 Gemini functionCall 补全验签哨兵。
         assert_eq!(
             parts.len(),
             1,
-            "finalize must NOT inject a placeholder thought block"
+            "finalize must not inject a placeholder thought block"
         );
         let fc = parts
             .iter()
             .find(|p| p.get("functionCall").is_some())
             .unwrap();
-        assert!(
-            fc.get("thoughtSignature").is_none(),
-            "Pipeline finalize must not invent a sentinel; absence is tolerated by upstream"
-        );
+        assert_eq!(fc["thoughtSignature"], SENTINEL_SIGNATURE);
     }
 
     #[test]
@@ -4644,7 +4637,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_to_claude_wraps_foreign_thought_in_think_tags_and_strips_tool_sig() {
+    fn test_gemini_to_claude_preserves_thought_and_strips_gemini_signatures() {
         let gemini_sig = "Ep4MCpsMARFNMg9NDlK9RXXz5Mzq9mniX9KSQBBzbUx3k85w/qDgtcE+28NH+1EvPeULAprqUquvYXGMzUXGy1xJoMnqdkC4vqebuhyd2Xhs0oz+OhqcOTwLhGYOG0KBKQ87Hfw4q/sMCSgf2gz4vFMa6V6kKMJepYlPXKFJJF4ok+W6lUt3PfYln8K9Dh7wB/40iHiZ2BnJd++6hfUwu9Bz1n795S50l0yCj84EaSCDDF334Erxq7Fo";
         let thought_text = "Step 1: Check database schema. Step 2: Query tables.";
         let visible_answer = "Found 3 matching records in the database.";
@@ -4683,9 +4676,15 @@ mod tests {
         assert_eq!(parts[0]["text"], thought_text);
         assert!(parts[0].get("thoughtSignature").is_none());
         assert_eq!(parts[1]["text"], visible_answer);
-        assert_eq!(parts[1]["thoughtSignature"], gemini_sig);
+        assert!(parts[1].get("thoughtSignature").is_none());
         assert_eq!(parts[2]["functionCall"]["id"], "call_db_1");
         assert!(parts[2].get("thoughtSignature").is_none());
+        assert!(
+            parts
+                .iter()
+                .all(|part| part.get("thoughtSignature") != Some(&json!(gemini_sig))),
+            "Gemini signatures must not cross the Claude family boundary"
+        );
     }
 
     #[test]
@@ -4766,6 +4765,10 @@ mod tests {
             "Must match via synthetic context ID even though Gemini request had no tool id"
         );
 
+        let restored_parts = gemini_contents[1]["parts"].as_array().expect("parts");
+        assert_eq!(restored_parts[0]["thought"], true);
+        assert_eq!(restored_parts[0]["text"], thought_text);
+
         finalize_gemini_contents_thinking_with_model(
             &mut gemini_contents,
             true,
@@ -4773,12 +4776,9 @@ mod tests {
         );
 
         let model_parts = gemini_contents[1]["parts"].as_array().expect("parts");
-        // 验证思考块被成功提升复活：
-        assert_eq!(model_parts[0]["thought"], true);
-        assert_eq!(model_parts[0]["text"], thought_text);
-
-        // 验证跨协议捕获到的真实签名被归位到锚点，而不是被替换成哨兵：
-        let fc = &model_parts[1];
+        assert_eq!(model_parts.len(), 1);
+        // 终审丢弃历史思考正文，并将跨协议捕获到的真实签名归位到工具调用。
+        let fc = &model_parts[0];
         assert_eq!(fc["functionCall"]["name"], "bash");
         assert_eq!(
             fc["thoughtSignature"], real_sig,
@@ -4796,12 +4796,10 @@ mod tests {
 
 /// 官方报文对齐回归测试：五种 part 排列下签名锚点必须与真机一致。
 ///
-/// 依据 3 份官方 Antigravity 报文、23 处真实签名归纳出的不变量
-/// （见 `.workbuddy/outputs/correct-assembly-spec.md`）：
-///   1. 签名只出现在 model 轮，每轮至多 1 个；
-///   2. 锚点 = 该轮第一个 `thought != true` 的 part；
-///   3. `thought: true` / `functionResponse` / 非锚点 —— 字段必须「缺席」；
-///   4. 缺失签名被上游容忍，绝不发明哨兵。
+/// Gemini 签名归位要求：
+///   1. 真实签名优先保留在对应的 functionCall；
+///   2. `thought: true` 和 functionResponse 不携带签名；
+///   3. 无真实签名的 functionCall 使用验签哨兵作为最终回退。
 #[cfg(test)]
 mod signature_placement_tests {
     use super::*;
@@ -4812,6 +4810,14 @@ mod signature_placement_tests {
         let mut raw = vec![0x12u8, seed];
         raw.extend_from_slice(&[b'A'; 60]);
         base64::engine::general_purpose::STANDARD.encode(raw)
+    }
+
+    /// 构造包含 Claude 协议标识的有效签名。
+    fn claude_sig() -> String {
+        use base64::Engine;
+        let payload =
+            b"\x12\xb2\x02\n\x92\x01\x08\x12\x10\x02\x18\x02*@claude-opus-4-6-signature-data";
+        base64::engine::general_purpose::STANDARD.encode(payload)
     }
 
     #[test]
@@ -4897,16 +4903,12 @@ mod signature_placement_tests {
     }
 
     #[test]
-    fn unsigned_anchor_stays_absent_when_no_source_available() {
-        // 官方 baogao.txt contents[17]：在飞 functionCall 就是无签名的
+    fn unsigned_anchor_uses_sentinel_when_no_source_available() {
         let mut parts = vec![json!({ "functionCall": { "id": "call_x", "name": "bash" } })];
         let placed = place_turn_signature(&mut parts, None);
 
-        assert!(placed.is_none());
-        assert!(
-            parts[0].get("thoughtSignature").is_none(),
-            "绝不发明哨兵，官方报文里哨兵出现 0 次"
-        );
+        assert_eq!(placed.as_deref(), Some(SENTINEL_SIGNATURE));
+        assert_eq!(parts[0]["thoughtSignature"], SENTINEL_SIGNATURE);
     }
 
     #[test]
@@ -4921,16 +4923,16 @@ mod signature_placement_tests {
     }
 
     #[test]
-    fn sentinel_is_never_accepted_as_a_source() {
+    fn sentinel_source_is_preserved_as_final_fallback() {
         let mut parts = vec![json!({ "functionCall": { "id": "call_x", "name": "bash" } })];
         let placed = place_turn_signature(&mut parts, Some(SENTINEL_SIGNATURE));
 
-        assert!(placed.is_none(), "哨兵不是合法回填来源");
-        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(placed.as_deref(), Some(SENTINEL_SIGNATURE));
+        assert_eq!(parts[0]["thoughtSignature"], SENTINEL_SIGNATURE);
     }
 
     #[test]
-    fn non_anchor_signatures_are_purged_to_absence() {
+    fn parallel_function_call_signatures_are_preserved() {
         let sig_a = gemini_sig(6);
         let sig_b = gemini_sig(7);
         let mut parts = vec![
@@ -4941,7 +4943,7 @@ mod signature_placement_tests {
         place_turn_signature(&mut parts, None);
 
         assert_eq!(parts[0]["thoughtSignature"], sig_a, "锚点保留自己的真签名");
-        assert!(parts[1].get("thoughtSignature").is_none());
+        assert_eq!(parts[1]["thoughtSignature"], sig_b);
         assert!(parts[2].get("thoughtSignature").is_none());
         assert!(
             parts[2].get("thought_signature").is_none(),
@@ -5029,7 +5031,7 @@ mod signature_placement_tests {
         assert_eq!(gemini_extracted.as_deref(), Some(fc_sig.as_str()));
 
         // 2. Claude (prefer_function_call = false) -> 提取首个非思考部件的签名 text_sig
-        let claude_sig_str = "AQ".to_string() + &"A".repeat(50);
+        let claude_sig_str = claude_sig();
         let claude_parts = vec![
             json!({ "text": "Analyzing...", "thoughtSignature": claude_sig_str }),
             json!({ "functionCall": { "id": "call_test", "name": "read" } }),
@@ -5228,10 +5230,10 @@ mod signature_placement_tests {
             Some("sess-test-seq-1"),
         );
 
-        // 黄金法则（第二种情况）：当本轮确实没有独立签名时，消除哨兵保持缺省，
-        // 绝不跨轮继承其他工具调用的不同真实签名！
+        // 无真实签名的新工具调用使用哨兵，不跨轮继承 Tool A 的签名。
         let turn3_parts = contents[3]["parts"].as_array().unwrap();
-        assert!(turn3_parts[0].get("thoughtSignature").is_none());
+        assert_eq!(turn3_parts[0]["thoughtSignature"], SENTINEL_SIGNATURE);
+        assert_ne!(turn3_parts[0]["thoughtSignature"], sig_tool_a);
     }
 
     #[test]
@@ -5311,11 +5313,10 @@ mod signature_placement_tests {
         );
 
         let parts = contents[0]["parts"].as_array().unwrap();
-        // 1. 思考块必须排在首位 parts[0]，且无签名
-        assert_eq!(parts[0]["thought"], true);
-        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|part| part.get("thought").is_none()));
 
-        // 2. 首个工具调用 fc 必须全局抢夺签名（parts[1] 或首个 fc）
+        // 两个并发工具调用均保留自己的有效签名。
         let fc1 = parts
             .iter()
             .find(|p| {
@@ -5327,14 +5328,13 @@ mod signature_placement_tests {
             .unwrap();
         assert_eq!(fc1["thoughtSignature"], real_sig);
 
-        // 3. 伴随正文 text 绝不携带签名
+        // 伴随正文不携带签名。
         let text_part = parts
             .iter()
             .find(|p| p.get("text").is_some() && p.get("thought").is_none())
             .unwrap();
         assert!(text_part.get("thoughtSignature").is_none());
 
-        // 4. 并发的其余工具调用绝不携带签名
         let fc2 = parts
             .iter()
             .find(|p| {
@@ -5344,6 +5344,6 @@ mod signature_placement_tests {
                     == Some("call_fc_2")
             })
             .unwrap();
-        assert!(fc2.get("thoughtSignature").is_none());
+        assert_eq!(fc2["thoughtSignature"], real_sig);
     }
 }

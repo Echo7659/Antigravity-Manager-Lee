@@ -2389,7 +2389,7 @@ mod tests {
     #[test]
     fn test_thinking_block_empty_content_fix() {
         // [场景] 客户端发送了一个内容为空的 thinking 块
-        // 期望: 自动填充 "..."
+        // 思考开启时使用稳定的占位思考文本，后续可见正文保持独立。
         let req = ClaudeRequest {
             model: "claude-sonnet-4-6".to_string(),
             messages: vec![Message {
@@ -2431,18 +2431,12 @@ mod tests {
         let contents = body["request"]["contents"].as_array().unwrap();
         let parts = contents[0]["parts"].as_array().unwrap();
 
-        // 验证空 thinking 块被降级为包含 "..." 的非 thought 文本部分（并与后续文本紧凑合并）
-        let downgraded_part = parts.iter().find(|p| {
-            p.get("text")
-                .and_then(|t| t.as_str())
-                .map(|s| s.contains("..."))
-                .unwrap_or(false)
-                && p.get("thought").is_none()
-        });
-        assert!(
-            downgraded_part.is_some(),
-            "Empty thinking should be downgraded to text without thought: true"
-        );
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "Let me think...");
+        assert_eq!(parts[0]["thought"], true);
+        assert!(parts[0].get("thoughtSignature").is_none());
+        assert_eq!(parts[1]["text"], "Hi");
+        assert!(parts[1].get("thought").is_none());
     }
 
     #[test]
@@ -3198,7 +3192,7 @@ mod tests {
             panic!("Expected array content");
         }
 
-        // 2. transform_claude_request_in should produce a thinking block with sentinel signature for gemini-3.8-flash-high
+        // 2. Gemini 历史请求不回传无签名的思考正文。
         let req = ClaudeRequest {
             model: "gemini-3.8-flash-high".to_string(),
             messages,
@@ -3229,18 +3223,10 @@ mod tests {
             .as_array()
             .expect("Contents array");
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
-        assert_eq!(assistant_parts.len(), 2);
-        assert_eq!(assistant_parts[0]["thought"], true);
-        assert!(
-            assistant_parts[0].get("thoughtSignature").is_none()
-                || assistant_parts[0]["thoughtSignature"].is_null(),
-            "Sentinel elimination: thoughtSignature must be absent when unsigned"
-        );
-        assert_eq!(
-            assistant_parts[0]["text"],
-            "Considering the question deeply..."
-        );
-        assert_eq!(assistant_parts[1]["text"], "Here is my answer");
+        assert_eq!(assistant_parts.len(), 1);
+        assert_eq!(assistant_parts[0]["text"], "Here is my answer");
+        assert!(assistant_parts[0].get("thought").is_none());
+        assert!(assistant_parts[0].get("thoughtSignature").is_none());
     }
 
     #[test]
@@ -3295,7 +3281,7 @@ mod tests {
             }
         }
 
-        // 2. transform_claude_request_in should map both thinking and functionCall with the real signature
+        // 2. Gemini 历史请求只保留带真实签名的 functionCall。
         let req = ClaudeRequest {
             model: "gemini-3.8-flash-high".to_string(),
             messages,
@@ -3326,15 +3312,10 @@ mod tests {
             .as_array()
             .expect("Contents array");
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
-        assert_eq!(assistant_parts.len(), 2);
-        assert_eq!(assistant_parts[0]["thought"], true);
-        assert!(
-            assistant_parts[0].get("thoughtSignature").is_none(),
-            "I4 rule: Gemini target thought block must NOT carry signature"
-        );
-        assert_eq!(assistant_parts[1]["functionCall"]["name"], "list_directory");
+        assert_eq!(assistant_parts.len(), 1);
+        assert_eq!(assistant_parts[0]["functionCall"]["name"], "list_directory");
         assert_eq!(
-            assistant_parts[1]["thoughtSignature"], real_sig,
+            assistant_parts[0]["thoughtSignature"], real_sig,
             "Gemini model functionCall must inherit the real signature from the thinking block"
         );
     }
@@ -3387,7 +3368,7 @@ mod tests {
             }
         }
 
-        // 2. 验证 transform_claude_request_in 在目标为 Gemini 时，思考块与工具调用的签名均安全降级为哨兵
+        // 2. Gemini 历史请求丢弃异构思考块，无真实签名的工具调用使用哨兵。
         let req = ClaudeRequest {
             model: "gemini-3.7-flash-high".to_string(),
             messages,
@@ -3424,17 +3405,9 @@ mod tests {
             .as_array()
             .expect("Contents array");
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
-        assert_eq!(assistant_parts[0]["thought"], true);
-        assert!(
-            assistant_parts[0].get("thoughtSignature").is_none(),
-            "Thinking block must be clean without signature"
-        );
-        // 铁律：不兼容的外来 Claude 签名被剥离后**留空**，绝不回退成哨兵。
-        // 官方报文里哨兵出现 0/23 次，它不属于 Antigravity 协议。
-        assert!(
-            assistant_parts[1].get("thoughtSignature").is_none(),
-            "Gemini functionCall must drop the foreign signature instead of falling back to sentinel"
-        );
+        assert_eq!(assistant_parts.len(), 1);
+        assert_eq!(assistant_parts[0]["functionCall"]["name"], "web_fetch");
+        assert_eq!(assistant_parts[0]["thoughtSignature"], SENTINEL_SIGNATURE);
     }
 
     #[test]

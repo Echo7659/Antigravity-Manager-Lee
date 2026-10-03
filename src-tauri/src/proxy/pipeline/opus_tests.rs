@@ -4,7 +4,9 @@ const MODEL: &str = "claude-opus-5-5";
 
 fn with_control_sources(mut test: impl FnMut()) {
     use crate::proxy::config::*;
-    let _lock = TEST_CONFIG_LOCK.lock().unwrap();
+    let _lock = TEST_CONFIG_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     struct Restore(ThinkingBudgetConfig);
     impl Drop for Restore {
         fn drop(&mut self) {
