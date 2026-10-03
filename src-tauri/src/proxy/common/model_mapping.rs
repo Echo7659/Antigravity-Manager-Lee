@@ -95,13 +95,15 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
 /// `claude-open-4.x`）。服务端目录只认连字符形态（`claude-opus-4-6` 等）。
 /// 这里只改写 Claude ID：移除连续的受支持前缀，把短版本号里的点换成连字符。
 pub fn canonicalize_upstream_model_id(input: &str) -> String {
-    let mut id = input.trim().to_lowercase();
+    let normalized = input.trim().to_lowercase();
+    let mut id = normalized.as_str();
     while let Some(rest) = id
         .strip_prefix("anthropic/")
         .or_else(|| id.strip_prefix("models/"))
     {
-        id = rest.to_string();
+        id = rest;
     }
+    let mut id = id.to_string();
     if id.contains("claude-open-") {
         id = id.replace("claude-open-", "claude-opus-");
     }
@@ -507,6 +509,17 @@ pub fn resolve_model_route(
 #[cfg(test)]
 mod opus_route_tests {
     use super::*;
+
+    #[test]
+    fn canonicalize_long_repeated_prefixes() {
+        let prefixes = "models/anthropic/".repeat(16_384);
+        let input = format!("{prefixes}claude-opus-5.5");
+        let canonical = canonicalize_upstream_model_id(&input);
+        assert_eq!(canonical, "claude-opus-5-5");
+        assert_eq!(canonicalize_upstream_model_id(&canonical), canonical);
+        let unknown = format!("{prefixes}future-model-9");
+        assert_eq!(canonicalize_upstream_model_id(&unknown), unknown);
+    }
 
     #[test]
     fn opus_5_5_canonical_prefixes_are_idempotent() {
