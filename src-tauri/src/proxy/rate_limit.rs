@@ -476,21 +476,30 @@ impl RateLimitTracker {
             RateLimitReason::ServerError
         };
 
+        let parsed_current_delay = match parser_mode {
+            RetryParserMode::Current => {
+                crate::proxy::upstream::retry::parse_retry_delay_with_source(
+                    body,
+                    retry_after_header,
+                )
+            }
+            RetryParserMode::Baseline => None,
+        };
         let retry_after_sec = match parser_mode {
             RetryParserMode::Current => {
-                crate::proxy::upstream::retry::parse_retry_delay(body, retry_after_header)
-                    .map(|delay_ms| delay_ms.saturating_add(999) / 1000)
+                parsed_current_delay.map(|delay| delay.raw_ms.saturating_add(999) / 1000)
             }
             RetryParserMode::Baseline => retry_after_header
                 .and_then(|value| value.parse::<u64>().ok())
                 .or_else(|| self.parse_retry_time_from_body_baseline(body)),
         };
-        let has_explicit_retry_time = retry_after_sec.is_some();
         let preserve_explicit_quota = parser_mode == RetryParserMode::Current
             && status == 429
             && reason == RateLimitReason::QuotaExhausted
             && has_explicit_quota_exhausted(body)
-            && has_explicit_retry_time;
+            && parsed_current_delay.is_some_and(|delay| {
+                delay.source == crate::proxy::upstream::retry::RetryDelaySource::QuotaMetadata
+            });
 
         // 4. 处理默认值与软避让逻辑（根据限流类型设置不同默认值）
         let retry_sec = match retry_after_sec {
@@ -1039,17 +1048,29 @@ mod tests {
             .unwrap();
         assert_eq!(inferred.retry_after_sec, 300);
 
-        let text_model = tracker
+        let header_only = tracker
             .parse_from_error(
-                "acc-text",
+                "acc-header",
                 429,
                 Some("72h"),
                 r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED"}]}}"#,
-                Some("gemini-2.5-pro".to_string()),
+                Some("gemini-3-pro-image".to_string()),
                 &[60, 300],
             )
             .unwrap();
-        assert_eq!(text_model.retry_after_sec, 300);
+        assert_eq!(header_only.retry_after_sec, 300);
+
+        let generic_structured = tracker
+            .parse_from_error(
+                "acc-retry-info",
+                429,
+                None,
+                r#"{"error":{"details":[{"reason":"QUOTA_EXHAUSTED","retryDelay":"72h"}]}}"#,
+                Some("gemini-3-pro-image".to_string()),
+                &[60, 300],
+            )
+            .unwrap();
+        assert_eq!(generic_structured.retry_after_sec, 300);
 
         let broad_quota = tracker
             .parse_from_error(

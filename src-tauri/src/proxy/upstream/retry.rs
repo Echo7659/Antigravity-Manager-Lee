@@ -79,6 +79,8 @@ pub fn parse_duration_ms(duration_str: &str) -> Option<u64> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryDelaySource {
+    Header,
+    QuotaMetadata,
     Structured,
     ResponseText,
 }
@@ -92,7 +94,9 @@ pub struct ParsedRetryDelay {
 impl ParsedRetryDelay {
     pub fn actual_wait_ms(self) -> u64 {
         let buffer_ms = match self.source {
-            RetryDelaySource::Structured => 200,
+            RetryDelaySource::Header
+            | RetryDelaySource::QuotaMetadata
+            | RetryDelaySource::Structured => 200,
             RetryDelaySource::ResponseText => 1000,
         };
         self.raw_ms.saturating_add(buffer_ms)
@@ -113,19 +117,25 @@ pub fn parse_retry_delay_with_source(
         if let Ok(seconds) = value.parse::<u64>() {
             return seconds.checked_mul(1000).map(|raw_ms| ParsedRetryDelay {
                 raw_ms,
-                source: RetryDelaySource::Structured,
+                source: RetryDelaySource::Header,
             });
         }
         if let Some(delay) = parse_duration_ms(value) {
             return Some(ParsedRetryDelay {
                 raw_ms: delay,
-                source: RetryDelaySource::Structured,
+                source: RetryDelaySource::Header,
             });
         }
     }
 
     // 2. 结构化 JSON 字段优先，避免把 JSON 中的 retryDelay 当作响应文字。
     if let Ok(json) = serde_json::from_str(error_text) {
+        if let Some(raw_ms) = extract_quota_metadata_delay_recursive(&json, 0) {
+            return Some(ParsedRetryDelay {
+                raw_ms,
+                source: RetryDelaySource::QuotaMetadata,
+            });
+        }
         if let Some(raw_ms) = extract_structured_delay_recursive(&json, 0, false) {
             return Some(ParsedRetryDelay {
                 raw_ms,
@@ -146,6 +156,36 @@ pub fn parse_retry_delay_with_source(
         }
     }
     None
+}
+
+/// 从结构化上游错误中提取配额重置延迟。
+///
+/// 该边界只识别 `quotaResetDelay` 及其分隔符变体，不包含 Retry-After 或自然语言。
+fn extract_quota_metadata_delay_recursive(value: &serde_json::Value, depth: usize) -> Option<u64> {
+    if depth > 8 {
+        return None;
+    }
+
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                let normalized_key = key.to_lowercase().replace(['-', '_'], "");
+                if normalized_key == "quotaresetdelay" {
+                    if let Some(delay) = parse_structured_duration_value(value) {
+                        return Some(delay);
+                    }
+                }
+                if let Some(delay) = extract_quota_metadata_delay_recursive(value, depth + 1) {
+                    return Some(delay);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| extract_quota_metadata_delay_recursive(value, depth + 1)),
+        _ => None,
+    }
 }
 
 /// Preserve the pre-state-machine delay parsing used by the Claude handler.
@@ -301,11 +341,23 @@ mod tests {
             None,
         )
         .unwrap();
+        assert_eq!(quota_reset.source, RetryDelaySource::QuotaMetadata);
         assert_eq!(quota_reset.actual_wait_ms(), 5200);
         assert!(should_grace_retry(quota_reset.raw_ms));
 
         let retry_after = parse_retry_delay_with_source("", Some("3")).unwrap();
+        assert_eq!(retry_after.source, RetryDelaySource::Header);
         assert_eq!(retry_after.actual_wait_ms(), 3200);
+
+        let header_precedes_quota_metadata = parse_retry_delay_with_source(
+            r#"{"error":{"details":[{"metadata":{"quotaResetDelay":"5s"}}]}}"#,
+            Some("3"),
+        )
+        .unwrap();
+        assert_eq!(
+            header_precedes_quota_metadata.source,
+            RetryDelaySource::Header
+        );
 
         let response_text = parse_retry_delay_with_source("quota reset after 3s", None).unwrap();
         assert_eq!(response_text.source, RetryDelaySource::ResponseText);
