@@ -244,11 +244,14 @@ pub fn determine_retry_strategy_adaptive(
                 if let Some(delay) = parsed_delay {
                     let actual_ms = delay.actual_wait_ms();
                     if actual_ms <= 30_000 {
-                        tracing::info!(
-                            "[Retry] Single account 429: quotaResetDelay detected ({}ms), applying GraceRetry",
-                            actual_ms
-                        );
-                        return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
+                        if allow_grace_retry {
+                            tracing::info!(
+                                "[Retry] Single account 429: quotaResetDelay detected ({}ms), applying GraceRetry",
+                                actual_ms
+                            );
+                            return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
+                        }
+                        return RetryStrategy::FixedDelay(Duration::from_millis(actual_ms));
                     } else {
                         return RetryStrategy::FixedDelay(Duration::from_millis(30_000));
                     }
@@ -259,7 +262,11 @@ pub fn determine_retry_strategy_adaptive(
                         "[Retry] Single account 429 without explicit delay: backing off {}ms",
                         backoff_ms
                     );
-                    return RetryStrategy::GraceRetry(Duration::from_millis(backoff_ms));
+                    return if allow_grace_retry {
+                        RetryStrategy::GraceRetry(Duration::from_millis(backoff_ms))
+                    } else {
+                        RetryStrategy::FixedDelay(Duration::from_millis(backoff_ms))
+                    };
                 }
             }
 
@@ -425,6 +432,24 @@ mod tests {
         let mut all_503 = FailureStatusTracker::default();
         all_503.record(StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(all_503.final_status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn task_single_account_grace_retry_is_limited_to_once() {
+        for (body, expected_delay) in [
+            (
+                r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"1s"}]}}"#,
+                Duration::from_millis(1_200),
+            ),
+            ("rate limited", Duration::from_millis(3_000)),
+        ] {
+            let mut state = RequestRetryState::default();
+            let first = state.determine_strategy("account", 429, body, None, false);
+            assert!(matches!(first, RetryStrategy::GraceRetry(delay) if delay == expected_delay));
+
+            let second = state.determine_strategy("account", 429, body, None, false);
+            assert!(matches!(second, RetryStrategy::FixedDelay(delay) if delay == expected_delay));
+        }
     }
 }
 
