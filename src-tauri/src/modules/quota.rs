@@ -42,6 +42,47 @@ struct DeprecatedModelInfo {
     new_model_id: String,
 }
 
+/// 保存成功响应的公开目录；仅有配额信息的模型进入额度保护数据。
+fn collect_available_models(quota_data: &mut QuotaData, response: QuotaResponse) {
+    for (name, info) in response.models {
+        // 上游显式标记的内部模型不属于对外目录。
+        if info.is_internal == Some(true)
+            || !crate::proxy::common::model_mapping::is_public_snapshot_model_id(&name)
+        {
+            continue;
+        }
+        quota_data.catalog_model_ids.push(name.clone());
+        if let Some(quota_info) = info.quota_info {
+            let percentage = quota_info
+                .remaining_fraction
+                .map(|fraction| (fraction * 100.0) as i32)
+                .unwrap_or(0);
+            quota_data.add_model(crate::models::quota::ModelQuota {
+                name,
+                percentage,
+                reset_time: quota_info.reset_time.unwrap_or_default(),
+                display_name: info.display_name,
+                supports_images: info.supports_images,
+                supports_thinking: info.supports_thinking,
+                thinking_budget: info.thinking_budget.map(|value| value as i32),
+                recommended: info.recommended,
+                max_tokens: info.max_tokens.map(|value| value as i32),
+                max_output_tokens: info.max_output_tokens.map(|value| value as i32),
+                model: Some(info.model),
+                supported_mime_types: info.supported_mime_types,
+            });
+        }
+    }
+    quota_data.catalog_model_ids.sort();
+    if let Some(deprecated) = response.deprecated_model_ids {
+        for (old_id, info) in deprecated {
+            quota_data
+                .model_forwarding_rules
+                .insert(old_id, info.new_model_id);
+        }
+    }
+}
+
 // ---- retrieveUserQuotaSummary 响应反序列化结构 ----
 
 #[derive(Debug, Deserialize)]
@@ -371,50 +412,7 @@ pub async fn fetch_quota_with_cache(
                 // 动态更新官方全量模型结构体目录缓存
                 crate::models::OfficialModelCatalog::update(quota_response.models.clone());
 
-                for (name, info) in quota_response.models {
-                    if let Some(quota_info) = info.quota_info {
-                        let percentage = quota_info
-                            .remaining_fraction
-                            .map(|f| (f * 100.0) as i32)
-                            .unwrap_or(0);
-
-                        let reset_time = quota_info.reset_time.clone().unwrap_or_default();
-
-                        // Only keep models we care about (exclude internal chat models)
-                        if name.starts_with("gemini")
-                            || name.starts_with("claude")
-                            || name.starts_with("gpt")
-                            || name.starts_with("image")
-                            || name.starts_with("imagen")
-                        {
-                            let model_quota = crate::models::quota::ModelQuota {
-                                name,
-                                percentage,
-                                reset_time,
-                                display_name: info.display_name,
-                                supports_images: info.supports_images,
-                                supports_thinking: info.supports_thinking,
-                                thinking_budget: info.thinking_budget.map(|v| v as i32),
-                                recommended: info.recommended,
-                                max_tokens: info.max_tokens.map(|v| v as i32),
-                                max_output_tokens: info.max_output_tokens.map(|v| v as i32),
-                                model: Some(info.model),
-                                supported_mime_types: info.supported_mime_types,
-                            };
-                            quota_data.add_model(model_quota);
-                        }
-                    }
-                }
-
-                // Parse deprecated model routing rules
-                if let Some(deprecated) = quota_response.deprecated_model_ids {
-                    for (old_id, info) in deprecated {
-                        // Register forwarding rules (including those mapping to gemini-pro-agent)
-                        quota_data
-                            .model_forwarding_rules
-                            .insert(old_id, info.new_model_id);
-                    }
-                }
+                collect_available_models(&mut quota_data, quota_response);
 
                 // 归一化订阅等级。注意：**不再**用模型列表做兜底推断
                 // （fetchAvailableModels 对免费号和 Pro 号返回完全相同的全量目录）。
@@ -942,6 +940,44 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
         "Successfully triggered warmup for {} model series",
         warmed_count
     ))
+}
+
+#[cfg(test)]
+mod model_catalog_tests {
+    use super::*;
+
+    #[test]
+    fn model_catalog_collects_public_upstream_ids_without_quota_info() {
+        let response: QuotaResponse = serde_json::from_value(serde_json::json!({
+            "models": {
+                "gpt-oss-20b": {"quotaInfo": {"remainingFraction": 0.8}},
+                "nova-x-1": {},
+                "nova-pro-image-flash-v9": {"quotaInfo": {"remainingFraction": 0.6}},
+                "chat_20706": {},
+                "private-model": {"isInternal": true},
+                "gemini-pro-agent": {}
+            }
+        }))
+        .unwrap();
+        let mut quota = QuotaData::new();
+        collect_available_models(&mut quota, response);
+        let snapshot = quota.current_catalog_snapshot().unwrap();
+        assert_eq!(snapshot.models.len(), 4);
+        for name in [
+            "gpt-oss-20b",
+            "nova-x-1",
+            "nova-pro-image-flash-v9",
+            "gemini-pro-agent",
+        ] {
+            assert!(snapshot.models.contains(&name.to_string()), "{name}");
+        }
+        assert_eq!(quota.models.len(), 2);
+        assert!(quota.models.iter().any(|model| model.name == "gpt-oss-20b"));
+        assert!(quota
+            .models
+            .iter()
+            .any(|model| model.name == "nova-pro-image-flash-v9"));
+    }
 }
 
 #[cfg(test)]

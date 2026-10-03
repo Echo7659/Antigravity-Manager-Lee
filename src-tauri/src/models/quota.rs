@@ -94,6 +94,9 @@ pub struct ModelCatalogSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuotaData {
     pub models: Vec<ModelQuota>,
+    /// 成功上游响应中的公开模型 ID；不依赖模型是否带有配额信息。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub catalog_model_ids: Vec<String>,
     pub last_updated: i64,
     #[serde(default)]
     pub is_forbidden: bool,
@@ -121,6 +124,7 @@ impl QuotaData {
     pub fn new() -> Self {
         Self {
             models: Vec::new(),
+            catalog_model_ids: Vec::new(),
             last_updated: chrono::Utc::now().timestamp(),
             is_forbidden: false,
             forbidden_reason: None,
@@ -149,12 +153,14 @@ impl QuotaData {
 
     /// 返回当前配额中的模型目录观测；空模型响应不构成成功目录观测。
     pub(crate) fn current_catalog_snapshot(&self) -> Option<ModelCatalogSnapshot> {
-        let models: Vec<_> = self
-            .models
-            .iter()
-            .map(|model| model.name.trim())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
+        let models: Vec<_> = if self.catalog_model_ids.is_empty() {
+            self.models.iter().map(|model| model.name.clone()).collect()
+        } else {
+            self.catalog_model_ids.clone()
+        };
+        let models: Vec<_> = models
+            .into_iter()
+            .filter(|name| !name.trim().is_empty())
             .collect();
         (self.last_updated > 0 && !models.is_empty()).then(|| ModelCatalogSnapshot {
             last_updated: self.last_updated,

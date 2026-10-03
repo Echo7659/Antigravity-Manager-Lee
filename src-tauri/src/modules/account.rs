@@ -1788,6 +1788,7 @@ pub fn mark_account_forbidden(account_id: &str, reason: &str) -> Result<(), Stri
     } else {
         account.quota = Some(crate::models::QuotaData {
             models: Vec::new(),
+            catalog_model_ids: Vec::new(),
             last_updated: chrono::Utc::now().timestamp(),
             subscription_tier: None,
             is_paid_subscription: None,

@@ -56,6 +56,15 @@ fn classify_rate_limit_reason(error_body: &str) -> crate::proxy::rate_limit::Rat
 const IMAGE_ACCOUNT_RESELECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const MODEL_CATALOG_FRESH_SECS: i64 = 86_400;
 
+/// 读取公开目录 ID；旧账号文件仍从配额模型列表恢复目录。
+fn catalog_model_entries(catalog: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    catalog
+        .get("catalog_model_ids")
+        .and_then(|value| value.as_array())
+        .filter(|models| !models.is_empty())
+        .or_else(|| catalog.get("models").and_then(|value| value.as_array()))
+}
+
 fn select_catalog_snapshots<T>(snapshots: Vec<(i64, T)>, now: i64) -> Vec<T> {
     let snapshots: Vec<_> = snapshots
         .into_iter()
@@ -4086,7 +4095,7 @@ impl TokenManager {
                     .filter(|snapshot| !snapshot.is_null())
                     .unwrap_or(quota);
                 let timestamp = catalog.get("last_updated")?.as_i64().filter(|t| *t > 0)?;
-                catalog.get("models")?.as_array()?.iter().find(|model| {
+                catalog_model_entries(catalog)?.iter().find(|model| {
                     model
                         .as_str()
                         .or_else(|| model.get("name").and_then(|v| v.as_str()))
@@ -4101,7 +4110,7 @@ impl TokenManager {
         let mut models = HashSet::new();
         let mut rules = HashMap::new();
         for (_, quota) in select_catalog_snapshots(snapshots, now) {
-            if let Some(raw_models) = quota.get("models").and_then(|v| v.as_array()) {
+            if let Some(raw_models) = catalog_model_entries(&quota) {
                 for model in raw_models {
                     if let Some(name) = model
                         .as_str()
@@ -5369,6 +5378,45 @@ mod tests {
         assert!(
             !crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
                 .contains_key("retired-last-known-good")
+        );
+    }
+
+    #[tokio::test]
+    async fn model_catalog_uses_upstream_ids_through_fresh_and_last_known_good() {
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let data_dir = crate::modules::account::get_data_dir().unwrap();
+        let accounts_dir = data_dir.join("accounts");
+        std::fs::create_dir(&accounts_dir).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let mut account: crate::models::Account =
+            serde_json::from_value(weekly_quota_account(now)).unwrap();
+        let mut first = crate::models::QuotaData::new();
+        first.last_updated = now;
+        first.catalog_model_ids = vec!["nova-x-1".to_string(), "gpt-oss-20b".to_string()];
+        first
+            .model_forwarding_rules
+            .insert("old-nova".to_string(), "nova-x-1".to_string());
+        account.update_quota(first);
+        let path = accounts_dir.join("weekly-test.json");
+        std::fs::write(&path, serde_json::to_string(&account).unwrap()).unwrap();
+        let manager = TokenManager::new(data_dir);
+        manager.load_accounts().await.unwrap();
+        let fresh = manager.get_all_collected_models();
+        assert!(fresh.contains("nova-x-1"));
+        assert!(fresh.contains("gpt-oss-20b"));
+        assert!(!fresh.contains("gemini-3.8-flash-high"));
+
+        let mut empty = crate::models::QuotaData::new();
+        empty.last_updated = now + 1;
+        crate::modules::account::update_account_quota("weekly-test", empty).unwrap();
+        manager.reload_account("weekly-test").await.unwrap();
+        assert!(manager.get_all_collected_models().contains("nova-x-1"));
+        assert_eq!(
+            crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
+                .get("old-nova")
+                .unwrap()
+                .value(),
+            "nova-x-1"
         );
     }
 

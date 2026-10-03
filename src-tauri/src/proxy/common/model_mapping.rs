@@ -234,76 +234,12 @@ pub fn map_claude_model_to_gemini(input: &str) -> String {
     input.to_string()
 }
 
-fn model_version(model: &str, prefix: &str) -> Option<(u32, u32)> {
-    let rest = model.split_once(prefix)?.1;
-    let mut parts = rest
-        .split(['-', '.'])
-        .skip_while(|part| part.parse::<u32>().is_err());
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
-    Some((major, minor))
-}
-
-/// 核心基准线过滤器：严格遵循官方客户端当前展示的模型基准线
-/// 1. Gemini Flash 系列：基准线 3.5，另保留 3.1 Flash Lite。
-/// 2. Claude 系列：基准线 4.6。版本 >= 4.6 保留；4.6 以下全部淘汰。
-/// 3. GPT 系列：以官方最新公布为准 (gpt-oss-120b-medium)，淘汰 gpt-4o 等历史旧模型。
-/// 4. Gemini Pro 系列：基准线 3.1，另保留 3 Pro Image。
-pub fn is_model_compliant_with_baseline(model: &str) -> bool {
-    let lower = model.to_lowercase();
-    let m = lower.trim();
-
-    // 过滤内部任务与测试模型
-    if m.starts_with("chat_")
-        || m.starts_with("tab_jump")
-        || m.contains("internal")
-        || m == "gemini-pro-agent"
-        || m == "gemini-3-flash-agent"
-        || m.contains("-exp")
-    {
-        return false;
-    }
-
-    // 1. Claude 系列：以 4.6 为基准线，4.6 以下全部淘汰
-    if m.contains("claude") {
-        return model_version(m, "claude-").is_some_and(|version| version >= (4, 6));
-    }
-
-    // 2. GPT / OpenAI 系列：以官方为准 (gpt-oss-120b-medium)
-    if m.contains("gpt") || m.contains("o1") || m.contains("o3") {
-        return m == "gpt-oss-120b-medium";
-    }
-
-    // 3. 图像模型保底
-    if m.contains("image") {
-        return !m.contains("preview")
-            && (m == "gemini-3-pro-image"
-                || model_version(m, "gemini-").is_some_and(|version| version >= (3, 1)));
-    }
-
-    // 4. Gemini Pro 系列：以官方最新为准 (3.1 Pro)，淘汰 2.5 Pro 及以下历史旧模型
-    if m.contains("pro") {
-        return !m.contains("preview")
-            && model_version(m, "gemini-").is_some_and(|version| version >= (3, 1));
-    }
-
-    // 5. Gemini Flash 系列：淘汰 2.5 全系列及已 503 的 3.5-flash-lite；放行 3.1-flash-lite 与 >= 3.5 版本
-    if m.contains("flash") {
-        // 3.1-flash-lite 特别放行（1M 上下文轻量健康模型）
-        if m == "gemini-3.1-flash-lite" {
-            return true;
-        }
-
-        // 3.5-flash-lite 上游已下线 503
-        if m == "gemini-3.5-flash-lite" {
-            return false;
-        }
-
-        return model_version(m, "gemini-").is_some_and(|version| version >= (3, 5));
-    }
-
-    // 其他未知系列由上游快照决定是否进入目录。
-    true
+/// 判定快照 ID 是否属于对外模型；版本和模型家族由成功上游快照决定。
+pub(crate) fn is_public_snapshot_model_id(model: &str) -> bool {
+    let name = model.trim().to_ascii_lowercase();
+    // chat_ 是上游内部聊天任务 ID，不是可请求的模型 ID。
+    // tab_jump 是编辑器跳转任务 ID，不是可请求的模型 ID。
+    !name.is_empty() && !name.starts_with("chat_") && !name.starts_with("tab_jump")
 }
 
 /// 获取所有内置支持的标准公开模型列表 (已清理过期实验模型、重复笛卡尔积及旧快照)
@@ -374,7 +310,7 @@ pub fn model_ids_from_catalog(
     use std::collections::HashSet;
     let mut model_ids: HashSet<_> = collected
         .into_iter()
-        .filter(|id| is_model_compliant_with_baseline(id))
+        .filter(|id| is_public_snapshot_model_id(id))
         .collect();
 
     // 配置允许时追加用户自定义映射名称。
@@ -844,6 +780,34 @@ mod tests {
             .contains(&"custom-gpt4".to_string()));
     }
 
+    #[test]
+    fn model_catalog_accepts_advertised_families_and_deduplicates() {
+        let collected = [
+            "gpt-oss-20b",
+            "nova-x-1",
+            "nova-pro-image-flash-v9",
+            "gpt-oss-20b",
+            "",
+            "chat_20706",
+        ]
+        .into_iter()
+        .map(str::to_string);
+        let mapping = HashMap::from([("custom-alias".to_string(), "nova-x-1".to_string())]);
+        assert_eq!(
+            model_ids_from_catalog(collected.clone(), &mapping, true),
+            vec!["gpt-oss-20b", "nova-pro-image-flash-v9", "nova-x-1"]
+        );
+        assert_eq!(
+            model_ids_from_catalog(collected, &mapping, false),
+            vec![
+                "custom-alias",
+                "gpt-oss-20b",
+                "nova-pro-image-flash-v9",
+                "nova-x-1"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_find_dynamic_model() {
         let custom_mapping = tokio::sync::RwLock::new(
@@ -1142,67 +1106,30 @@ mod tests {
     }
 
     #[test]
-    fn test_is_model_compliant_with_baseline() {
-        // Claude: >= 4.6 passes, < 4.6 rejected
-        assert!(is_model_compliant_with_baseline("claude-sonnet-4-6"));
-        assert!(is_model_compliant_with_baseline("claude-opus-4-6-thinking"));
-        assert!(is_model_compliant_with_baseline("claude-sonnet-4-7"));
-        assert!(is_model_compliant_with_baseline("claude-opus-5-0"));
-        assert!(is_model_compliant_with_baseline("claude-sonnet-4-10"));
-        assert!(!is_model_compliant_with_baseline("claude-sonnet-4-5"));
-        assert!(!is_model_compliant_with_baseline("claude-3-5-sonnet"));
-        assert!(!is_model_compliant_with_baseline("claude-3-7-sonnet"));
-        assert!(!is_model_compliant_with_baseline("claude-haiku-4-5"));
-
-        // GPT: only gpt-oss-120b-medium passes
-        assert!(is_model_compliant_with_baseline("gpt-oss-120b-medium"));
-        assert!(!is_model_compliant_with_baseline("gpt-4o"));
-        assert!(!is_model_compliant_with_baseline("gpt-4"));
-        assert!(!is_model_compliant_with_baseline("gpt-3.5-turbo"));
-
-        // Gemini Flash: >= 3.5 passes, 3.1-flash-lite passes, 2.5 rejected, 3.5-flash-lite rejected
-        assert!(is_model_compliant_with_baseline("gemini-3.8-flash-high"));
-        assert!(is_model_compliant_with_baseline("gemini-3.10-flash-high"));
-        assert!(is_model_compliant_with_baseline("gemini-3.7-flash-medium"));
-        assert!(is_model_compliant_with_baseline("gemini-3.6-flash-low"));
-        assert!(is_model_compliant_with_baseline("gemini-3.5-flash-low"));
-        assert!(is_model_compliant_with_baseline("gemini-3.1-flash-lite"));
-        assert!(!is_model_compliant_with_baseline("gemini-2.5-flash"));
-        assert!(!is_model_compliant_with_baseline("gemini-2.5-flash-lite"));
-        assert!(!is_model_compliant_with_baseline(
-            "gemini-2.5-flash-thinking"
-        ));
-        assert!(!is_model_compliant_with_baseline("gemini-3.5-flash-lite"));
-        assert!(!is_model_compliant_with_baseline("gemini-3-flash"));
-        assert!(!is_model_compliant_with_baseline("gemini-1.5-flash"));
-        assert!(!is_model_compliant_with_baseline("gemini-2.0-flash"));
-
-        // Gemini Pro: 3.1 pass, 2.5/1.5/2.0/3.0 rejected
-        assert!(is_model_compliant_with_baseline("gemini-3.1-pro-high"));
-        assert!(is_model_compliant_with_baseline("gemini-11.5-pro-high"));
-        assert!(is_model_compliant_with_baseline("gemini-3.1-pro-low"));
-        assert!(!is_model_compliant_with_baseline("gemini-2.5-pro"));
-        assert!(!is_model_compliant_with_baseline("gemini-1.5-pro"));
-        assert!(!is_model_compliant_with_baseline("gemini-2.0-pro"));
-        assert!(!is_model_compliant_with_baseline("gemini-3-pro"));
-        assert!(!is_model_compliant_with_baseline("gemini-3.1-pro-preview"));
-
-        // Image models
-        assert!(is_model_compliant_with_baseline("gemini-3.1-flash-image"));
-        assert!(is_model_compliant_with_baseline("gemini-4.0-flash-image"));
-        assert!(!is_model_compliant_with_baseline(
-            "gemini-3.1-pro-image-preview"
-        ));
-        assert!(is_model_compliant_with_baseline("gemini-3-pro-image"));
-
-        // Internal models
-        assert!(!is_model_compliant_with_baseline(
-            "tab_jump_flash_lite_preview"
-        ));
-        assert!(!is_model_compliant_with_baseline("chat_20706"));
-        assert!(!is_model_compliant_with_baseline("chat_23310"));
-        assert!(!is_model_compliant_with_baseline("gemini-pro-agent"));
-        assert!(!is_model_compliant_with_baseline("gemini-3-flash-agent"));
+    fn model_catalog_only_excludes_known_internal_task_ids() {
+        for name in [
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-7",
+            "gpt-oss-20b",
+            "gpt-4o",
+            "gemini-2.5-flash",
+            "gemini-3.1-pro-image-preview",
+            "gemini-pro-agent",
+            "gemini-3-flash-agent",
+            "nova-pro-image-flash-v9",
+            "nova-x-1",
+        ] {
+            assert!(is_public_snapshot_model_id(name), "{name}");
+        }
+        for name in [
+            "",
+            "  ",
+            "chat_20706",
+            "chat_23310",
+            "tab_jump_flash_lite_preview",
+        ] {
+            assert!(!is_public_snapshot_model_id(name), "{name}");
+        }
     }
 }
 
