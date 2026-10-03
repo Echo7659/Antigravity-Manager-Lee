@@ -47,6 +47,7 @@ fn create_test_token(
         account_path: PathBuf::from("/tmp/test"),
         project_id: None,
         subscription_tier: tier.map(|s| s.to_string()),
+        is_paid_subscription: false,
         remaining_quota,
         protected_models: HashSet::new(),
         health_score,

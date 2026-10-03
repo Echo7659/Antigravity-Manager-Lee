@@ -1790,6 +1790,7 @@ pub fn mark_account_forbidden(account_id: &str, reason: &str) -> Result<(), Stri
             models: Vec::new(),
             last_updated: chrono::Utc::now().timestamp(),
             subscription_tier: None,
+            is_paid_subscription: None,
             is_forbidden: true,
             forbidden_reason: Some(reason.to_string()),
             model_forwarding_rules: std::collections::HashMap::new(),

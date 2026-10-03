@@ -85,6 +85,44 @@ struct LoadProjectResponse {
     ineligible_tiers: Option<Vec<IneligibleTier>>,
 }
 
+impl LoadProjectResponse {
+    /// 返回成功响应中的订阅等级与可识别的付费证据。
+    fn subscription_evidence(&self) -> (Option<String>, Option<bool>) {
+        let raw_tier = self
+            .paid_tier
+            .as_ref()
+            .and_then(|t| t.id.clone().or_else(|| t.name.clone()))
+            .or_else(|| {
+                self.current_tier
+                    .as_ref()
+                    .and_then(|t| t.id.clone().or_else(|| t.name.clone()))
+            })
+            .or_else(|| {
+                self.allowed_tiers.as_ref().and_then(|allowed| {
+                    allowed
+                        .iter()
+                        .find(|t| {
+                            t.id.as_deref() == Some("free-tier") || t.is_default == Some(true)
+                        })
+                        .and_then(|t| t.id.clone().or_else(|| t.name.clone()))
+                })
+            })
+            .unwrap_or_else(|| "free-tier".to_string());
+        let tier = crate::models::quota::resolve_subscription_tier(Some(&raw_tier));
+        let paid = self
+            .paid_tier
+            .as_ref()
+            .and_then(|t| t.id.as_deref().or(t.name.as_deref()))
+            .is_some_and(|tier| {
+                matches!(
+                    crate::models::quota::normalize_subscription_tier(tier).as_str(),
+                    "PRO" | "ULTRA"
+                )
+            });
+        (Some(tier), Some(paid))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct IneligibleTier {
     #[allow(dead_code)]
@@ -137,7 +175,7 @@ async fn fetch_project_id(
     access_token: &str,
     email: &str,
     account_id: Option<&str>,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<bool>) {
     let client = create_standard_client(account_id).await;
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
 
@@ -163,43 +201,8 @@ async fn fetch_project_id(
                     if let Ok(data) = res.json::<LoadProjectResponse>().await {
                         let project_id = data.project_id.clone();
 
-                        // 等级提取优先级：
-                        // 1. 优先取 paid_tier：若有付费信息（g1-pro-tier / g1-ultra-tier），直接作为权威付费等级；
-                        // 2. 其次取 current_tier：若当前生效档位为 free-tier，则为 FREE；
-                        // 3. 再次检查 allowed_tiers：若包含且仅能用 free-tier，则为 FREE；
-                        // 4. 若 paid_tier 与 current_tier 均为 null（如地理位置受限、受限账号），则权威判为 FREE，绝不误判为 PRO。
-                        let raw_tier = data
-                            .paid_tier
-                            .as_ref()
-                            .and_then(|t| t.id.clone().or_else(|| t.name.clone()))
-                            .or_else(|| {
-                                data.current_tier
-                                    .as_ref()
-                                    .and_then(|t| t.id.clone().or_else(|| t.name.clone()))
-                            })
-                            .or_else(|| {
-                                data.allowed_tiers.as_ref().and_then(|allowed| {
-                                    allowed
-                                        .iter()
-                                        .find(|t| {
-                                            t.id.as_deref() == Some("free-tier")
-                                                || t.is_default == Some(true)
-                                        })
-                                        .and_then(|t| t.id.clone().or_else(|| t.name.clone()))
-                                })
-                            })
-                            .unwrap_or_else(|| "free-tier".to_string());
-
-                        let subscription_tier = {
-                            let normalized =
-                                crate::models::quota::normalize_subscription_tier(&raw_tier);
-                            if crate::models::quota::is_known_tier(&normalized) {
-                                Some(normalized)
-                            } else {
-                                // standard-tier 或其他未知档位安全归入 FREE
-                                Some("FREE".to_string())
-                            }
-                        };
+                        let (subscription_tier, is_paid_subscription) =
+                            data.subscription_evidence();
 
                         if let Some(ref tier) = subscription_tier {
                             crate::modules::logger::log_info(&format!(
@@ -215,7 +218,7 @@ async fn fetch_project_id(
                             ));
                         }
 
-                        return (project_id, subscription_tier);
+                        return (project_id, subscription_tier, is_paid_subscription);
                     }
                 } else {
                     crate::modules::logger::log_warn(&format!(
@@ -237,7 +240,7 @@ async fn fetch_project_id(
         }
     }
 
-    (None, None)
+    (None, None, None)
 }
 
 /// Unified entry point for fetching account quota
@@ -269,16 +272,20 @@ pub async fn fetch_quota_with_cache(
     // 这个「优化」只剩副作用，因此移除。
     //
     // 现在：始终调用；仅在上游返回空值时用缓存/已存值兜底，避免网络抖动把数据抹掉。
-    let (fresh_project_id, fresh_tier) = fetch_project_id(access_token, email, account_id).await;
+    let (fresh_project_id, fresh_tier, fresh_paid) =
+        fetch_project_id(access_token, email, account_id).await;
 
     let project_id = fresh_project_id.or_else(|| cached_project_id.map(|s| s.to_string()));
 
-    let existing_tier = account_id
+    let existing_quota = account_id
         .and_then(|id| crate::modules::load_account(id).ok())
-        .and_then(|acc| acc.quota.and_then(|q| q.subscription_tier));
+        .and_then(|acc| acc.quota);
 
     // 上游值优先；上游这次没给（网络失败 / 未识别）才保留旧值。
-    let subscription_tier = fresh_tier.or(existing_tier);
+    let mut subscription = QuotaData::new();
+    subscription.subscription_tier = fresh_tier;
+    subscription.is_paid_subscription = fresh_paid;
+    subscription.preserve_subscription_evidence(existing_quota.as_ref());
 
     // We keep project_id to store in the DB, but we NO LONGER force inject it into payload if it's absent
 
@@ -319,10 +326,8 @@ pub async fn fetch_quota_with_cache(
                         crate::modules::logger::log_warn(&format!(
                             "Account unauthorized (403 Forbidden), marking as forbidden"
                         ));
-                        let mut q = QuotaData::new();
+                        let mut q = subscription.clone();
                         q.is_forbidden = true;
-                        // 保留本次 loadCodeAssist 拿到的等级；拿不到才回退到已存值
-                        q.subscription_tier = subscription_tier.clone();
                         return Ok((q, project_id.clone()));
                     }
 
@@ -358,7 +363,7 @@ pub async fn fetch_quota_with_cache(
                 let quota_response: QuotaResponse =
                     response.json().await.map_err(AppError::from)?;
 
-                let mut quota_data = QuotaData::new();
+                let mut quota_data = subscription.clone();
 
                 // Use debug level for detailed info to avoid console noise
                 tracing::debug!("Quota API returned {} models", quota_response.models.len());
@@ -413,8 +418,9 @@ pub async fn fetch_quota_with_cache(
 
                 // 归一化订阅等级。注意：**不再**用模型列表做兜底推断
                 // （fetchAvailableModels 对免费号和 Pro 号返回完全相同的全量目录）。
-                let final_tier =
-                    crate::models::quota::resolve_subscription_tier(subscription_tier.as_deref());
+                let final_tier = crate::models::quota::resolve_subscription_tier(
+                    quota_data.subscription_tier.as_deref(),
+                );
                 quota_data.subscription_tier = Some(final_tier);
 
                 // Best-effort: fetch grouped quota summary (weekly + 5h windows).
@@ -588,7 +594,7 @@ pub async fn get_valid_token_for_warmup(
     }
 
     // Fetch project_id
-    let (project_id, _) = fetch_project_id(
+    let (project_id, _, _) = fetch_project_id(
         &account.token.access_token,
         &account.email,
         Some(&account.id),
@@ -936,4 +942,50 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
         "Successfully triggered warmup for {} model series",
         warmed_count
     ))
+}
+
+#[cfg(test)]
+mod paid_subscription_tests {
+    use super::*;
+
+    #[test]
+    fn opus_5_5_eligibility_paid_tier_is_required_for_pro() {
+        for (payload, expected) in [
+            (
+                json!({"paidTier": {"id": "g1-pro-tier"}}),
+                (Some("PRO".to_string()), Some(true)),
+            ),
+            (
+                json!({"currentTier": {"id": "g1-pro-tier"}}),
+                (Some("PRO".to_string()), Some(false)),
+            ),
+            (
+                json!({"paidTier": {}, "currentTier": {"id": "g1-pro-tier"}}),
+                (Some("PRO".to_string()), Some(false)),
+            ),
+            (
+                json!({"paidTier": {"id": "unrecognized-tier"}}),
+                (Some("FREE".to_string()), Some(false)),
+            ),
+        ] {
+            let response: LoadProjectResponse = serde_json::from_value(payload).unwrap();
+            assert_eq!(response.subscription_evidence(), expected);
+        }
+    }
+
+    #[test]
+    fn opus_5_5_eligibility_refresh_preserves_unknown_and_overrides_known_evidence() {
+        let mut existing = QuotaData::new();
+        existing.subscription_tier = Some("PRO".to_string());
+        existing.is_paid_subscription = Some(true);
+        let mut refreshed = QuotaData::new();
+        refreshed.preserve_subscription_evidence(Some(&existing));
+        assert_eq!(refreshed.is_paid_subscription, Some(true));
+        assert_eq!(refreshed.subscription_tier.as_deref(), Some("PRO"));
+        refreshed.is_forbidden = true;
+        refreshed.is_paid_subscription = Some(false);
+        refreshed.preserve_subscription_evidence(Some(&existing));
+        assert_eq!(refreshed.is_paid_subscription, Some(false));
+        assert!(refreshed.is_forbidden);
+    }
 }

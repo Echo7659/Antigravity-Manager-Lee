@@ -103,6 +103,9 @@ pub struct QuotaData {
     /// 订阅等级 (FREE/PRO/ULTRA)
     #[serde(default)]
     pub subscription_tier: Option<String>,
+    /// loadCodeAssist 的付费证据；None 表示尚无可判断的响应。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_paid_subscription: Option<bool>,
     /// 模型淘汰重定向规则表 (old_model_id -> new_model_id)
     #[serde(default)]
     pub model_forwarding_rules: std::collections::HashMap<String, String>,
@@ -122,6 +125,7 @@ impl QuotaData {
             is_forbidden: false,
             forbidden_reason: None,
             subscription_tier: None,
+            is_paid_subscription: None,
             model_forwarding_rules: std::collections::HashMap::new(),
             last_successful_catalog: None,
             quota_groups: None,
@@ -130,6 +134,17 @@ impl QuotaData {
 
     pub fn add_model(&mut self, model: ModelQuota) {
         self.models.push(model);
+    }
+
+    /// 仅在本次刷新缺少证据时保留已有订阅信息。
+    pub fn preserve_subscription_evidence(&mut self, existing: Option<&Self>) {
+        if let Some(existing) = existing {
+            self.subscription_tier = self
+                .subscription_tier
+                .take()
+                .or_else(|| existing.subscription_tier.clone());
+            self.is_paid_subscription = self.is_paid_subscription.or(existing.is_paid_subscription);
+        }
     }
 
     /// 返回当前配额中的模型目录观测；空模型响应不构成成功目录观测。
@@ -259,6 +274,25 @@ impl Default for QuotaData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_5_5_eligibility_paid_evidence_json_compatibility() {
+        let mut quota: QuotaData = serde_json::from_value(serde_json::json!({
+            "models": [], "last_updated": 1, "subscription_tier": "PRO"
+        }))
+        .unwrap();
+        assert_eq!(quota.is_paid_subscription, None);
+        assert!(serde_json::to_value(&quota)
+            .unwrap()
+            .get("is_paid_subscription")
+            .is_none());
+        for paid in [true, false] {
+            quota.is_paid_subscription = Some(paid);
+            let restored: QuotaData =
+                serde_json::from_value(serde_json::to_value(&quota).unwrap()).unwrap();
+            assert_eq!(restored.is_paid_subscription, Some(paid));
+        }
+    }
 
     #[test]
     fn test_normalize_subscription_tier() {

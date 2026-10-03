@@ -148,16 +148,37 @@ pub struct ProxyToken {
     pub account_path: PathBuf, // 账号文件路径，用于更新
     pub project_id: Option<String>,
     pub subscription_tier: Option<String>, // "FREE" | "PRO" | "ULTRA"
-    pub remaining_quota: Option<i32>,      // [FIX #563] Remaining quota for priority sorting
+    pub is_paid_subscription: bool,
+    pub remaining_quota: Option<i32>, // [FIX #563] Remaining quota for priority sorting
     pub protected_models: HashSet<String>, // [NEW #621]
-    pub health_score: f32,                 // [NEW] 健康分数 (0.0 - 1.0)
-    pub reset_time: Option<i64>,           // [NEW] 配额刷新时间戳（用于排序优化）
+    pub health_score: f32,            // [NEW] 健康分数 (0.0 - 1.0)
+    pub reset_time: Option<i64>,      // [NEW] 配额刷新时间戳（用于排序优化）
     pub validation_blocked: bool, // [NEW] Check for validation block (VALIDATION_REQUIRED temporary block)
     pub validation_blocked_until: i64, // [NEW] Timestamp until which the account is blocked
     pub validation_url: Option<String>, // [NEW] Validation URL (#1522)
     pub exact_model_quotas: HashMap<String, i32>,
     pub model_quotas: HashMap<String, i32>, // [OPTIMIZATION] In-memory cache for model-specific quotas
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
+}
+
+/// Opus 5.5 仅允许 Ultra 或具有明确付费证据的 Pro。
+pub fn is_opus_5_5_eligible(tier: &str, paid: bool) -> bool {
+    match crate::models::quota::normalize_subscription_tier(tier).as_str() {
+        "ULTRA" => true,
+        "PRO" => paid,
+        _ => false,
+    }
+}
+
+fn is_model_account_eligible(token: &ProxyToken, model: &str) -> bool {
+    !model
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("claude-opus-5-5")
+        || is_opus_5_5_eligible(
+            token.subscription_tier.as_deref().unwrap_or(""),
+            token.is_paid_subscription,
+        )
 }
 
 fn is_account_quota_protected(token: &ProxyToken, protection_enabled: bool) -> bool {
@@ -723,6 +744,11 @@ impl TokenManager {
             .and_then(|q| q.get("subscription_tier"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let is_paid_subscription = account
+            .get("quota")
+            .and_then(|q| q.get("is_paid_subscription"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // [FIX #563] 提取最大剩余配额百分比用于优先级排序 (Option<i32> now)
         let remaining_quota = account
@@ -838,6 +864,7 @@ impl TokenManager {
             account_path: path.clone(),
             project_id,
             subscription_tier,
+            is_paid_subscription,
             remaining_quota,
             protected_models,
             health_score,
@@ -1691,7 +1718,10 @@ impl TokenManager {
     ) -> Result<(String, String, String, String, u64), String> {
         let mut tokens_snapshot: Vec<ProxyToken> =
             self.tokens.iter().map(|e| e.value().clone()).collect();
-        tokens_snapshot.retain(|token| !excluded_accounts.contains(&token.account_id));
+        tokens_snapshot.retain(|token| {
+            !excluded_accounts.contains(&token.account_id)
+                && is_model_account_eligible(token, target_model)
+        });
         let mut total = tokens_snapshot.len();
         if total == 0 {
             return Err("Token pool is empty".to_string());
@@ -4257,6 +4287,118 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn opus_5_5_eligibility_tiers_and_model_prefix() {
+        for (tier, paid, eligible) in [
+            ("ULTRA", false, true),
+            ("PRO", true, true),
+            ("PRO", false, false),
+            ("FREE", true, false),
+            ("", true, false),
+        ] {
+            assert_eq!(is_opus_5_5_eligible(tier, paid), eligible);
+            let mut token = create_test_token("test", Some(tier), 1.0, None, Some(100));
+            token.is_paid_subscription = paid;
+            for model in ["claude-opus-5-5", "claude-opus-5-5-20261001"] {
+                assert_eq!(is_model_account_eligible(&token, model), eligible);
+            }
+            assert!(is_model_account_eligible(&token, "claude-opus-4-6"));
+            assert!(is_model_account_eligible(&token, "gemini-3.1-pro"));
+        }
+    }
+
+    #[tokio::test]
+    async fn opus_5_5_eligibility_filters_preferred_and_failed_accounts_after_reload() {
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let data_dir = crate::modules::account::get_data_dir().unwrap();
+        let accounts = data_dir.join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        for (id, tier, paid) in [
+            ("ultra", "ULTRA", None),
+            ("paid", "PRO", Some(true)),
+            ("trial", "PRO", Some(false)),
+            ("legacy", "PRO", None),
+            ("free", "FREE", Some(true)),
+        ] {
+            let mut account = weekly_quota_account(now);
+            account["id"] = serde_json::json!(id);
+            account["email"] = serde_json::json!(format!("{id}@example.test"));
+            account["quota"]["subscription_tier"] = serde_json::json!(tier);
+            if let Some(paid) = paid {
+                account["quota"]["is_paid_subscription"] = serde_json::json!(paid);
+            }
+            std::fs::write(accounts.join(format!("{id}.json")), account.to_string()).unwrap();
+        }
+        let manager = TokenManager::new(data_dir);
+        manager.load_accounts().await.unwrap();
+        assert!(
+            !manager
+                .get_token_by_id("legacy")
+                .unwrap()
+                .is_paid_subscription
+        );
+        assert!(
+            manager
+                .get_token_by_id("paid")
+                .unwrap()
+                .is_paid_subscription
+        );
+        manager
+            .set_preferred_account(Some("legacy".to_string()))
+            .await;
+        manager
+            .session_accounts
+            .insert("session".to_string(), "trial".to_string());
+        let mut excluded = HashSet::new();
+        for expected in ["ultra", "paid"] {
+            let (_, _, _, selected, _) = manager
+                .get_token_filtered(
+                    "claude",
+                    false,
+                    Some("session"),
+                    "claude-opus-5-5-20261001",
+                    &excluded,
+                )
+                .await
+                .unwrap();
+            assert_eq!(selected, expected);
+            assert!(excluded.insert(selected));
+        }
+        assert!(manager
+            .get_token_filtered(
+                "claude",
+                false,
+                Some("session"),
+                "claude-opus-5-5",
+                &excluded,
+            )
+            .await
+            .is_err());
+        let (_, _, _, selected, _) = manager
+            .get_token_filtered("claude", false, None, "claude-sonnet-4-6", &excluded)
+            .await
+            .unwrap();
+        assert_eq!(selected, "legacy");
+        let mut paid_account: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(accounts.join("paid.json")).unwrap())
+                .unwrap();
+        paid_account["quota"]["is_paid_subscription"] = serde_json::json!(false);
+        std::fs::write(accounts.join("paid.json"), paid_account.to_string()).unwrap();
+        manager.reload_account("paid").await.unwrap();
+        assert!(
+            !manager
+                .get_token_by_id("paid")
+                .unwrap()
+                .is_paid_subscription
+        );
+        excluded.remove("paid");
+        assert!(manager
+            .get_token_filtered("claude", false, None, "claude-opus-5-5", &excluded,)
+            .await
+            .is_err());
+    }
+
+    #[test]
     fn model_catalog_uses_every_fresh_snapshot() {
         let selected = select_catalog_snapshots(vec![(100, "a"), (101, "b")], 101);
         assert_eq!(selected, vec!["a", "b"]);
@@ -5296,6 +5438,7 @@ mod tests {
             account_path: PathBuf::from("/tmp/test"),
             project_id: None,
             subscription_tier: tier.map(|s| s.to_string()),
+            is_paid_subscription: false,
             remaining_quota,
             protected_models: HashSet::new(),
             health_score,
@@ -5688,6 +5831,7 @@ mod tests {
             account_path: PathBuf::from("/tmp/test"),
             project_id: None,
             subscription_tier: Some("PRO".to_string()),
+            is_paid_subscription: false,
             remaining_quota,
             protected_models,
             health_score: 1.0,

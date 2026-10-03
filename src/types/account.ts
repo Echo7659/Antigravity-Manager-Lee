@@ -48,6 +48,7 @@ export interface QuotaData {
     is_forbidden?: boolean;
     forbidden_reason?: string;
     subscription_tier?: string;  // 订阅类型: FREE/PRO/ULTRA
+    is_paid_subscription?: boolean; // loadCodeAssist 付费证据；缺省表示未知
     model_forwarding_rules?: Record<string, string>; // 废弃模型转发表
     quota_groups?: QuotaGroup[]; // 按模型组的配额摘要 (weekly + 5h 双窗口)
 }
