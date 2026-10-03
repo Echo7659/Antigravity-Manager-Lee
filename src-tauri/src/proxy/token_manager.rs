@@ -3728,19 +3728,13 @@ impl TokenManager {
         self.session_accounts.remove(session_id);
     }
 
-    /// 比较并删除：只有映射里仍然是这个账号才清掉当前会话。
+    /// 原子比较并删除会话绑定，保留已由其他请求更新的账号。
     pub fn abandon_session(&self, session_id: &str, account_id: &str) -> bool {
-        let still_bound = self
-            .session_accounts
-            .get(session_id)
-            .map(|bound| bound.as_str() == account_id)
-            .unwrap_or(false);
-        if still_bound {
-            self.session_accounts.remove(session_id);
-            true
-        } else {
-            false
-        }
+        #[cfg(test)]
+        tests::run_session_remove_hook();
+        self.session_accounts
+            .remove_if(session_id, |_, bound| bound.as_str() == account_id)
+            .is_some()
     }
 
     /// 上游成功后写下真正用过的账号。轮换成功的新账号也从这里进入粘性表。
@@ -4297,6 +4291,50 @@ mod tests {
     use super::*;
     use std::cmp::Ordering;
     use std::time::Duration;
+
+    // 测试在删除操作前插入成功请求的提交，固定竞态交错顺序。
+    thread_local! {
+        static SESSION_REMOVE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn run_session_remove_hook() {
+        let hook = SESSION_REMOVE_HOOK.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[test]
+    fn abandon_session_preserves_replacement_at_removal_boundary() {
+        let manager = std::sync::Arc::new(TokenManager::new(PathBuf::new()));
+        manager.commit_session("session", "account-a");
+        let replacement = manager.clone();
+        SESSION_REMOVE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                replacement.commit_session("session", "account-b");
+            }));
+        });
+
+        assert!(!manager.abandon_session("session", "account-a"));
+        assert_eq!(
+            manager.session_accounts.get("session").unwrap().as_str(),
+            "account-b"
+        );
+    }
+
+    #[test]
+    fn abandon_session_removes_only_expected_current_account() {
+        let manager = TokenManager::new(PathBuf::new());
+        manager.commit_session("session", "account-a");
+        assert!(!manager.abandon_session("session", "account-b"));
+        assert_eq!(
+            manager.session_accounts.get("session").unwrap().as_str(),
+            "account-a"
+        );
+        assert!(manager.abandon_session("session", "account-a"));
+        assert!(!manager.session_accounts.contains_key("session"));
+        assert!(!manager.abandon_session("session", "account-a"));
+    }
 
     #[test]
     fn opus_5_5_eligibility_tiers_and_model_prefix() {
