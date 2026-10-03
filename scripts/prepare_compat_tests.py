@@ -23,7 +23,8 @@ streaming = (source / 'mappers/openai/streaming.rs').read_text()
 response = (source / 'mappers/openai/response.rs').read_text()
 assert 'pub fn create_legacy_sse_stream' in streaming
 assert '#[cfg(test)]' in response
-(destination / 'streaming_excerpt.rs').write_text(streaming.split('pub fn create_legacy_sse_stream', 1)[0])
+stream_helpers = streaming[streaming.index('fn report_sse_json_parse('):streaming.index('fn inject_seq(')]
+(destination / 'streaming_excerpt.rs').write_text(streaming.split('pub fn create_legacy_sse_stream', 1)[0] + stream_helpers)
 (destination / 'response_excerpt.rs').write_text(response.split('#[cfg(test)]', 1)[0])
 
 
@@ -38,13 +39,21 @@ common = common.replace('use crate::proxy::server::AppState;\n', '')
 
 
 utils = (source / 'mappers/common_utils.rs').read_text()
-start = utils.index('pub fn safe_truncate_chars(')
-end = utils.index('\n}', start) + 2
+start = utils.index('pub fn safe_truncate_str(')
+end = utils.index('\n}', utils.index('pub fn safe_truncate_chars(')) + 2
 (destination / 'common_utils_excerpt.rs').write_text(utils[start:end])
+
+client = (source / 'upstream/client.rs').read_text()
+start = client.index('pub fn sanitize_error_for_log(')
+end = client.index('\n}', start) + 2
+(destination / 'client_excerpt.rs').write_text(client[start:end])
 
 
 def module(path):
-    return json.dumps(str(path))
+    return json.dumps(str(path), ensure_ascii=False)
+
+
+assert module(pathlib.Path('中文.rs')) == '"中文.rs"'
 
 
 # 缓存与音频桩仅隔离未参与这些测试的应用依赖，协议转换代码保持原样。
@@ -101,13 +110,14 @@ pub mod proxy {{
     #[path = {module(source / 'middleware/response_deadline.rs')}] pub mod response_deadline;
 
     pub mod upstream {{
+        #[path = {module(destination / 'client_excerpt.rs')}] pub mod client;
         #[path = {module(source / 'upstream/retry.rs')}] pub mod retry;
         #[path = {module(source / 'upstream/header_timeout.rs')}] pub mod header_timeout;
     }}
     pub struct SignatureCache;
     impl SignatureCache {{
         pub fn global() -> &'static Self {{ &Self }}
-        pub fn cache_tool_signature(&self, _: &str, _: String) {{}}
+        pub fn cache_tool_signature(&self, _: &str, _: &str, _: String) {{}}
         pub fn cache_session_signature(&self, _: &str, _: String, _: usize) {{}}
     }}
     pub mod audio {{ pub fn normalize_audio_mime(value: &str) -> String {{ value.to_string() }} }}

@@ -3,5 +3,4 @@
 
 pub mod client;
 pub mod header_timeout;
-pub mod models;
 pub mod retry;

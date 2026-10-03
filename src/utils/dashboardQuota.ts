@@ -30,6 +30,8 @@ export function computeQuotaMetrics(accounts: Account[], category: DashboardQuot
         avgWeekly: average(values.map(value => value.weeklyPercentage)),
         averageEffective: average(values.map(value => value.effectivePercentage)),
         zeroWeeklyCount: values.filter(value => value.weeklyPercentage === 0).length,
+        cappedCount: values.filter(value => value.fiveHourPercentage !== null && value.weeklyPercentage !== null && value.weeklyPercentage < value.fiveHourPercentage).length,
+        coolingCount: values.filter(value => value.fiveHourPercentage === 0 && value.weeklyPercentage !== null && value.weeklyPercentage > 0).length,
     };
 }
 

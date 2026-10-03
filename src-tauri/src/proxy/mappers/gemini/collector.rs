@@ -48,9 +48,15 @@ where
 
     loop {
         match stream.next().await {
-            Some(chunk) => {
-                buffer.extend_from_slice(&chunk.map_err(|e| format!("Stream error: {}", e))?)
-            }
+            Some(chunk) => buffer.extend_from_slice(&chunk.map_err(|e| {
+                crate::proxy::mappers::error_classifier::report_stream_error(
+                    "gemini-collector",
+                    "collect_stream_to_json_with_anchor",
+                    &e,
+                    format!("session={}", session_id),
+                )
+                .client_message()
+            })?),
             None if !buffer.is_empty() => buffer.extend_from_slice(b"\n"),
             None => break,
         }

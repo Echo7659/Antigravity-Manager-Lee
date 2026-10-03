@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { getModelQuotaDisplay } from '../../src/utils/quotaDisplay';
+import { getModelConstrainedQuota, getModelQuotaDisplay } from '../../src/utils/quotaDisplay';
 import { computeQuotaMetrics, recommendAccount } from '../../src/utils/dashboardQuota';
 import type { Account, QuotaGroup } from '../../src/types/account';
 
@@ -22,6 +22,10 @@ assert.equal(shortDisplay.effectivePercentage, 15);
 assert.equal(shortDisplay.resetTime, '2030-01-01T00:00:00Z');
 assert.equal(display.resetTime, '2030-01-07T00:00:00Z');
 assert.equal(target.quota!.models[0].percentage, 15);
+for (const [view, expected] of [['weighted', 15], ['5h', 92], ['weekly', 15]] as const) {
+    assert.equal(getModelConstrainedQuota(target.quota!.models[0].name, target.quota!.models[0], target.quota!.quota_groups, view).effectivePercentage, expected);
+    assert.equal(getModelConstrainedQuota('gemini-test', undefined, [], view).effectivePercentage, null);
+}
 const metrics = computeQuotaMetrics([target, account('fresh', 1, .55), { id: 'unknown' } as Account], 'gemini');
 assert.equal(metrics.avg5h, 96);
 assert.equal(metrics.avgWeekly, 35);

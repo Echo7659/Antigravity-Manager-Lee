@@ -19,6 +19,7 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'warm_up_all_accounts': { url: '/api/accounts/warmup', method: 'POST' },
   'warm_up_account': { url: '/api/accounts/:accountId/warmup', method: 'POST' },
   'update_account_label': { url: '/api/accounts/:accountId/label', method: 'POST' },
+  'update_account_priority': { url: '/api/accounts/:accountId/priority', method: 'POST' },
   'export_accounts': { url: '/api/accounts/export', method: 'POST' },
   'bind_device_profile': { url: '/api/accounts/:accountId/bind-device', method: 'POST' },
   'get_device_profiles': { url: '/api/accounts/:accountId/device-profiles', method: 'GET' },
@@ -42,7 +43,6 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'check_proxy_health': { url: '/api/proxy/health-check/trigger', method: 'POST' },
   'get_preferred_account': { url: '/api/proxy/preferred-account', method: 'GET' },
   'set_preferred_account': { url: '/api/proxy/preferred-account', method: 'POST' },
-  'fetch_zai_models': { url: '/api/zai/models/fetch', method: 'POST' },
   'load_config': { url: '/api/config', method: 'GET' },
   'get_config': { url: '/api/config', method: 'GET' },
   'save_config': { url: '/api/config', method: 'POST' },
@@ -112,6 +112,8 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
 
   // System
   'get_data_dir_path': { url: '/api/system/data-dir', method: 'GET' },
+  'get_internal_error_log_path': { url: '/api/system/error-log-path', method: 'GET' },
+  'get_internal_error_log_disk_size': { url: '/api/system/error-log-size', method: 'GET' },
   'set_data_dir': { url: '/api/system/data-dir', method: 'POST' },
   'get_update_settings': { url: '/api/system/updates/settings', method: 'GET' },
   'save_update_settings': { url: '/api/system/updates/save', method: 'POST' },

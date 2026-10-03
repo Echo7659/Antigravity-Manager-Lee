@@ -322,23 +322,25 @@ fn reorder_gemini_parts(parts: &mut Vec<Value>) {
     }
 
     let mut thinking_parts = Vec::new();
-    let mut text_parts = Vec::new();
-    let mut tool_parts = Vec::new();
-    let mut other_parts = Vec::new();
+    // 非思考部件**保持原有相对顺序**。
+    //
+    // 历史实现按 `[text] → [other] → [tool]` 重排，把 `functionCall` 挤到最后：
+    // 同一段对话经 Claude 入口与经 OpenAI / Gemini 入口会产出不同的 `contents`
+    // （前缀缓存哈希必然不命中），且在 text / tool 混排轮上移动签名锚点。
+    // parts 顺序即锚点语义，除「思考块置于首位」外不得改写。
+    let mut rest_parts = Vec::new();
 
     for part in parts.drain(..) {
         if part.get("thought").and_then(|t| t.as_bool()) == Some(true) {
             thinking_parts.push(part);
-        } else if part.get("functionCall").is_some() {
-            tool_parts.push(part);
         } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
             let t = text.trim();
             // Filter empty / dummy text parts that might have been created during merging or from client dot echo
             if !t.is_empty() && t != "(no content)" && t != "·" {
-                text_parts.push(part);
+                rest_parts.push(part);
             }
         } else {
-            other_parts.push(part);
+            rest_parts.push(part);
         }
     }
 
@@ -365,9 +367,7 @@ fn reorder_gemini_parts(parts: &mut Vec<Value>) {
         parts.push(t);
     }
 
-    parts.extend(text_parts);
-    parts.extend(other_parts);
-    parts.extend(tool_parts);
+    parts.extend(rest_parts);
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -384,7 +384,7 @@ pub fn transform_claude_request_in(
     token: Option<&crate::proxy::token_manager::ProxyToken>,
 ) -> Result<Value, String> {
     transform_claude_request_in_timed(
-        claude_req, project_id, is_retry, account_id, session_id, token,
+        claude_req, project_id, is_retry, account_id, session_id, session_id, token,
     )
     .map(|(body, _)| body)
 }
@@ -394,7 +394,8 @@ pub fn transform_claude_request_in_timed(
     project_id: &str,
     is_retry: bool,
     account_id: Option<&str>,
-    _session_id: &str,
+    thinking_session_id: &str,
+    _upstream_session_id: &str,
     token: Option<&crate::proxy::token_manager::ProxyToken>, // [NEW] 支持动态规格
 ) -> Result<(Value, TransformTiming), String> {
     let mut timing = TransformTiming::default();
@@ -461,8 +462,8 @@ pub fn transform_claude_request_in_timed(
     }
     cleaned_req.messages = filtered_messages;
 
-    // [FIX #813] 合并连续的同角色消息 (Consecutive User Messages)
-    // 确保请求符合 Anthropic 和 Gemini 的角色交替协议
+    // [FIX #813] Anthropic / z.ai 要求角色交替。这里只做源协议的相邻同角色归一。
+    // 转成 Gemini contents 之后，相邻 user / model / functionResponse 的合并由进站流水线负责。
     merge_consecutive_messages(&mut cleaned_req.messages);
 
     clean_cache_control_from_messages(&mut cleaned_req.messages);
@@ -491,9 +492,9 @@ pub fn transform_claude_request_in_timed(
 
     let claude_req = &cleaned_req; // 后续使用清理后的请求
 
-    // Prefer the handler-resolved session id (tenant + X-Session-Id) when provided.
-    let session_id = if !_session_id.is_empty() {
-        _session_id.to_string()
+    // 思维库和上游 sessionId 都用带锚点的 store key。账号粘性不经过这里。
+    let session_id = if !thinking_session_id.is_empty() {
+        thinking_session_id.to_string()
     } else {
         SessionManager::extract_session_id(claude_req)
     };
@@ -612,7 +613,7 @@ pub fn transform_claude_request_in_timed(
 
     // Check signature requirements for function calls
     if is_thinking_enabled {
-        let global_sig = get_thought_signature();
+        let _global_sig = get_thought_signature();
 
         // Check if there are function calls in the request
         let has_function_calls = claude_req.messages.iter().any(|m| {
@@ -625,17 +626,10 @@ pub fn transform_claude_request_in_timed(
             }
         });
 
-        if has_function_calls
-            && !has_valid_signature_for_function_calls(
-                &claude_req.messages,
-                &global_sig,
-                &session_id,
-            )
-        {
+        if has_function_calls {
             // [FIX #2167] Rely on ThinkingStore / sentinel injection rather than disabling thinking
             tracing::info!(
-                "[Thinking-Mode] Function calls present without explicit client signature. \
-                 Relying on ThinkingStore restoration and sentinel injection."
+                "[Thinking-Mode] Function calls present. Relying on InboundThinkingPipeline restoration and sentinel injection."
             );
         }
     }
@@ -685,19 +679,16 @@ pub fn transform_claude_request_in_timed(
 
     if let Some(tools_val) = tools {
         inner_request["tools"] = tools_val;
-        // 显式设置工具配置模式为 VALIDATED 并开启 includeServerSideToolInvocations (同时支持 camelCase 与 snake_case 以对齐 Google v1internal 接口)
-        inner_request["toolConfig"] = json!({
-            "functionCallingConfig": {
-                "mode": "VALIDATED"
-            },
-            "includeServerSideToolInvocations": true
-        });
-        inner_request["tool_config"] = json!({
-            "function_calling_config": {
-                "mode": "VALIDATED"
-            },
-            "include_server_side_tool_invocations": true
-        });
+    }
+
+    // [tool_choice] 客户端有就传，没有就不传：
+    // 若客户端显式指定了 tool_choice，将其规范化映射为标准的 Gemini toolConfig
+    if let Some(tool_choice) = &claude_req.tool_choice {
+        if let Some(gemini_tc) =
+            crate::proxy::mappers::common_utils::map_claude_tool_choice_to_gemini(tool_choice)
+        {
+            inner_request["toolConfig"] = gemini_tc;
+        }
     }
 
     // [PIPELINE] 统一清洗提示词与风控伪 Header（含 [undefined] 深度清理，见 PromptSanitizer）
@@ -749,25 +740,28 @@ pub fn transform_claude_request_in_timed(
     // [ADDED v4.1.24] 注入稳定 sessionId 对齐官方规范
     // [FIX session-1M] 混入对话指纹与代数,不同对话隔离服务端会话,1M 累计报错后 bump 自愈
     if let Some(account_id) = account_id {
-        let generation = crate::proxy::common::session::current_bump(account_id, &session_id);
-        inner_request["sessionId"] = json!(crate::proxy::common::session::derive_session_scoped(
+        crate::proxy::common::session::apply_upstream_session(
+            &mut inner_request,
             account_id,
             &session_id,
-            generation
-        ));
+        );
     }
 
-    // 生成 requestId
-    // [CHANGED v4.1.24] Structured requestId to match official format
-    let request_id = format!(
-        "agent/antigravity/{}/{}",
-        &session_id[..session_id.len().min(8)],
-        message_count
-    );
+    // 生成 requestId —— 官方 5 段形态，三适配器共用。
+    // 必须含 unixMs：历史实现为 `agent/antigravity/{session[:8]}/{count}`，**不含时间戳**，
+    // 同一会话同一轮次重试会拿到完全相同的 ID，从而 pin 到上一次的 429 / 旧缓存。
+    let request_id =
+        super::super::common_utils::build_official_request_id(&session_id, message_count as u64);
+
+    // 官方客户端指纹（企业 / GCP 账号为 jetski）—— 三适配器共用，避免指纹漂移
+    let (official_user_agent, _official_ide_type) =
+        super::super::common_utils::resolve_official_fingerprint(token);
 
     // [CACHE] 统一委托进站流水线进行前缀拓扑规范化与对齐（Pipeline First 核心归一）
-    crate::proxy::pipeline::InboundThinkingPipeline::align_google_request_prefix_topology(
+    crate::proxy::pipeline::InboundThinkingPipeline::align_google_request_prefix_topology_with_model(
         &mut inner_request,
+        &config.final_model,
+        Some(&request_id),
     );
     let reordered_inner = inner_request;
 
@@ -784,23 +778,22 @@ pub fn transform_claude_request_in_timed(
     let is_agent_request =
         config.request_type != "image_gen" && (has_tools || has_tool_interactions);
 
-    // 构建最终请求体 (顶层键序稳定: project -> request -> model -> userAgent -> requestId)
+    // 构建最终请求体 (顶层键序对齐官方: project -> requestId -> request -> model -> userAgent -> requestType)
     let mut body = json!({
         "project": project_id,
+        "requestId": request_id,
         "request": reordered_inner,
         "model": config.final_model,
-        "userAgent": "antigravity",
-        "requestId": request_id,
+        "userAgent": official_user_agent,
     });
 
     if config.request_type == "image_gen" {
         body["requestType"] = json!("image_gen");
     } else if is_agent_request {
         body["requestType"] = json!("agent");
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("enabledCreditTypes".to_string(), json!(["GOOGLE_ONE_AI"]));
-        }
     }
+
+    crate::proxy::pipeline::InboundThinkingPipeline::align_official_envelope(&mut body);
 
     // [FIX #593] 最后一道防线: 递归深度清理所有 cache_control 字段
     // 确保发送给 Antigravity 的请求中不包含任何 cache_control
@@ -881,90 +874,11 @@ fn model_supports_thinking(mapped_model: &str) -> bool {
     mapped_model.contains("-thinking") || mapped_model.starts_with("claude-")
 }
 
-/// Whether a model should keep thinking enabled (and rely on the
-/// `skip_thought_signature_validator` sentinel injected by `build_contents`)
-/// when no valid signature is available, instead of disabling thinking.
-///
-/// `gemini-pro-agent` is a forced-thinking model: disabling thinking leaves
-/// historical `functionCall` parts without `thought_signature`, which Gemini
-/// rejects with HTTP 400.
-fn model_is_gemini_flash_family(mapped_model: &str) -> bool {
-    crate::proxy::model_specs::is_gemini_v3_or_above(mapped_model)
-        && (mapped_model.contains("flash") || mapped_model.contains("-flash-"))
-}
-
-fn model_keeps_thinking_without_signature(mapped_model: &str) -> bool {
-    model_is_gemini_flash_family(mapped_model) || mapped_model.contains("gemini-pro-agent")
-}
-
 /// Minimum length for a valid thought_signature
-const MIN_SIGNATURE_LENGTH: usize = 50;
+const MIN_SIGNATURE_LENGTH: usize = 32;
 
 /// Sentinel signature for models that support skipping signature validation
 const SENTINEL_SIGNATURE: &str = "skip_thought_signature_validator";
-
-/// [FIX #295] Check if we have any valid signature available for function calls
-/// This prevents Gemini 3 Pro from rejecting requests due to missing thought_signature
-///
-/// [NEW FIX] Now also checks Session Cache to support retry scenarios
-fn has_valid_signature_for_function_calls(
-    messages: &[Message],
-    global_sig: &Option<String>,
-    session_id: &str, // NEW: Add session_id parameter
-) -> bool {
-    // 1. Check global store (deprecated but kept for compatibility)
-    if let Some(sig) = global_sig {
-        if sig.len() >= MIN_SIGNATURE_LENGTH {
-            tracing::debug!(
-                "[Signature-Check] Found valid signature in global store (len: {})",
-                sig.len()
-            );
-            return true;
-        }
-    }
-
-    // 2. [NEW] Check Session Cache - this is critical for retry scenarios
-    // When retrying, the signature may not be in messages but exists in Session Cache
-    if let Some(sig) = crate::proxy::SignatureCache::global().get_session_signature(session_id) {
-        if sig.len() >= MIN_SIGNATURE_LENGTH {
-            tracing::info!(
-                "[Signature-Check] Found valid signature in SESSION cache (session: {}, len: {})",
-                session_id,
-                sig.len()
-            );
-            return true;
-        }
-    }
-
-    // 3. Check if any message has a thinking block with valid signature
-    for msg in messages.iter().rev() {
-        if msg.role == "assistant" {
-            if let MessageContent::Array(blocks) = &msg.content {
-                for block in blocks {
-                    if let ContentBlock::Thinking {
-                        signature: Some(sig),
-                        ..
-                    } = block
-                    {
-                        if sig.len() >= MIN_SIGNATURE_LENGTH {
-                            tracing::debug!(
-                                "[Signature-Check] Found valid signature in message history (len: {})",
-                                sig.len()
-                            );
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    tracing::warn!(
-        "[Signature-Check] No valid signature found (session: {}, checked: global store, session cache, message history)",
-        session_id
-    );
-    false
-}
 
 fn clean_system_prompt_text(text: &str) -> String {
     crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::strip_pipeline_markers(text)
@@ -1052,9 +966,9 @@ fn build_contents(
     is_assistant: bool,
     _claude_req: &ClaudeRequest,
     is_thinking_enabled: bool,
-    session_id: &str,
-    msg_index: usize,
-    allow_dummy_thought: bool,
+    _session_id: &str,
+    _msg_index: usize,
+    _allow_dummy_thought: bool,
     is_retry: bool,
     tool_id_to_name: &mut HashMap<String, String>,
     tool_name_to_schema: &HashMap<String, Value>,
@@ -1086,7 +1000,7 @@ fn build_contents(
                             break;
                         }
                     }
-                    ContentBlock::ToolUse { id, signature, .. } => {
+                    ContentBlock::ToolUse { signature, .. } => {
                         if let Some(s) = signature {
                             if (s == SENTINEL_SIGNATURE || s.len() >= MIN_SIGNATURE_LENGTH)
                                 && (!mapped_model.to_lowercase().contains("gemini")
@@ -1096,31 +1010,8 @@ fn build_contents(
                                 break;
                             }
                         }
-                        if let Some(s) =
-                            crate::proxy::SignatureCache::global().get_tool_signature(id)
-                        {
-                            if !mapped_model.to_lowercase().contains("gemini")
-                                || crate::proxy::thinking_store::is_likely_gemini_signature(&s)
-                            {
-                                turn_signature = Some(s);
-                                break;
-                            }
-                        }
                     }
                     _ => {}
-                }
-            }
-        }
-
-        // If not found from blocks or tool cache, try session cache at msg_index
-        if turn_signature.is_none() {
-            if let Some(s) = crate::proxy::SignatureCache::global()
-                .get_session_signature_at(session_id, msg_index)
-            {
-                if !mapped_model.to_lowercase().contains("gemini")
-                    || crate::proxy::thinking_store::is_likely_gemini_signature(&s)
-                {
-                    turn_signature = Some(s);
                 }
             }
         }
@@ -1144,10 +1035,27 @@ fn build_contents(
             }
         }
         MessageContent::Array(blocks) => {
+            let mut turn_tool_media_parts = Vec::new();
             for item in blocks {
                 match item {
                     ContentBlock::Text { text } => {
                         if text != "(no content)" && !text.trim().is_empty() {
+                            // [2026-09-27] 如果 assistant 消息同时包含 tool_use，且该文本仅为占位符（如 "..."、"·" 等），
+                            // 丢弃无实质意义的占位文本，避免在 Gemini 格式转换中被误选为签名锚点，
+                            // 导致上游 400 'Function call is missing a thought_signature in functionCall parts'
+                            if is_assistant
+                                && crate::proxy::thinking_store::is_placeholder_thought(text)
+                                && blocks
+                                    .iter()
+                                    .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                            {
+                                tracing::debug!(
+                                    "[Claude-Request] Dropping placeholder text accompanying tool_use (text={:?})",
+                                    text
+                                );
+                                continue;
+                            }
+
                             // [NEW] 任务去重逻辑: 如果当前是 User 消息，且紧跟在 ToolResult 之后，
                             // 检查该文本是否与上一轮任务描述完全一致。
                             if !is_assistant && *previous_was_tool_result {
@@ -1188,25 +1096,21 @@ fn build_contents(
                             signature
                         );
 
-                        // [FIX] Empty thinking blocks cause "Field required" errors.
-                        // We downgrade them to Text to avoid structural errors and signature mismatch.
-                        if thinking.is_empty() {
-                            tracing::warn!("[Claude-Request] Empty thinking block detected. Downgrading to Text.");
-                            parts.push(json!({
-                                "text": "..."
-                            }));
-                            saw_non_thinking = true;
-                            continue;
-                        }
-
-                        // Normalize placeholder thoughts (e.g. Claude Code "·", ".", "···") to "..."
+                        // [2026-09-27] 占位/空思考块直接丢弃（不写思考块、不降级为文本）。
+                        // 官方样本（baogao.txt）9/24 轮是「无思考块 + 锚点带签名」，
+                        // 空 / "." / "..." / 空格 / "·" 等占位思考无信息量；签名归位
+                        // 由流水线终审 place_turn_signature 按锚点规则处理（ inbound 已
+                        // 把占位块的签名转移给首个非思考 part）。
                         let is_placeholder =
                             crate::proxy::thinking_store::is_placeholder_thought(thinking);
-                        let final_thought_text = if is_placeholder && signature.is_none() {
-                            "..."
-                        } else {
-                            thinking.as_str()
-                        };
+                        if is_placeholder || thinking.trim().is_empty() {
+                            tracing::debug!(
+                                "[Claude-Request] Placeholder thinking block dropped (text={:?}).",
+                                &thinking[..thinking.len().min(20)],
+                            );
+                            continue;
+                        }
+                        let final_thought_text = thinking.as_str();
 
                         // [HOTFIX] Gemini Protocol Enforcement: Thinking block MUST be the first block.
                         // If we already have content (like Text), we must downgrade this thinking block to Text.
@@ -1234,12 +1138,7 @@ fn build_contents(
                             continue;
                         }
 
-                        let is_google_cloud = mapped_model.starts_with("projects/");
                         let is_claude_model = mapped_model.to_lowercase().contains("claude");
-                        let can_use_sentinel = !is_google_cloud
-                            && !is_claude_model
-                            && (is_thinking_enabled
-                                || model_keeps_thinking_without_signature(mapped_model));
 
                         let mut effective_sig = None;
 
@@ -1292,15 +1191,11 @@ fn build_contents(
                             effective_sig = turn_signature.clone();
                         }
 
-                        // 3. Fallback to sentinel signature for Gemini models that support it
-                        if effective_sig.is_none() && can_use_sentinel {
-                            tracing::info!(
-                                "[Thinking-Signature] No valid signature available for thinking block (model: {}). Using sentinel signature.",
-                                mapped_model
-                            );
-                            effective_sig = Some(SENTINEL_SIGNATURE.to_string());
-                        }
-
+                        // 3. 无合法签名时**绝不发明哨兵**。
+                        //    依据（3 份官方报文 / 23 处签名）：哨兵在官方流量里出现 0/23 次，
+                        //    它不属于 Antigravity 协议；且「跳过校验」不等于恢复推理连续性。
+                        //    签名缺失是被上游容忍的（官方"在飞轮"即缺席），
+                        //    归位统一交给流水线终审 `place_turn_signature`。
                         if let Some(sig) = effective_sig {
                             *last_thought_signature = Some(sig.clone());
                             let part = json!({
@@ -1310,13 +1205,17 @@ fn build_contents(
                             });
                             parts.push(part);
                         } else {
-                            // Downgrade to text only if signature is missing and target refuses sentinel
-                            tracing::warn!(
-                                "[Thinking-Signature] No signature available and sentinel not allowed for model {}. Downgrading to text.",
+                            // 无签名：保留思考块结构（`thought: true`），但**不携带签名字段**。
+                            // Gemini 目标的思考块本就不应带签名（铁律 I4：
+                            // 官方报文里 `thought:true` 的 part 没有 thoughtSignature）。
+                            tracing::debug!(
+                                "[Thinking-Signature] No signature for thought block (model: {}). Keeping thought block without signature.",
                                 mapped_model
                             );
-                            parts.push(json!({"text": final_thought_text}));
-                            saw_non_thinking = true;
+                            parts.push(json!({
+                                "text": final_thought_text,
+                                "thought": true,
+                            }));
                         }
                     }
                     ContentBlock::RedactedThinking { data } => {
@@ -1388,31 +1287,14 @@ fn build_contents(
                         let final_sig = signature
                             .as_ref()
                             .filter(|s| {
-                                (s.as_str() == SENTINEL_SIGNATURE || s.len() >= MIN_SIGNATURE_LENGTH)
+                                (s.as_str() == SENTINEL_SIGNATURE
+                                    || s.len() >= MIN_SIGNATURE_LENGTH)
                                     && (!mapped_model.to_lowercase().contains("gemini")
-                                        || crate::proxy::thinking_store::is_likely_gemini_signature(s))
+                                        || crate::proxy::thinking_store::is_likely_gemini_signature(
+                                            s,
+                                        ))
                             })
-                            .cloned()
-                            .or_else(|| {
-                                crate::proxy::SignatureCache::global()
-                                    .get_tool_signature(id)
-                                    .filter(|s| {
-                                        !mapped_model.to_lowercase().contains("gemini")
-                                            || crate::proxy::thinking_store::is_likely_gemini_signature(s)
-                                    })
-                            })
-                            .or_else(|| {
-                                last_thought_signature.as_ref().filter(|s| {
-                                    !mapped_model.to_lowercase().contains("gemini")
-                                        || crate::proxy::thinking_store::is_likely_gemini_signature(s)
-                                }).cloned()
-                            })
-                            .or_else(|| {
-                                turn_signature.as_ref().filter(|s| {
-                                    !mapped_model.to_lowercase().contains("gemini")
-                                        || crate::proxy::thinking_store::is_likely_gemini_signature(s)
-                                }).cloned()
-                            });
+                            .cloned();
 
                         if let Some(ref s) = final_sig {
                             *last_thought_signature = Some(s.clone());
@@ -1426,17 +1308,9 @@ fn build_contents(
                                 obj.remove("thought_signature");
                             }
                         } else {
-                            // Gemini 原生模型：首个工具调用挂载真实签名 (若有)，后续并行工具调用统一打上 32 字节哨兵占位
-                            let has_preceding_fc =
-                                parts.iter().any(|p| p.get("functionCall").is_some());
-                            if !has_preceding_fc {
-                                if let Some(sig) = final_sig {
-                                    part["thoughtSignature"] = json!(sig);
-                                } else {
-                                    part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
-                                }
-                            } else {
-                                part["thoughtSignature"] = json!(SENTINEL_SIGNATURE);
+                            // 纯净线缆透传：客户端若自带签名则保持，未带则留空，全权委托进站流水线统一对齐与回填
+                            if let Some(ref sig) = final_sig {
+                                part["thoughtSignature"] = json!(sig);
                             }
                         }
                         parts.push(part);
@@ -1491,24 +1365,9 @@ fn build_contents(
                                 }
                                 texts.join("\n")
                             }
+                            serde_json::Value::Null => String::new(),
                             _ => content.to_string(),
                         };
-
-                        // Smart Truncation: max chars limit
-                        const MAX_TOOL_RESULT_CHARS: usize = 200_000;
-                        if merged_content.len() > MAX_TOOL_RESULT_CHARS {
-                            tracing::warn!(
-                                "Truncating tool result from {} chars to {}",
-                                merged_content.len(),
-                                MAX_TOOL_RESULT_CHARS
-                            );
-                            let mut truncated = merged_content
-                                .chars()
-                                .take(MAX_TOOL_RESULT_CHARS)
-                                .collect::<String>();
-                            truncated.push_str("\n...[truncated output]");
-                            merged_content = truncated;
-                        }
 
                         // [优化] 如果结果为空，注入显式确认信号，防止模型幻觉
                         if merged_content.trim().is_empty() {
@@ -1520,10 +1379,10 @@ fn build_contents(
                             }
                         }
 
-                        let mut part = json!({
+                        let part = json!({
                             "functionResponse": {
                                 "name": func_name,
-                                "response": {"result": merged_content},
+                                "response": {"output": merged_content},
                                 "id": tool_use_id
                             }
                         });
@@ -1531,10 +1390,8 @@ fn build_contents(
                         // 危险测试分支法则：ToolResult (functionResponse) 绝不携带签名
                         parts.push(part);
 
-                        // 追加图片 parts
-                        for extra in extra_parts {
-                            parts.push(extra);
-                        }
+                        // 暂存随行媒体 parts，确保同一轮中所有 functionResponse 置顶连续，多模态媒体统一延后追加
+                        turn_tool_media_parts.extend(extra_parts);
 
                         // 标记状态，用于下一条 User 消息的去重判断
                         *previous_was_tool_result = true;
@@ -1547,6 +1404,7 @@ fn build_contents(
                     }
                 }
             }
+            parts.extend(turn_tool_media_parts);
         }
     }
 
@@ -1567,7 +1425,7 @@ fn build_contents(
                     "functionResponse": {
                         "name": name,
                         "response": {
-                            "result": "Tool execution interrupted. No result provided."
+                            "output": "Tool execution interrupted. No result provided."
                         },
                         "id": id
                     }
@@ -1584,7 +1442,7 @@ fn build_contents(
     // [Optimization] Apply this to ALL assistant messages in history, not just the last one.
     // Vertex AI requires every assistant message to start with a thinking block when thinking is enabled.
     if is_assistant && is_thinking_enabled {
-        let is_google_cloud = mapped_model.starts_with("projects/");
+        let _is_google_cloud = mapped_model.starts_with("projects/");
         let thought_idx = parts
             .iter()
             .position(|p| p.get("thought").and_then(|v| v.as_bool()) == Some(true));
@@ -1648,7 +1506,7 @@ fn build_google_content(
                     "functionResponse": {
                         "name": name,
                         "response": {
-                            "result": "Tool execution interrupted. No result provided."
+                            "output": "Tool execution interrupted. No result provided."
                         },
                         "id": id
                     }
@@ -1782,7 +1640,6 @@ fn build_google_contents(
     let think_start = std::time::Instant::now();
     crate::proxy::pipeline::InboundThinkingPipeline::process_contents(
         &mut contents,
-        crate::proxy::pipeline::ProxyProtocol::AnthropicClaude,
         mapped_model,
         should_finalize_thinking,
         Some(session_id),
@@ -1836,9 +1693,23 @@ fn build_tools(
 ) -> Result<Option<Value>, String> {
     if let Some(tools_list) = tools {
         let mut function_declarations: Vec<Value> = Vec::new();
-        let mut has_google_search = has_web_search;
+        let has_google_search = has_web_search;
+
+        let is_search_tool = |tool: &Tool| {
+            tool.is_web_search()
+                || tool.name.as_deref() == Some("google_search")
+                || tool.name.as_deref() == Some("builtin_web_search")
+                || tool.type_.as_deref() == Some("builtin_web_search")
+        };
+        // 只有搜索工具时，改映射为上游 googleSearch，不进客户端函数列表。
+        // 旁边还有 Bash/Read 等函数工具时，web_search 与其他协议一样留在 functionDeclarations。
+        let search_only =
+            !tools_list.is_empty() && tools_list.iter().all(|tool| is_search_tool(tool));
 
         for tool in tools_list {
+            if search_only && is_search_tool(tool) {
+                continue;
+            }
             let name = tool
                 .name
                 .as_deref()
@@ -1867,12 +1738,7 @@ fn build_tools(
         let supports_mixed_tools = false;
 
         if !function_declarations.is_empty() {
-            // [CACHE] 按 function name 稳定字典序排序，确保全协议 tool schema 字节完全一致
-            function_declarations.sort_by(|a, b| {
-                let name_a = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let name_b = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                name_a.cmp(name_b)
-            });
+            // 保持客户端工具声明原序，不按 name 重排。
             let mut func_obj = serde_json::Map::new();
             func_obj.insert(
                 "functionDeclarations".to_string(),
@@ -1968,96 +1834,28 @@ fn build_generation_config(
             token,
         );
     } else if is_thinking_enabled && !crate::proxy::model_specs::is_gemini_under_v3(mapped_model) {
-        let mut thinking_config = json!({"includeThoughts": true});
-
-        let global_mode_is_adaptive = matches!(
-            tb_config.mode,
-            crate::proxy::config::ThinkingBudgetMode::Adaptive
+        crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
+            mapped_model,
+            &mut config,
+            client_switch,
+            client_effort,
+            client_budget,
+            token,
         );
-        let user_is_adaptive = claude_req
-            .thinking
-            .as_ref()
-            .map(|t| t.type_ == "adaptive")
-            .unwrap_or(false);
-        let should_use_adaptive = (user_is_adaptive || global_mode_is_adaptive)
-            && mapped_model.to_lowercase().contains("claude");
-
-        if should_use_adaptive {
-            let mapped_level = match effort.map(|e| e.to_lowercase()).as_deref() {
-                Some("low") => "LOW",
-                Some("medium") => "MEDIUM",
-                Some("high") | Some("max") | Some("xhigh") => "HIGH",
-                _ => "HIGH",
-            };
-            tracing::debug!(
-                "[Claude-Request] Mapping adaptive mode to thinkingLevel: {} for Claude model",
-                mapped_level
-            );
-            thinking_config["thinkingLevel"] = json!(mapped_level);
-            config["thinkingConfig"] = thinking_config;
-        } else {
-            // 协议无关：思考预算与 thinkingConfig 统一由进站流水线节点治理
-            crate::proxy::pipeline::InboundThinkingPipeline::configure_inbound_thinking(
-                mapped_model,
-                &mut config,
-                client_switch,
-                client_effort,
-                client_budget,
-                token,
-            );
-        }
     }
 
-    // 其他参数
     if let Some(temp) = claude_req.temperature {
         config["temperature"] = json!(temp);
     }
     if let Some(top_p) = claude_req.top_p {
         config["topP"] = json!(top_p);
-    } else {
-        config["topP"] = json!(1.0); // [CHANGED v4.1.24] Default topP=1.0 to match official client
     }
     if let Some(top_k) = claude_req.top_k {
         config["topK"] = json!(top_k);
-    } else {
-        config["topK"] = json!(40); // [ADDED v4.1.24] Default topK=40 to match official client
     }
 
-    // web_search 强制 candidateCount=1
-    /*if has_web_search {
-        config["candidateCount"] = json!(1);
-    }*/
-
-    // max_tokens 映射为 maxOutputTokens
-    // [FIX] 不再默认设置 81920，防止非思维模型 (如 claude-sonnet-4-6) 报 400 Invalid Argument
+    // max_tokens 映射为 maxOutputTokens。客户端没传时留给流水线按官方模型结构体补齐。
     let mut final_max_tokens: Option<i64> = claude_req.max_tokens.map(|t| t as i64);
-
-    // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
-    // [NEW] 确保 maxOutputTokens 大于 thinkingBudget (API 强约束)
-    let model_lower = mapped_model.to_lowercase();
-    // 重新计算 should_use_adaptive (因为上面定义的作用域仅在其 if 块内有效，或者我们可以假设在这里也需要同样的逻辑)
-    // 但为了简洁和解耦，我们这里重新从 config 读取
-    let tb_config_chk = crate::proxy::config::get_thinking_budget_config();
-    let global_adaptive = matches!(
-        tb_config_chk.mode,
-        crate::proxy::config::ThinkingBudgetMode::Adaptive
-    );
-    let req_adaptive = claude_req
-        .thinking
-        .as_ref()
-        .map(|t| t.type_ == "adaptive")
-        .unwrap_or(false);
-
-    let is_adaptive_effective = (req_adaptive || global_adaptive) && model_lower.contains("claude");
-    // [FIX] Lower default overhead to keep total under 65536
-    let final_overhead = if is_adaptive_effective { 64000 } else { 32768 };
-
-    // [FIX #2007] Opus 4.6 Thinking Alignment
-    // OpenAI logs show maxOutputTokens = 57344 (24576 + 32768)
-    if model_lower.contains("claude-opus-4-6-thinking") && is_thinking_enabled {
-        final_max_tokens = Some(57344);
-        tracing::debug!("[Opus-Alignment] Enforcing maxOutputTokens 57344 for Opus 4.6");
-    }
 
     if let Some(thinking_config) = config.get("thinkingConfig") {
         if let Some(budget) = thinking_config
@@ -2066,29 +1864,18 @@ fn build_generation_config(
         {
             let current = final_max_tokens.unwrap_or(0);
             if current <= budget as i64 {
-                // [FIX #1675] 针对图像模型使用更小的增量 (2048)
                 let overhead = if mapped_model.contains("-image") {
                     2048
                 } else {
                     8192
                 };
-                let boosted = (budget + overhead).min(65536); // [FIX] Never exceed hard limit
-                final_max_tokens = Some(boosted as i64);
+                let boosted = (budget as i64 + overhead).min(65536);
+                final_max_tokens = Some(boosted);
                 tracing::info!(
-                    "[Generation-Config] Bumping maxOutputTokens to {} due to thinking budget of {}", 
+                    "[Generation-Config] Bumping maxOutputTokens to {} due to thinking budget of {}",
                     boosted, budget
                 );
             }
-        } else if is_adaptive_effective {
-            // [FIX] Adaptive mode (no budget set in thinkingConfig), apply default maxOutputTokens
-            if final_max_tokens.is_none() {
-                final_max_tokens = Some(final_overhead as i64);
-            }
-        }
-    } else {
-        // No thinkingConfig
-        if final_max_tokens.is_none() && is_adaptive_effective {
-            final_max_tokens = Some(final_overhead as i64);
         }
     }
 
@@ -2140,7 +1927,7 @@ use crate::proxy::mappers::common_utils::is_model_compatible;
 mod tests {
     use super::*;
     use crate::proxy::common::json_schema::clean_json_schema;
-    use crate::proxy::config::{update_thinking_budget_config, ThinkingBudgetConfig};
+    use crate::proxy::config::ThinkingBudgetConfig;
 
     #[test]
     fn test_agent_sdk_identity_is_normalized_for_antigravity() {
@@ -2263,6 +2050,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -2361,6 +2149,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -2379,7 +2168,7 @@ mod tests {
         assert_eq!(func_resp["id"], "call_1");
 
         // Verify merged content
-        let resp_text = func_resp["response"]["result"].as_str().unwrap();
+        let resp_text = func_resp["response"]["output"].as_str().unwrap();
         assert!(resp_text.contains("file1.txt"));
         assert!(resp_text.contains("file2.txt"));
         assert!(resp_text.contains("\n"));
@@ -2432,6 +2221,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -2505,6 +2295,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -2523,13 +2314,13 @@ mod tests {
             "thinkingConfig must be preserved per server-side thinking persistence policy"
         );
 
-        // 验证: 历史 Assistant 消息中补齐了思考块，避免上游 400
+        // 验证: 遵循纯净线缆原则，不凭空伪造虚假思考块，同时保持 thinkingConfig 开启
         let contents = request["contents"].as_array().expect("Contents array");
         let assistant_msg = &contents[1];
         let parts = assistant_msg["parts"].as_array().expect("Parts array");
         assert!(
-            parts.iter().any(|p| p.get("thought") == Some(&json!(true))),
-            "Assistant message must contain a thinking block"
+            parts.iter().all(|p| p.get("thought") != Some(&json!(true))),
+            "Assistant message without thinking should not have fake thinking injected"
         );
     }
 
@@ -2565,6 +2356,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result = transform_claude_request_in(
@@ -2628,6 +2420,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -2680,6 +2473,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -2881,17 +2675,15 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
             transform_claude_request_in(&req, "test-v", false, None, "test_session", None).unwrap();
-        // [FIX] Since we removed the default 81920, maxOutputTokens should NOT be present
-        // when max_tokens is None and thinking is disabled
+        // Official pipeline topology populates official default maxOutputTokens (65536)
         let gen_config = &result["request"]["generationConfig"];
-        assert!(
-            gen_config.get("maxOutputTokens").is_none(),
-            "maxOutputTokens should not be set when max_tokens is None"
-        );
+        let max_output = gen_config.get("maxOutputTokens").and_then(Value::as_i64);
+        assert_eq!(max_output, Some(65536));
     }
     #[test]
     fn test_claude_flash_thinking_budget_capping() {
@@ -2922,6 +2714,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -2951,6 +2744,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         // Should cap
@@ -2991,6 +2785,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         // Transform
@@ -3035,6 +2830,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         // Transform
@@ -3083,6 +2879,7 @@ mod tests {
             output_config: None,
             size: Some("1024x1024".to_string()),
             quality: Some("hd".to_string()),
+            tool_choice: None,
         };
 
         // 3. Transform request
@@ -3142,6 +2939,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         // Transform
@@ -3152,16 +2950,15 @@ mod tests {
         let gen_config = result["request"]["generationConfig"].as_object().unwrap();
         let thinking_config = gen_config["thinkingConfig"].as_object().unwrap();
 
-        // Check injection: Claude models use thinkingLevel in adaptive mode
+        // 网关模式下 Claude 模型走流水线：effort=high 对应 claude_high，不再按协议写 thinkingLevel
         assert_eq!(thinking_config["includeThoughts"], true);
-        assert_eq!(thinking_config["thinkingLevel"], "HIGH");
-        assert!(thinking_config.get("thinkingBudget").is_none());
-        assert!(thinking_config.get("thinkingType").is_none());
-        assert!(thinking_config.get("effort").is_none());
+        assert_eq!(thinking_config["thinkingBudget"], 16384);
+        assert!(thinking_config.get("thinkingLevel").is_none());
+        assert!(gen_config.get("topP").is_none());
+        assert!(gen_config.get("topK").is_none());
 
-        // Check maxOutputTokens default for adaptive
         let max_output_tokens = gen_config["maxOutputTokens"].as_i64().unwrap();
-        assert_eq!(max_output_tokens, 64000);
+        assert_eq!(max_output_tokens, 24576);
     }
 
     #[test]
@@ -3196,6 +2993,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         // 模拟映射到 Gemini 2.0
@@ -3254,6 +3052,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         // 模拟映射到 Gemini 1.5
@@ -3279,6 +3078,70 @@ mod tests {
     }
 
     #[test]
+    fn web_search_only_injects_google_search() {
+        let tools = Some(vec![Tool {
+            type_: Some("web_search_20250305".to_string()),
+            name: Some("web_search".to_string()),
+            description: None,
+            input_schema: None,
+        }]);
+        let tools_val = build_tools(&tools, true, "gemini-3.8-flash-high")
+            .unwrap()
+            .expect("search-only request should still carry a tool");
+        let tools_arr = tools_val.as_array().expect("tools array");
+        assert!(
+            tools_arr.iter().any(|t| t.get("googleSearch").is_some()),
+            "web_search alone must inject googleSearch"
+        );
+        assert!(
+            tools_arr
+                .iter()
+                .all(|t| t.get("functionDeclarations").is_none()),
+            "web_search must not be declared as a client function"
+        );
+    }
+
+    #[test]
+    fn web_search_alongside_client_tools_stays_in_function_declarations() {
+        let tools = Some(vec![
+            Tool {
+                type_: Some("web_search_20250305".to_string()),
+                name: Some("web_search".to_string()),
+                description: Some("Search".to_string()),
+                input_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } }
+                })),
+            },
+            Tool {
+                type_: None,
+                name: Some("Bash".to_string()),
+                description: Some("Run a command".to_string()),
+                input_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } }
+                })),
+            },
+        ]);
+        let tools_val = build_tools(&tools, true, "gemini-3.8-flash-high")
+            .unwrap()
+            .expect("mixed tools");
+        let tools_arr = tools_val.as_array().expect("tools array");
+        assert!(
+            tools_arr.iter().all(|t| t.get("googleSearch").is_none()),
+            "function tools and googleSearch must not be mixed"
+        );
+        let names: Vec<&str> = tools_arr
+            .iter()
+            .filter_map(|t| t.get("functionDeclarations")?.as_array())
+            .flatten()
+            .filter_map(|decl| decl.get("name")?.as_str())
+            .collect();
+        assert!(names.contains(&"web_search"));
+        assert!(names.contains(&"Bash"));
+    }
+
+    #[test]
     fn test_model_supports_thinking() {
         // gemini-pro-agent is the mapped target of gemini-3.1-pro-high /
         // gemini-3-pro-high and is a forced-thinking Pro agent model.
@@ -3295,26 +3158,6 @@ mod tests {
         // Keyword models (gemini/flash/pro/agent) now force server-side thinking.
         assert!(model_supports_thinking("gemini-2.5-pro"));
         assert!(model_supports_thinking("gemini-1.5-pro"));
-    }
-
-    #[test]
-    fn test_model_keeps_thinking_without_signature() {
-        assert!(model_keeps_thinking_without_signature("gemini-3-flash"));
-        assert!(model_keeps_thinking_without_signature("gemini-3.1-flash"));
-        assert!(model_keeps_thinking_without_signature(
-            "gemini-3.7-flash-high"
-        ));
-        assert!(model_keeps_thinking_without_signature(
-            "gemini-3.6-flash-medium"
-        ));
-        assert!(model_keeps_thinking_without_signature(
-            "gemini-3.5-flash-low"
-        ));
-        assert!(model_keeps_thinking_without_signature("gemini-pro-agent"));
-        assert!(!model_keeps_thinking_without_signature("gemini-3.1-pro"));
-        assert!(!model_keeps_thinking_without_signature(
-            "gemini-3.1-pro-preview"
-        ));
     }
 
     #[test]
@@ -3374,6 +3217,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -3386,9 +3230,10 @@ mod tests {
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
         assert_eq!(assistant_parts.len(), 2);
         assert_eq!(assistant_parts[0]["thought"], true);
-        assert_eq!(
-            assistant_parts[0]["thoughtSignature"],
-            "skip_thought_signature_validator"
+        assert!(
+            assistant_parts[0].get("thoughtSignature").is_none()
+                || assistant_parts[0]["thoughtSignature"].is_null(),
+            "Sentinel elimination: thoughtSignature must be absent when unsigned"
         );
         assert_eq!(
             assistant_parts[0]["text"],
@@ -3398,7 +3243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_call_inherits_real_signature_and_sentinel() {
+    fn test_tool_call_inherits_real_signature_without_sentinel() {
         use crate::proxy::mappers::claude::thinking_utils::filter_invalid_thinking_blocks_with_family;
         let real_sig = "Ep4MCpsMARFNMg9NDlK9RXXz5Mzq9mniX9KSQBBzbUx3k85w/qDgtcE+28NH+1EvPeULAprqUquvYXGMzUXGy1xJoMnqdkC4vqebuhyd2Xhs0oz+OhqcOTwLhGYOG0KBKQ87Hfw4q/sMCSgf2gz4vFMa6V6kKMJepYlPXKFJJF4ok+W6lUt3PfYln8K9Dh7wB/40iHiZ2BnJd++6hfUwu9Bz1n795S50l0yCj84EaSCDDF334Erxq7Fo";
 
@@ -3469,6 +3314,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -3481,16 +3327,19 @@ mod tests {
         let assistant_parts = contents[1]["parts"].as_array().expect("Assistant parts");
         assert_eq!(assistant_parts.len(), 2);
         assert_eq!(assistant_parts[0]["thought"], true);
-        assert_eq!(assistant_parts[0]["thoughtSignature"], real_sig);
-        assert_eq!(assistant_parts[1]["functionCall"]["name"], "list_directory");
         assert!(
-            assistant_parts[1].get("thoughtSignature").is_none(),
-            "Claude model functionCall must NOT carry thoughtSignature!"
+            assistant_parts[0].get("thoughtSignature").is_none(),
+            "I4 rule: Gemini target thought block must NOT carry signature"
+        );
+        assert_eq!(assistant_parts[1]["functionCall"]["name"], "list_directory");
+        assert_eq!(
+            assistant_parts[1]["thoughtSignature"], real_sig,
+            "Gemini model functionCall must inherit the real signature from the thinking block"
         );
     }
 
     #[test]
-    fn test_foreign_claude_signature_fallback_to_sentinel_for_gemini() {
+    fn test_foreign_claude_signature_dropped_for_gemini() {
         use crate::proxy::mappers::claude::thinking_utils::filter_invalid_thinking_blocks_with_family;
         let foreign_claude_sig = "3mgp11XmVXq9InniGA4VAKd7c97NqFw+dWZt79Uz/w9znho88gSM76jv2bZmir7wI86Ixpha7eWdGuznAot4PNbe3+V9bgMTIEyUarn4MLAiiFVb830ZlM+H5ukQwXdD2Zv8nUSmmZTYinpLPGha8TORZAfpU1FJEvwyECel5+W7kc9kpTWrd8DqRNBTOz5EDtvoatiZgKv5SqInhGXK74SJ+PRIC6fNXvYG082HR6TsVxvVYaerz8A40rloIVTxRNK43h3Ecs1boxY4PZqBT8Yhl2qn/iZ+4Xt7FNkI0DAuS9iK0HYKMC4yw0OqKx/LeU+WFZlyc6hGm1BkzLY6yG97MH7kmJ0OPlBWgWFaTeL/uXuGJX6QkKObXN+phoq+kkF2vdFt/mdJMbdgfmSCVQ9037hGBhOHm0zN50KLkp1SxuAY1oWc+lDcI4ufWoyn";
 
@@ -3557,6 +3406,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result = transform_claude_request_in(
@@ -3578,9 +3428,11 @@ mod tests {
             assistant_parts[0].get("thoughtSignature").is_none(),
             "Thinking block must be clean without signature"
         );
-        assert_eq!(
-            assistant_parts[1]["thoughtSignature"], "skip_thought_signature_validator",
-            "Gemini functionCall must use sentinel signature instead of foreign Claude signature"
+        // 铁律：不兼容的外来 Claude 签名被剥离后**留空**，绝不回退成哨兵。
+        // 官方报文里哨兵出现 0/23 次，它不属于 Antigravity 协议。
+        assert!(
+            assistant_parts[1].get("thoughtSignature").is_none(),
+            "Gemini functionCall must drop the foreign signature instead of falling back to sentinel"
         );
     }
 
@@ -3636,6 +3488,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -3680,6 +3533,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -3718,6 +3572,7 @@ mod tests {
             output_config: None,
             size: None,
             quality: None,
+            tool_choice: None,
         };
 
         let result =
@@ -3731,8 +3586,8 @@ mod tests {
 
         assert_eq!(thinking_config["includeThoughts"], true);
         assert_eq!(
-            thinking_config["thinkingBudget"], 16384,
-            "Client budget (99999) must be ignored in favor of tier dictionary budget (16384)"
+            thinking_config["thinkingBudget"], -1,
+            "Client budget (99999) must be ignored in favor of tier dictionary budget (-1)"
         );
     }
 
@@ -3862,7 +3717,7 @@ mod tests {
         assert_eq!(inline_data["mimeType"], "image/png");
         assert_eq!(inline_data["data"], fake_b64);
 
-        let res_str = tool_parts[0]["functionResponse"]["response"]["result"]
+        let res_str = tool_parts[0]["functionResponse"]["response"]["output"]
             .as_str()
             .unwrap();
         assert!(!res_str.contains(fake_b64));

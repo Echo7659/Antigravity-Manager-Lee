@@ -11,12 +11,13 @@
   - *Model Routing Example*: Prioritize wildcard patterns (e.g., `gemini-*-flash-*`) to anticipate future model releases rather than exact string matches.
   - *Prompt Sanitization Example*: For agent-client prompt sanitization, prioritize regex-based pattern matching over static keyword replacement, ensuring full coverage without stripping pipeline system prompts or user queries.
 - **Formatting & CI Discipline**:
-  - **Unit Testing**: Prioritize targeted unit tests for touched modules rather than full-suite runs — CI compiles test targets without executing them. Skip writing tests for trivial edits (constants, prompts, or config tweaks).
-  - **Pre-flight Checks**: Run focused checks covering touched areas before submitting PRs or release tags:
+  - **Unit Testing**: Keep focused — run targeted tests for touched modules locally; CI compiles test targets without executing them. Skip tests for trivial edits (constants, prompts, or config tweaks). No need to run the full suite locally.
+  - **Local Test Discretion**: For strings, constants, hardcoded values, or other trivial edits, ask after the task whether a small functional check is wanted rather than testing on your own. Self-test only when four or more core backend or frontend interaction files are involved; hardcoded-only edits do not count as core-file changes. In general, follow the user's preference on whether to test.
+  - **Pre-flight Checks**: Run the essentials before submitting PRs or release tags:
     - `cd src-tauri && cargo fmt -- --check` (for Rust edits)
-    - `cd src-tauri && cargo clippy --all-targets --all-features` (comprehensive Rust gate, rather than running redundant `cargo check`)
+    - `cd src-tauri && cargo clippy --all-targets --all-features` (comprehensive Rust gate, already includes compilation — no separate `cargo check` needed)
     - `npm run build` (when `src/` or frontend configs changed)
-    - Rely on CI for full-app compilation (`tauri build`), reserving local checks for fast feedback.
+    - Rely on CI for full-app compilation (`tauri build`) and full test execution. Local pre-flight covers fmt + clippy + frontend build only.
 - **Release Channels & Discipline**:
   - **Release Channel Separation**:
     - **Stable Releases (正式版)**: Exclusively on `main`. Deploys official production packages, updates Docker/GitHub `latest` tags, and services automatic update channels.
@@ -28,7 +29,7 @@
     1. **Atomic Version Sync**: Run `npm run bump <patch|minor|beta|version>` to synchronize all project manifests and generate changelog skeletons.
     2. **Documentation & Attribution**:
        - Audit Git history (`<last-tag>..HEAD`) and merged PRs to summarize all authors, co-authors, and linked Issues/PRs (`Fixes #xxx`, `PR #xxx`). Attribute every contributor inline (`Thanks to @username`) in `CHANGELOG.md` (and `CHANGELOG_EN.md`).
-       - **Synchronize README Changelog (同步首页更新日志)**: For stable releases, you **MUST** update the release summary in both `README.md` (under "## 📝 更新日志") and `README_EN.md` (under "## 📝 Changelog"). Never update only `CHANGELOG.md` while leaving `README.md` / `README_EN.md` with outdated release notes. Pre-release / beta versions remain exclusively in changelogs; stable releases require full synchronization across both README files.
+       - **Synchronize README Changelog (同步首页更新日志)**: For stable releases, you **MUST** update the release summary in both `README.md` (English home under "## 📝 Changelog") and `README_ZH.md` (Chinese home under "## 📝 更新日志"). Never update only `CHANGELOG.md` while leaving `README.md` / `README_ZH.md` with outdated release notes. Pre-release / beta versions remain exclusively in changelogs; stable releases require full synchronization across both README files.
     3. **Pre-flight before Tagging**: Run the Pre-flight Checks above on the exact commit to be tagged.
     4. **Commit, Tag & Push**: Push stable releases to `main` (`git tag vX.Y.Z && git push origin vX.Y.Z`), reserving `beta` exclusively for pre-releases (`git tag vX.Y.Z-beta.N && git push origin vX.Y.Z-beta.N`). The release gate strictly intercepts cross-branch misplacement. Tags must match `CHANGELOG.md` headings character-for-character (including `v` prefix and pre-release suffix).
   - *Full procedure*: See `docs/RELEASE_GUIDE.md` for bump options, changelog templates, and rollback steps.

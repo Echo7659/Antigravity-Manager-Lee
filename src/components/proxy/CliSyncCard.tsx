@@ -87,11 +87,11 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
     const [hermesSyncModal, setHermesSyncModal] = useState(false);
     const [openClawSyncModal, setOpenClawSyncModal] = useState(false);
     const [selectedModels, setSelectedModels] = useState<Record<CliAppType, string>>({
-        Claude: 'claude-3-5-sonnet-latest',
-        Codex: 'gpt-4o',
+        Claude: 'claude-sonnet-4-6',
+        Codex: 'gpt-oss-120b-medium',
         JeikCode: 'gemini-3.8-flash-high',
-        GrokBuild: 'gemini-3.8-flash',
-        Gemini: 'gemini-1.5-pro',
+        GrokBuild: 'gemini-3.8-flash-high',
+        Gemini: 'gemini-3.1-pro-high',
         OpenCode: '',
         Droid: '',
         Hermes: '',
@@ -399,9 +399,9 @@ export const CliSyncCard = ({ proxyUrl, apiKey, className }: CliSyncCardProps) =
                 {/* JeikCode 专属官方项目推荐卡片（贴满方格，充实饱满，点击跳转 GitHub） */}
                 {app === 'JeikCode' && (
                     <div
-                        onClick={() => openExternalUrl('https://github.com/jeikcode/JeikCode')}
+                        onClick={() => openExternalUrl('https://github.com/jeikl/JeikCode')}
                         className="mb-3 p-3 rounded-xl border border-emerald-500/30 bg-gradient-to-br from-emerald-500/[0.09] via-teal-500/[0.05] to-cyan-500/[0.08] dark:from-emerald-950/40 dark:via-teal-950/25 dark:to-cyan-950/30 hover:border-emerald-400 hover:shadow-md transition-all duration-300 cursor-pointer group/link select-none w-full"
-                        title="点击访问 JeikCode 官方 GitHub 仓库 (https://github.com/jeikcode/JeikCode)"
+                        title="点击访问 JeikCode 官方 GitHub 仓库 (https://github.com/jeikl/JeikCode)"
                     >
                         {/* 顶栏：Logo + 标题与作者 + 右侧 GitHub 放大图标 */}
                         <div className="flex items-center justify-between gap-2 mb-1.5">

@@ -1,5 +1,30 @@
 import type { ModelQuota, QuotaBucket, QuotaGroup } from '../types/account';
 
+export type DashboardQuotaView = 'weighted' | '5h' | 'weekly';
+
+export interface ConstrainedQuotaResult {
+    /** 当前视图的剩余百分比；null 表示该窗口未知。 */
+    effectivePercentage: number | null;
+    /** 原始 5H 滑动窗口配额百分比 (0-100, 或 null) */
+    raw5h: number | null;
+    /** 原始 7 天周配额百分比 (0-100, 或 null) */
+    rawWeekly: number | null;
+    /** 已知模型和时间窗口的最低剩余百分比；全部未知时为 null。 */
+    weighted: number | null;
+    /** 依据当前模式和约束状态计算出的建议重置时间 */
+    resetTime?: string;
+    /** 是否受到周配额短板压制 (例如 5H 本有 80% 但周配额仅剩 30%，上限被压至 30%) */
+    isWeeklyConstrained: boolean;
+    /** 周窗口显示为 0% 时为 true；实际调度资格由后端决定。 */
+    isWeeklyExhausted: boolean;
+    /** 是否处于 5H 瞬时冷却态 (周配额虽有，但当前 5H 窗口打满归零) */
+    is5hCooling: boolean;
+    /** 5H 窗口专属重置时间 */
+    fiveHourResetTime?: string;
+    /** 7天周配额专属重置时间 */
+    weeklyResetTime?: string;
+}
+
 function getModelQuotaBuckets(modelId: string, groups: QuotaGroup[]): QuotaBucket[] {
     const name = modelId.toLowerCase();
     const thirdParty = /^(claude|gpt)/.test(name);
@@ -54,4 +79,41 @@ export function getModelQuotaDisplay(modelId: string, model: ModelQuota | undefi
 
 export function formatQuotaPercentage(value: number | null): string {
     return value === null ? '—' : `${value}%`;
+}
+
+/** 返回所选配额窗口及限制状态；窗口值保持独立，未知值不补零。 */
+export function getModelConstrainedQuota(
+    modelId: string,
+    model: ModelQuota | undefined,
+    groups: QuotaGroup[] = [],
+    view: DashboardQuotaView = 'weighted'
+): ConstrainedQuotaResult {
+    const display = getModelQuotaDisplay(modelId, model, groups);
+    const fiveHour = getModelQuotaDisplay(modelId, model, groups, '5h');
+    const raw5h = fiveHour.displayPercentage;
+    const rawWeekly = display.weeklyPercentage;
+    const fiveHourResetTime = fiveHour.resetTime;
+    const weeklyResetTime = display.weeklyResetTime;
+
+    // 2. 状态判定
+    const isWeeklyExhausted = rawWeekly !== null && rawWeekly <= 0;
+    const isWeeklyConstrained = isWeeklyExhausted || (rawWeekly !== null && raw5h !== null && rawWeekly < raw5h);
+    const is5hCooling = raw5h !== null && raw5h <= 0 && (rawWeekly === null || rawWeekly > 0);
+
+    const weighted = display.effectivePercentage;
+    const effectivePercentage = view === '5h' ? raw5h : view === 'weekly' ? rawWeekly : weighted;
+    const resetTime = view === '5h' ? fiveHourResetTime : view === 'weekly' ? weeklyResetTime : display.resetTime;
+
+    return {
+        effectivePercentage,
+        raw5h,
+        rawWeekly,
+        weighted,
+        resetTime,
+        isWeeklyConstrained,
+        isWeeklyExhausted,
+        is5hCooling,
+        fiveHourResetTime,
+        weeklyResetTime,
+    };
 }

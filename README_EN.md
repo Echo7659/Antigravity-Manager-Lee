@@ -1,5 +1,5 @@
 # Antigravity Tools 🚀
-> Professional Account Management & Protocol Proxy System for AI Services (v4.8.1)
+> Professional Account Management & Protocol Proxy System for AI Services (v4.9.1)
 
 <div align="center">
   <img src="public/icon.png" width="100" height="100" alt="Antigravity Tools Logo">
@@ -11,7 +11,7 @@
       <img src="https://img.shields.io/github/v/release/lbjlaq/Antigravity-Manager?color=blue&style=flat-square" alt="GitHub release">
     </a>
     <a href="https://github.com/lbjlaq/Antigravity-Manager">
-      <img src="https://img.shields.io/badge/Version-4.8.1-blue?style=flat-square" alt="Version">
+      <img src="https://img.shields.io/badge/Version-4.9.1-blue?style=flat-square" alt="Version">
     </a>
     <img src="https://img.shields.io/badge/Tauri-v2-orange?style=flat-square" alt="Tauri">
     <img src="https://img.shields.io/badge/Backend-Rust-red?style=flat-square" alt="Rust">
@@ -20,15 +20,15 @@
   </p>
 
   <p>
-    <a href="#-features">Features</a> • 
-    <a href="#-gui-overview">GUI Overview</a> • 
-    <a href="#-architecture">Architecture</a> • 
-    <a href="#-installation">Installation</a> • 
+    <a href="#-features">Features</a> •
+    <a href="#-gui-overview">GUI Overview</a> •
+    <a href="#-architecture">Architecture</a> •
+    <a href="#-installation">Installation</a> •
     <a href="#-quick-integration">Integration</a>
   </p>
 
   <p>
-    <a href="./README.md">简体中文</a> | 
+    <a href="./README.md">简体中文</a> |
     <strong>English</strong>
   </p>
 </div>
@@ -311,7 +311,7 @@ print(response.choices[0].message.content)
 ### How to use with Kilo Code?
 1.  **Protocol Selection**: We recommend using the **Gemini protocol**.
 2.  **Base URL**: Set it to `http://127.0.0.1:8045`.
-3.  **Note**: 
+3.  **Note**:
     - **OpenAI Protocol Limitation**: When using OpenAI mode, Kilo Code's request path will append `/v1/chat/completions/responses`, a non-standard path that will return 404 from Antigravity. Make sure to enter the Base URL and select Gemini mode.
     - **Model Mapping**: Model names in Kilo Code may differ from Antigravity's defaults. If you encounter connection issues, set up custom mappings on the "Model Mapping" page and check the **log files** for debugging.
 
@@ -345,7 +345,7 @@ with open("output.png", "wb") as f:
 
 **Supported parameters**：
 - **`size`**: Any `WIDTHxHEIGHT` format (e.g. `1280x720`, `1024x1024`, `1920x1080`), auto-calculates and maps to standard aspect ratios (21:9, 16:9, 9:16, 4:3, 3:4, 1:1)
-- **`quality`**: 
+- **`quality`**:
   - `"hd"` → 4K resolution (high quality)
   - `"medium"` → 2K resolution (medium quality)
   - `"standard"` → Default resolution (standard quality)
@@ -450,7 +450,7 @@ In clients that support OpenAI protocol (e.g., Cherry Studio), you can configure
 
 - **v4.8.1-lee.3**: Official 4.8.1 with retained reliability and dashboard fixes. [Reconciliation](docs/UPSTREAM_4_8_1.md). Thanks to @jeikl, @Avlaak and upstream contributors.
 
-> Latest version **v4.8.1** (2026-09-25): Completely reconstructed egress message serialization across all 4 protocols with deterministic key ordering and canonical structure alignment, ensuring 100% byte consistency across protocol switching and universal Prefix Caching invariance; resolved thought signature drift during Claude <-> Gemini migration with bi-directional `<think>` embedding and causal signature recovery; discarded client tool IDs in favor of context-causal deterministic pseudo-hash IDs for unified bidirectional lookup; bridged agent tool multimodal vision loop with native conversion of Base64 tool images into Gemini visual payloads; eliminated legacy adapter-level `web_search` tool filtering and hardcoded dead code, unifying all tool handling into the inbound pipeline; fixed client budget mode thinking disable failures; introduced one-click CLI synchronization cards and modern edge-to-edge square app avatars for JeikCode, Hermes, OpenClaw, and Grok Build; added multilingual adaptive thinking cache cleanup prompt on major updates.
+> Latest upstream version **v4.9.1** (2026-10-02): Restored `gemini-3.1-flash-lite` routing and Layer-3 background compression; retained legacy-model forwarding to `gemini-3.6-flash-medium` (Fixes #3577, thanks to @Xyloz3n). Thinking SSE heartbeats now run every 3 seconds (PR #3578, thanks to @EricZhou05). Lee account failover, quota protection and usage statistics are preserved.
 
 👉 **[View Full Changelog → CHANGELOG_EN.md](CHANGELOG_EN.md)**
 

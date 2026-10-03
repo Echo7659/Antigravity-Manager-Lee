@@ -57,6 +57,24 @@ docker run -d \
   lbjlaq/antigravity-manager:latest
 ```
 
+> [!TIP]
+> **🧪 體驗 Beta / 預覽版鏡像**：
+> 若需使用最新的 Beta 預發布特性，請拉取對應的 Beta 版本 Tag（預發布版本獨立構建發布，不會覆蓋 `latest` 穩定版標籤）：
+> ```bash
+> # 拉取指定 Beta 預發布版本
+> docker pull lbjlaq/antigravity-manager:v4.8.2-beta.0
+>
+> # 運行 Beta 容器
+> docker run -d --name antigravity-manager-beta \
+>   -p 8045:8045 \
+>   -e API_KEY=your-api-key \
+>   -e WEB_PASSWORD=your-login-password \
+>   -e ABV_MAX_BODY_SIZE=104857600 \
+>   -v ~/.antigravity_tools:/root/.antigravity_tools \
+>   lbjlaq/antigravity-manager:v4.8.2-beta.0
+> ```
+> 完整版本標籤請查看 [Docker Hub Tags](https://hub.docker.com/r/lbjlaq/antigravity-manager/tags)。若需直接運行未發版 Tag 的當前最新 `beta` 分支源碼，可在本地構建：`docker build -t lbjlaq/antigravity-manager:beta -f docker/Dockerfile .`。
+
 #### 🔐 鑒權邏輯 (Security Scenarios)
 *   **場景 A：僅設置了 `API_KEY`**
     - **Web 登錄**：使用 `API_KEY` 即可進入後台。
@@ -108,7 +126,7 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.fork.yml up
 
 #### 💡 構建參數
 本鏡像支持自動鏡像源切換，以提升国内構建速度：
-*   `USE_MIRROR`: 
+*   `USE_MIRROR`:
     *   `auto` (默認): 自動檢測網絡環境，若無法訪問 Google 則切換至国内镜像（阿里云/NPM Mirror）。
     *   `true`: 強制使用国内镜像源。
     *   `false`: 強制使用官方默認源。

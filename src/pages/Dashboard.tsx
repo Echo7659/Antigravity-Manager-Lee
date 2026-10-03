@@ -4,6 +4,8 @@ import {
     ArrowRight,
     Ban,
     Bot,
+    Calendar,
+    Clock,
     Download,
     RefreshCw,
     ShieldAlert,
@@ -25,6 +27,7 @@ import { useAccountStore } from '../stores/useAccountStore';
 import { Account } from '../types/account';
 import { isTauri } from '../utils/env';
 import { request as invoke } from '../utils/request';
+import { DashboardQuotaView } from '../utils/quotaDisplay';
 
 function Dashboard() {
     const { t } = useTranslation();
@@ -44,7 +47,23 @@ function Dashboard() {
         fetchCurrentAccount();
     }, []);
 
-    const [onlyAvailable, setOnlyAvailable] = useState(true);
+    const [onlyAvailable, setOnlyAvailable] = useState<boolean>(() => {
+        const saved = localStorage.getItem('dashboard_filter_only_available');
+        return saved !== null ? saved === 'true' : true;
+    });
+
+    const [quotaView, setQuotaView] = useState<DashboardQuotaView>(() => {
+        const saved = localStorage.getItem('dashboard_quota_view');
+        return (saved === '5h' || saved === 'weekly' || saved === 'weighted') ? saved : 'weighted';
+    });
+
+    useEffect(() => {
+        localStorage.setItem('dashboard_filter_only_available', String(onlyAvailable));
+    }, [onlyAvailable]);
+
+    useEffect(() => {
+        localStorage.setItem('dashboard_quota_view', quotaView);
+    }, [quotaView]);
 
     // 全维度账号健康与配额计算矩阵 (状态由风控定生死，底座池支持仅可用账号与全部正常账号无缝切换)
     const stats = useMemo(() => {
@@ -303,178 +322,289 @@ function Dashboard() {
                         </span>
                     </div>
 
-                    {/* 显眼的双选胶囊控制器 (Pill Capsule) */}
-                    <div className="flex items-center gap-1 bg-gray-200/80 dark:bg-base-300 p-1 rounded-full shadow-inner border border-gray-200/80 dark:border-base-200 select-none">
-                        <button
-                            type="button"
-                            onClick={() => setOnlyAvailable(true)}
-                            className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
-                                onlyAvailable
-                                    ? 'bg-emerald-600 text-white shadow-md scale-100 ring-2 ring-emerald-400/30'
-                                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-black/5 dark:hover:bg-white/5'
-                            }`}
-                            title={t('dashboard.btn_title_only_available', '当前：仅看开启且正常的可用账号 (点击包含已禁用账号)')}
-                        >
-                            <ShieldCheck className="w-3.5 h-3.5" />
-                            <span>
-                                {t('dashboard.btn_only_available', { count: stats.available })}
-                            </span>
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => setOnlyAvailable(false)}
-                            className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
-                                !onlyAvailable
-                                    ? 'bg-blue-600 text-white shadow-md scale-100 ring-2 ring-blue-400/30'
-                                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-black/5 dark:hover:bg-white/5'
-                            }`}
-                            title={t('dashboard.btn_title_include_disabled', '当前：查看全部正常状态账号包含禁用 (点击仅看可用账号)')}
-                        >
-                            <Users className="w-3.5 h-3.5" />
-                            <span>
-                                {t('dashboard.btn_include_disabled', { count: stats.normalCount })}
-                            </span>
-                        </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                        {/* 显眼的配额视窗三态胶囊控制器 (综合加权 | 5H 滚动 | 7天周配额) */}
+                        <div className="flex items-center gap-1 bg-gray-200/80 dark:bg-base-300 p-1 rounded-full shadow-inner border border-gray-200/80 dark:border-base-200 select-none">
+                            <button
+                                type="button"
+                                onClick={() => setQuotaView('weighted')}
+                                className={`px-3 py-1.5 rounded-full text-xs font-bold transition-all flex items-center gap-1 cursor-pointer ${
+                                    quotaView === 'weighted'
+                                        ? 'bg-indigo-600 text-white shadow-md scale-100 ring-2 ring-indigo-400/30'
+                                        : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-black/5 dark:hover:bg-white/5'
+                                }`}
+                                title={t('dashboard.view_mode_title_weighted')}
+                            >
+                                <Sparkles className="w-3.5 h-3.5" />
+                                <span>{t('dashboard.view_mode_weighted', '综合加权')}</span>
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setQuotaView('5h')}
+                                className={`px-3 py-1.5 rounded-full text-xs font-bold transition-all flex items-center gap-1 cursor-pointer ${
+                                    quotaView === '5h'
+                                        ? 'bg-emerald-600 text-white shadow-md scale-100 ring-2 ring-emerald-400/30'
+                                        : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-black/5 dark:hover:bg-white/5'
+                                }`}
+                                title={t('dashboard.view_mode_title_5h')}
+                            >
+                                <Clock className="w-3.5 h-3.5" />
+                                <span>{t('dashboard.view_mode_5h', '5H 滚动')}</span>
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setQuotaView('weekly')}
+                                className={`px-3 py-1.5 rounded-full text-xs font-bold transition-all flex items-center gap-1 cursor-pointer ${
+                                    quotaView === 'weekly'
+                                        ? 'bg-purple-600 text-white shadow-md scale-100 ring-2 ring-purple-400/30'
+                                        : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-black/5 dark:hover:bg-white/5'
+                                }`}
+                                title={t('dashboard.view_mode_title_weekly')}
+                            >
+                                <Calendar className="w-3.5 h-3.5" />
+                                <span>{t('dashboard.view_mode_weekly', '7天周配额')}</span>
+                            </button>
+                        </div>
+
+                        {/* 显眼的双选胶囊控制器 (Pill Capsule) */}
+                        <div className="flex items-center gap-1 bg-gray-200/80 dark:bg-base-300 p-1 rounded-full shadow-inner border border-gray-200/80 dark:border-base-200 select-none">
+                            <button
+                                type="button"
+                                onClick={() => setOnlyAvailable(true)}
+                                className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                                    onlyAvailable
+                                        ? 'bg-emerald-600 text-white shadow-md scale-100 ring-2 ring-emerald-400/30'
+                                        : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-black/5 dark:hover:bg-white/5'
+                                }`}
+                                title={t('dashboard.btn_title_only_available', '当前：仅看开启且正常的可用账号 (点击包含已禁用账号)')}
+                            >
+                                <ShieldCheck className="w-3.5 h-3.5" />
+                                <span>
+                                    {t('dashboard.btn_only_available', { count: stats.available })}
+                                </span>
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setOnlyAvailable(false)}
+                                className={`px-3.5 py-1.5 rounded-full text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
+                                    !onlyAvailable
+                                        ? 'bg-blue-600 text-white shadow-md scale-100 ring-2 ring-blue-400/30'
+                                        : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:bg-black/5 dark:hover:bg-white/5'
+                                }`}
+                                title={t('dashboard.btn_title_include_disabled', '当前：查看全部正常状态账号包含禁用 (点击仅看可用账号)')}
+                            >
+                                <Users className="w-3.5 h-3.5" />
+                                <span>
+                                    {t('dashboard.btn_include_disabled', { count: stats.normalCount })}
+                                </span>
+                            </button>
+                        </div>
                     </div>
                 </div>
 
-                {/* 三类配额：综合、5 小时与周配额的已知账号均值 */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    {/* Gemini 文本模型配额 */}
-                    <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 flex flex-col justify-between">
-                        <div>
-                            <div className="flex items-center justify-between mb-2">
-                                <div className="flex items-center gap-2">
-                                    <div className="p-1.5 bg-green-50 dark:bg-green-900/20 rounded-md">
-                                        <Sparkles className="w-4 h-4 text-green-500 dark:text-green-400" />
+                {/* 3 大模型卡片：展示 5H均值、周配额均值及周额度熔断加权配额 */}
+                {(() => {
+                    const getCardQuota = (stat: typeof stats.gemini) => {
+                        if (quotaView === '5h') {
+                            return {
+                                val: stat.avg5h,
+                                label: t('dashboard.view_mode_5h', '5H 滚动可用'),
+                                isTight: (stat.avg5h ?? 0) < 50,
+                            };
+                        }
+                        if (quotaView === 'weekly') {
+                            return {
+                                val: stat.avgWeekly,
+                                label: t('dashboard.view_mode_weekly', '7天周配额'),
+                                isTight: (stat.avgWeekly ?? 0) < 50,
+                            };
+                        }
+                        return {
+                            val: stat.averageEffective,
+                            label: t('dashboard.weighted_available', '综合加权可用'),
+                            isTight: (stat.averageEffective ?? 0) < 50,
+                        };
+                    };
+
+                    const geminiCard = getCardQuota(stats.gemini);
+                    const geminiImageCard = getCardQuota(stats.geminiImage);
+                    const claudeCard = getCardQuota(stats.claude);
+
+                    return (
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            {/* Gemini 文本模型配额 */}
+                            <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 flex flex-col justify-between">
+                                <div>
+                                    <div className="flex items-center justify-between mb-2">
+                                        <div className="flex items-center gap-2">
+                                            <div className="p-1.5 bg-green-50 dark:bg-green-900/20 rounded-md">
+                                                <Sparkles className="w-4 h-4 text-green-500 dark:text-green-400" />
+                                            </div>
+                                            <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
+                                                {t('dashboard.gemini_available_quota', 'Gemini 可用配额')}
+                                            </span>
+                                        </div>
+                                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${!geminiCard.isTight ? 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
+                                            {quotaStatus(geminiCard.val)}
+                                        </span>
                                     </div>
-                                    <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
-                                        {t('dashboard.gemini_available_quota', 'Gemini 可用配额')}
-                                    </span>
-                                </div>
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${(stats.gemini.averageEffective ?? 0) >= 50 ? 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
-                                    {quotaStatus(stats.gemini.averageEffective)}
-                                </span>
-                            </div>
 
-                            <div className="flex items-baseline gap-2 mb-2">
-                                <span className="text-3xl font-extrabold text-gray-900 dark:text-base-content font-mono">
-                                    {formatQuotaPercentage(stats.gemini.averageEffective)}
-                                </span>
-                                <span className="text-[11px] text-gray-400 dark:text-gray-500 font-medium">
-                                    {t('dashboard.weighted_available', '综合加权可用')}
-                                </span>
-                            </div>
-                        </div>
-
-                        <div className="pt-2 border-t border-gray-100 dark:border-base-300/60 flex items-center justify-between text-[11px]">
-                            <div className="flex items-center gap-1.5">
-                                <span className="text-gray-400 dark:text-gray-500">{t('dashboard.rolling_5h', '5小时滚动:')}</span>
-                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatQuotaPercentage(stats.gemini.avg5h)}</span>
-                            </div>
-                            <div className="flex items-center gap-1.5">
-                                <span className="text-gray-400 dark:text-gray-500">{t('dashboard.weekly_7d', '7天周配额:')}</span>
-                                <span className={`font-mono font-bold ${(stats.gemini.avgWeekly ?? 100) <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{formatQuotaPercentage(stats.gemini.avgWeekly)}</span>
-                            </div>
-                        </div>
-                        {stats.gemini.zeroWeeklyCount > 0 && (
-                            <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5 font-medium flex items-center gap-1">
-                                <AlertTriangle className="w-3 h-3 shrink-0" />
-                                <span>{t('dashboard.zero_weekly_warning', { count: stats.gemini.zeroWeeklyCount })}</span>
-                            </div>
-                        )}
-                    </div>
-
-                    {/* Gemini 绘图模型配额 */}
-                    <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 flex flex-col justify-between">
-                        <div>
-                            <div className="flex items-center justify-between mb-2">
-                                <div className="flex items-center gap-2">
-                                    <div className="p-1.5 bg-purple-50 dark:bg-purple-900/20 rounded-md">
-                                        <Sparkles className="w-4 h-4 text-purple-500 dark:text-purple-400" />
+                                    <div className="flex items-baseline gap-2 mb-2">
+                                        <span className="text-3xl font-extrabold text-gray-900 dark:text-base-content font-mono">
+                                            {formatQuotaPercentage(geminiCard.val)}
+                                        </span>
+                                        <span className="text-[11px] text-gray-400 dark:text-gray-500 font-medium">
+                                            {geminiCard.label}
+                                        </span>
                                     </div>
-                                    <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
-                                        {t('dashboard.gemini_image_quota', 'Gemini 绘图配额')}
-                                    </span>
                                 </div>
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${(stats.geminiImage.averageEffective ?? 0) >= 50 ? 'bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
-                                    {quotaStatus(stats.geminiImage.averageEffective)}
-                                </span>
-                            </div>
 
-                            <div className="flex items-baseline gap-2 mb-2">
-                                <span className="text-3xl font-extrabold text-gray-900 dark:text-base-content font-mono">
-                                    {formatQuotaPercentage(stats.geminiImage.averageEffective)}
-                                </span>
-                                <span className="text-[11px] text-gray-400 dark:text-gray-500 font-medium">
-                                    {t('dashboard.weighted_available', '综合加权可用')}
-                                </span>
-                            </div>
-                        </div>
-
-                        <div className="pt-2 border-t border-gray-100 dark:border-base-300/60 flex items-center justify-between text-[11px]">
-                            <div className="flex items-center gap-1.5">
-                                <span className="text-gray-400 dark:text-gray-500">{t('dashboard.rolling_5h', '5小时滚动:')}</span>
-                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatQuotaPercentage(stats.geminiImage.avg5h)}</span>
-                            </div>
-                            <div className="flex items-center gap-1.5">
-                                <span className="text-gray-400 dark:text-gray-500">{t('dashboard.weekly_7d', '7天周配额:')}</span>
-                                <span className={`font-mono font-bold ${(stats.geminiImage.avgWeekly ?? 100) <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{formatQuotaPercentage(stats.geminiImage.avgWeekly)}</span>
-                            </div>
-                        </div>
-                        {stats.geminiImage.zeroWeeklyCount > 0 && (
-                            <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5 font-medium flex items-center gap-1">
-                                <AlertTriangle className="w-3 h-3 shrink-0" />
-                                <span>{t('dashboard.zero_weekly_warning', { count: stats.geminiImage.zeroWeeklyCount })}</span>
-                            </div>
-                        )}
-                    </div>
-
-                    {/* Claude 模型配额 */}
-                    <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 flex flex-col justify-between">
-                        <div>
-                            <div className="flex items-center justify-between mb-2">
-                                <div className="flex items-center gap-2">
-                                    <div className="p-1.5 bg-cyan-50 dark:bg-cyan-900/20 rounded-md">
-                                        <Bot className="w-4 h-4 text-cyan-500 dark:text-cyan-400" />
+                                <div className="pt-2 border-t border-gray-100 dark:border-base-300/60 flex items-center justify-between text-[11px]">
+                                    <div className="flex items-center gap-1.5">
+                                        <span className="text-gray-400 dark:text-gray-500">{t('dashboard.rolling_5h', '5小时滚动:')}</span>
+                                        <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatQuotaPercentage(stats.gemini.avg5h)}</span>
                                     </div>
-                                    <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
-                                        {t('dashboard.claude_available_quota', 'Claude 可用配额')}
-                                    </span>
+                                    <div className="flex items-center gap-1.5">
+                                        <span className="text-gray-400 dark:text-gray-500">{t('dashboard.weekly_7d', '7天周配额:')}</span>
+                                        <span className={`font-mono font-bold ${(stats.gemini.avgWeekly ?? 100) <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{formatQuotaPercentage(stats.gemini.avgWeekly)}</span>
+                                    </div>
                                 </div>
-                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${(stats.claude.averageEffective ?? 0) >= 50 ? 'bg-cyan-50 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
-                                    {quotaStatus(stats.claude.averageEffective)}
-                                </span>
+                                {stats.gemini.zeroWeeklyCount > 0 && (
+                                    <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5 font-medium flex items-center gap-1">
+                                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                                        <span>{t('dashboard.zero_weekly_warning', { count: stats.gemini.zeroWeeklyCount })}</span>
+                                    </div>
+                                )}
+                                {quotaView === '5h' && stats.gemini.cappedCount > 0 && stats.gemini.zeroWeeklyCount === 0 && (
+                                    <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5 font-medium flex items-center gap-1">
+                                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                                        <span>{stats.gemini.cappedCount} 个账号 5H 上限受到周配额压制</span>
+                                    </div>
+                                )}
+                                {quotaView === 'weekly' && stats.gemini.coolingCount > 0 && (
+                                    <div className="text-[10px] text-blue-600 dark:text-blue-400 mt-1.5 font-medium flex items-center gap-1">
+                                        <Clock className="w-3 h-3 shrink-0" />
+                                        <span>{stats.gemini.coolingCount} 个账号当前处于 5H 冷却冻结中</span>
+                                    </div>
+                                )}
                             </div>
 
-                            <div className="flex items-baseline gap-2 mb-2">
-                                <span className="text-3xl font-extrabold text-gray-900 dark:text-base-content font-mono">
-                                    {formatQuotaPercentage(stats.claude.averageEffective)}
-                                </span>
-                                <span className="text-[11px] text-gray-400 dark:text-gray-500 font-medium">
-                                    {t('dashboard.weighted_available', '综合加权可用')}
-                                </span>
-                            </div>
-                        </div>
+                            {/* Gemini 绘图模型配额 */}
+                            <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 flex flex-col justify-between">
+                                <div>
+                                    <div className="flex items-center justify-between mb-2">
+                                        <div className="flex items-center gap-2">
+                                            <div className="p-1.5 bg-purple-50 dark:bg-purple-900/20 rounded-md">
+                                                <Sparkles className="w-4 h-4 text-purple-500 dark:text-purple-400" />
+                                            </div>
+                                            <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
+                                                {t('dashboard.gemini_image_quota', 'Gemini 绘图配额')}
+                                            </span>
+                                        </div>
+                                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${!geminiImageCard.isTight ? 'bg-purple-50 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
+                                            {quotaStatus(geminiImageCard.val)}
+                                        </span>
+                                    </div>
 
-                        <div className="pt-2 border-t border-gray-100 dark:border-base-300/60 flex items-center justify-between text-[11px]">
-                            <div className="flex items-center gap-1.5">
-                                <span className="text-gray-400 dark:text-gray-500">{t('dashboard.rolling_5h', '5小时滚动:')}</span>
-                                <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatQuotaPercentage(stats.claude.avg5h)}</span>
+                                    <div className="flex items-baseline gap-2 mb-2">
+                                        <span className="text-3xl font-extrabold text-gray-900 dark:text-base-content font-mono">
+                                            {formatQuotaPercentage(geminiImageCard.val)}
+                                        </span>
+                                        <span className="text-[11px] text-gray-400 dark:text-gray-500 font-medium">
+                                            {geminiImageCard.label}
+                                        </span>
+                                    </div>
+                                </div>
+
+                                <div className="pt-2 border-t border-gray-100 dark:border-base-300/60 flex items-center justify-between text-[11px]">
+                                    <div className="flex items-center gap-1.5">
+                                        <span className="text-gray-400 dark:text-gray-500">{t('dashboard.rolling_5h', '5小时滚动:')}</span>
+                                        <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatQuotaPercentage(stats.geminiImage.avg5h)}</span>
+                                    </div>
+                                    <div className="flex items-center gap-1.5">
+                                        <span className="text-gray-400 dark:text-gray-500">{t('dashboard.weekly_7d', '7天周配额:')}</span>
+                                        <span className={`font-mono font-bold ${(stats.geminiImage.avgWeekly ?? 100) <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{formatQuotaPercentage(stats.geminiImage.avgWeekly)}</span>
+                                    </div>
+                                </div>
+                                {stats.geminiImage.zeroWeeklyCount > 0 && (
+                                    <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5 font-medium flex items-center gap-1">
+                                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                                        <span>{t('dashboard.zero_weekly_warning', { count: stats.geminiImage.zeroWeeklyCount })}</span>
+                                    </div>
+                                )}
+                                {quotaView === '5h' && stats.geminiImage.cappedCount > 0 && stats.geminiImage.zeroWeeklyCount === 0 && (
+                                    <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5 font-medium flex items-center gap-1">
+                                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                                        <span>{stats.geminiImage.cappedCount} 个账号 5H 上限受到周配额压制</span>
+                                    </div>
+                                )}
+                                {quotaView === 'weekly' && stats.geminiImage.coolingCount > 0 && (
+                                    <div className="text-[10px] text-blue-600 dark:text-blue-400 mt-1.5 font-medium flex items-center gap-1">
+                                        <Clock className="w-3 h-3 shrink-0" />
+                                        <span>{stats.geminiImage.coolingCount} 个账号当前处于 5H 冷却冻结中</span>
+                                    </div>
+                                )}
                             </div>
-                            <div className="flex items-center gap-1.5">
-                                <span className="text-gray-400 dark:text-gray-500">{t('dashboard.weekly_7d', '7天周配额:')}</span>
-                                <span className={`font-mono font-bold ${(stats.claude.avgWeekly ?? 100) <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{formatQuotaPercentage(stats.claude.avgWeekly)}</span>
+
+                            {/* Claude 模型配额 */}
+                            <div className="bg-white dark:bg-base-100 rounded-xl p-4 shadow-sm border border-gray-100 dark:border-base-200 flex flex-col justify-between">
+                                <div>
+                                    <div className="flex items-center justify-between mb-2">
+                                        <div className="flex items-center gap-2">
+                                            <div className="p-1.5 bg-cyan-50 dark:bg-cyan-900/20 rounded-md">
+                                                <Bot className="w-4 h-4 text-cyan-500 dark:text-cyan-400" />
+                                            </div>
+                                            <span className="text-xs font-bold text-gray-800 dark:text-gray-200">
+                                                {t('dashboard.claude_available_quota', 'Claude 可用配额')}
+                                            </span>
+                                        </div>
+                                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${!claudeCard.isTight ? 'bg-cyan-50 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300' : 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'}`}>
+                                            {quotaStatus(claudeCard.val)}
+                                        </span>
+                                    </div>
+
+                                    <div className="flex items-baseline gap-2 mb-2">
+                                        <span className="text-3xl font-extrabold text-gray-900 dark:text-base-content font-mono">
+                                            {formatQuotaPercentage(claudeCard.val)}
+                                        </span>
+                                        <span className="text-[11px] text-gray-400 dark:text-gray-500 font-medium">
+                                            {claudeCard.label}
+                                        </span>
+                                    </div>
+                                </div>
+
+                                <div className="pt-2 border-t border-gray-100 dark:border-base-300/60 flex items-center justify-between text-[11px]">
+                                    <div className="flex items-center gap-1.5">
+                                        <span className="text-gray-400 dark:text-gray-500">{t('dashboard.rolling_5h', '5小时滚动:')}</span>
+                                        <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatQuotaPercentage(stats.claude.avg5h)}</span>
+                                    </div>
+                                    <div className="flex items-center gap-1.5">
+                                        <span className="text-gray-400 dark:text-gray-500">{t('dashboard.weekly_7d', '7天周配额:')}</span>
+                                        <span className={`font-mono font-bold ${(stats.claude.avgWeekly ?? 100) <= 10 ? 'text-amber-600 dark:text-amber-400' : 'text-gray-700 dark:text-gray-300'}`}>{formatQuotaPercentage(stats.claude.avgWeekly)}</span>
+                                    </div>
+                                </div>
+                                {stats.claude.zeroWeeklyCount > 0 && (
+                                    <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5 font-medium flex items-center gap-1">
+                                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                                        <span>{t('dashboard.zero_weekly_warning', { count: stats.claude.zeroWeeklyCount })}</span>
+                                    </div>
+                                )}
+                                {quotaView === '5h' && stats.claude.cappedCount > 0 && stats.claude.zeroWeeklyCount === 0 && (
+                                    <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5 font-medium flex items-center gap-1">
+                                        <AlertTriangle className="w-3 h-3 shrink-0" />
+                                        <span>{stats.claude.cappedCount} 个账号 5H 上限受到周配额压制</span>
+                                    </div>
+                                )}
+                                {quotaView === 'weekly' && stats.claude.coolingCount > 0 && (
+                                    <div className="text-[10px] text-blue-600 dark:text-blue-400 mt-1.5 font-medium flex items-center gap-1">
+                                        <Clock className="w-3 h-3 shrink-0" />
+                                        <span>{stats.claude.coolingCount} 个账号当前处于 5H 冷却冻结中</span>
+                                    </div>
+                                )}
                             </div>
                         </div>
-                        {stats.claude.zeroWeeklyCount > 0 && (
-                            <div className="text-[10px] text-amber-600 dark:text-amber-400 mt-1.5 font-medium flex items-center gap-1">
-                                <AlertTriangle className="w-3 h-3 shrink-0" />
-                                <span>{t('dashboard.zero_weekly_warning', { count: stats.claude.zeroWeeklyCount })}</span>
-                            </div>
-                        )}
-                    </div>
-                </div>
+                    );
+                })()}
 
                 <p className="text-xs text-gray-500">{t('dashboard.quota_explanation', '综合可用取模型、5 小时和周额度中较低的已知剩余比例；下方分别列出两个时间窗口，未知数据不计入平均值。')}</p>
                 {switchFeedback && <div role={switchFeedback.failed ? 'alert' : 'status'} aria-live="polite" className={`rounded-lg p-3 text-sm ${switchFeedback.failed ? 'bg-red-50 text-red-700' : 'bg-blue-50 text-blue-700'}`}>{switchFeedback.message}</div>}
@@ -482,6 +612,7 @@ function Dashboard() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <CurrentAccount
                         account={currentAccount}
+                        quotaView={quotaView}
                         onSwitch={() => navigate('/accounts')}
                     />
                     <BestAccounts

@@ -104,27 +104,8 @@ impl NonStreamingProcessor {
         self.build_response(gemini_response)
     }
 
-    /// 处理单个 part
     fn process_part(&mut self, part: &GeminiPart) {
-        let signature = part.thought_signature.as_ref().map(|sig| {
-            use base64::Engine;
-            match base64::engine::general_purpose::STANDARD.decode(sig) {
-                Ok(decoded_bytes) => {
-                    match String::from_utf8(decoded_bytes) {
-                        Ok(decoded_str) => {
-                            tracing::debug!(
-                                "[Response] Decoded base64 signature (len {} -> {})",
-                                sig.len(),
-                                decoded_str.len()
-                            );
-                            decoded_str
-                        }
-                        Err(_) => sig.clone(), // Not valid UTF-8, keep as is
-                    }
-                }
-                Err(_) => sig.clone(), // Not base64, keep as is
-            }
-        });
+        let signature = part.thought_signature.clone();
 
         // [FIX #765] Cache signature in NonStreamingProcessor
         if let Some(sig) = &signature {
@@ -176,7 +157,7 @@ impl NonStreamingProcessor {
             remap_function_call_args(&tool_name, &mut args);
 
             let mut tool_use = ContentBlock::ToolUse {
-                id: tool_id,
+                id: tool_id.clone(),
                 name: tool_name,
                 input: args.clone(),
                 signature: None,
@@ -185,7 +166,15 @@ impl NonStreamingProcessor {
 
             // 只使用 FC 自己的签名
             if let ContentBlock::ToolUse { signature: sig, .. } = &mut tool_use {
-                *sig = signature;
+                *sig = signature.clone();
+            }
+
+            if let (Some(sig), Some(sid)) = (signature.as_ref(), self.session_id.as_deref()) {
+                crate::proxy::SignatureCache::global().cache_tool_signature(
+                    sid,
+                    &tool_id,
+                    sig.clone(),
+                );
             }
 
             self.content_blocks.push(tool_use);
