@@ -15,6 +15,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{watch, RwLock};
 use tracing::{debug, error};
 
+#[cfg(test)]
+#[path = "server_opus_tests.rs"]
+mod opus_tests;
+
 fn prevent_stale_html(response: &mut Response) {
     let is_html = response
         .headers()

@@ -171,10 +171,7 @@ pub fn is_opus_5_5_eligible(tier: &str, paid: bool) -> bool {
 }
 
 fn is_model_account_eligible(token: &ProxyToken, model: &str) -> bool {
-    !model
-        .trim()
-        .to_ascii_lowercase()
-        .starts_with("claude-opus-5-5")
+    !crate::proxy::model_specs::is_adaptive_thinking_model(model)
         || is_opus_5_5_eligible(
             token.subscription_tier.as_deref().unwrap_or(""),
             token.is_paid_subscription,
@@ -1152,6 +1149,9 @@ impl TokenManager {
         account_id: &str,
         mapped_model: &str,
     ) -> String {
+        let canonical_model =
+            crate::proxy::common::model_mapping::canonicalize_upstream_model_id(mapped_model);
+        let mapped_model = canonical_model.as_str();
         let candidates = match Self::build_dynamic_model_candidates(mapped_model) {
             Some(c) => c,
             None => return mapped_model.to_string(),
@@ -1716,6 +1716,9 @@ impl TokenManager {
         target_model: &str,
         excluded_accounts: &HashSet<String>,
     ) -> Result<(String, String, String, String, u64), String> {
+        let canonical_model =
+            crate::proxy::common::model_mapping::canonicalize_upstream_model_id(target_model);
+        let target_model = canonical_model.as_str();
         let mut tokens_snapshot: Vec<ProxyToken> =
             self.tokens.iter().map(|e| e.value().clone()).collect();
         tokens_snapshot.retain(|token| {
@@ -4298,7 +4301,12 @@ mod tests {
             assert_eq!(is_opus_5_5_eligible(tier, paid), eligible);
             let mut token = create_test_token("test", Some(tier), 1.0, None, Some(100));
             token.is_paid_subscription = paid;
-            for model in ["claude-opus-5-5", "claude-opus-5-5-20261001"] {
+            for model in [
+                "claude-opus-5-5",
+                "claude-opus-5-5-20261001",
+                "anthropic/claude-opus-5-5",
+                "claude-opus-5.5",
+            ] {
                 assert_eq!(is_model_account_eligible(&token, model), eligible);
             }
             assert!(is_model_account_eligible(&token, "claude-opus-4-6"));
@@ -4324,6 +4332,8 @@ mod tests {
             account["id"] = serde_json::json!(id);
             account["email"] = serde_json::json!(format!("{id}@example.test"));
             account["quota"]["subscription_tier"] = serde_json::json!(tier);
+            account["quota"]["model_forwarding_rules"] =
+                serde_json::json!({"opus-eligibility-retired-test":"anthropic/claude-opus-5.5"});
             if let Some(paid) = paid {
                 account["quota"]["is_paid_subscription"] = serde_json::json!(paid);
             }
@@ -4350,30 +4360,48 @@ mod tests {
             .session_accounts
             .insert("session".to_string(), "trial".to_string());
         let mut excluded = HashSet::new();
-        for expected in ["ultra", "paid"] {
-            let (_, _, _, selected, _) = manager
+        let custom = HashMap::from([("client-opus".into(), "anthropic/claude-opus-5.5".into())]);
+        let canonical =
+            crate::proxy::common::model_mapping::resolve_model_route("client-opus", &custom);
+        manager.get_all_collected_models();
+        let forwarded = crate::proxy::common::model_mapping::resolve_model_route(
+            "opus-eligibility-retired-test",
+            &HashMap::new(),
+        );
+        assert_eq!(forwarded, "claude-opus-5-5");
+        for model in [
+            "claude-opus-5-5-20261001",
+            "anthropic/claude-opus-5-5",
+            "claude-opus-5.5",
+            canonical.as_str(),
+            forwarded.as_str(),
+        ] {
+            excluded.clear();
+            for _ in 0..2 {
+                let (_, _, _, selected, _) = manager
+                    .get_token_filtered("claude", false, Some("session"), model, &excluded)
+                    .await
+                    .unwrap();
+                assert!(matches!(selected.as_str(), "ultra" | "paid"));
+                assert!(excluded.insert(selected));
+            }
+            assert_eq!(
+                excluded,
+                HashSet::from(["ultra".to_string(), "paid".to_string()])
+            );
+            assert!(manager
                 .get_token_filtered(
                     "claude",
                     false,
                     Some("session"),
-                    "claude-opus-5-5-20261001",
+                    "claude-opus-5-5",
                     &excluded,
                 )
                 .await
-                .unwrap();
-            assert_eq!(selected, expected);
-            assert!(excluded.insert(selected));
+                .is_err());
         }
-        assert!(manager
-            .get_token_filtered(
-                "claude",
-                false,
-                Some("session"),
-                "claude-opus-5-5",
-                &excluded,
-            )
-            .await
-            .is_err());
+        crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
+            .remove("opus-eligibility-retired-test");
         let (_, _, _, selected, _) = manager
             .get_token_filtered("claude", false, None, "claude-sonnet-4-6", &excluded)
             .await

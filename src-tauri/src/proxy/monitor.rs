@@ -93,7 +93,13 @@ pub(crate) mod prompt_log_tests {
         let mut log = sample_log("opus-disabled", 100);
         log.status = 200;
         log.model = Some("claude-opus-5-5".into());
-        log.mapped_model = Some("claude-opus-5-5".into());
+        log.mapped_model = Some(crate::proxy::common::model_mapping::resolve_model_route(
+            "client-opus",
+            &std::collections::HashMap::from([(
+                "client-opus".into(),
+                "anthropic/claude-opus-5.5".into(),
+            )]),
+        ));
         log.account_email = Some("opus@example.test".into());
         log.input_tokens = Some(1_500);
         log.output_tokens = Some(250);
@@ -110,6 +116,14 @@ pub(crate) mod prompt_log_tests {
         })
         .await
         .expect("token writer did not finish");
+        let conn = rusqlite::Connection::open(crate::modules::token_stats::get_db_path().unwrap())
+            .unwrap();
+        let billing_model: String = conn
+            .query_row("SELECT billing_model FROM token_usage", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(billing_model, "claude-opus-5-5");
         let models = crate::modules::token_stats::get_model_stats(1).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model, "claude-opus-5-5");

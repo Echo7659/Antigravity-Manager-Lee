@@ -94,7 +94,7 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
 /// 旧客户端仍在请求带点号的 Claude 版本（`claude-opus-4.6`、`claude-sonnet-4.5`、
 /// `claude-open-4.x`）。服务端目录只认连字符形态（`claude-opus-4-6` 等）。
 /// 这里只改写 Claude ID：去掉供应商标前缀，把短版本号里的点换成连字符。
-fn canonicalize_claude_client_model_id(input: &str) -> String {
+pub fn canonicalize_upstream_model_id(input: &str) -> String {
     let mut id = input.trim().to_lowercase();
     for prefix in ["anthropic/", "models/"] {
         if let Some(rest) = id.strip_prefix(prefix) {
@@ -180,7 +180,7 @@ fn legacy_claude_family_target(id: &str) -> Option<&'static str> {
 /// 2. **已知前缀透传**: gemini-* 和 *-thinking 模型直接透传
 /// 3. **[NEW] 直接透传**: 未知模型 ID 直接传递给 Google API (支持体验未发布模型)
 pub fn map_claude_model_to_gemini(input: &str) -> String {
-    let canonical = canonicalize_claude_client_model_id(input);
+    let canonical = canonicalize_upstream_model_id(input);
 
     // 1. 精确匹配标准映射表
     if let Some(mapped) = CLAUDE_TO_GEMINI.get(canonical.as_str()) {
@@ -481,13 +481,16 @@ pub fn resolve_configured_model_route(
 ) -> Option<String> {
     // 0. API 热更新废弃模型转发 (最高物理优先级，强制纠正)
     // 如果用户非要用已经被移除的模型，并且官方下发了 fallback path，我们在此拦截并纠正
-    if let Some(forwarded) = DYNAMIC_MODEL_FORWARDING_RULES.get(original_model) {
+    let canonical = canonicalize_upstream_model_id(original_model);
+    if DYNAMIC_MODEL_FORWARDING_RULES.contains_key(original_model)
+        || DYNAMIC_MODEL_FORWARDING_RULES.contains_key(&canonical)
+    {
+        let forwarded = resolve_forwarded_upstream_model(original_model);
         crate::modules::logger::log_info(&format!(
             "[Router] 官方淘汰重定向: {} -> {}",
-            original_model,
-            forwarded.value()
+            original_model, forwarded
         ));
-        return Some(forwarded.value().clone());
+        return Some(forwarded);
     }
 
     // 1. 精确匹配 (次高优先级)
@@ -496,7 +499,7 @@ pub fn resolve_configured_model_route(
             "[Router] 精确映射: {} -> {}",
             original_model, target
         ));
-        return Some(target.clone());
+        return Some(resolve_forwarded_upstream_model(target));
     }
 
     // 1.5 [NEW] 检查是否命中自定义映射中的通配符规则 `gemini-3.x-flash`（要求 x > 8）
@@ -533,10 +536,28 @@ pub fn resolve_configured_model_route(
             "[Router] Wildcard match: {} -> {} (rule: {})",
             original_model, target, pattern
         ));
-        return Some(target.to_string());
+        return Some(resolve_forwarded_upstream_model(target));
     }
 
     None
+}
+
+/// 解析转发链后固定上游 ID；循环规则停在重复节点，不重复应用客户端映射。
+fn resolve_forwarded_upstream_model(input: &str) -> String {
+    let mut current = input.to_string();
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(current.clone()) {
+        let canonical = canonicalize_upstream_model_id(&current);
+        let next = DYNAMIC_MODEL_FORWARDING_RULES
+            .get(&current)
+            .or_else(|| DYNAMIC_MODEL_FORWARDING_RULES.get(&canonical))
+            .map(|entry| entry.value().clone());
+        match next {
+            Some(next) => current = next,
+            None => return canonical,
+        }
+    }
+    canonicalize_upstream_model_id(&current)
 }
 
 pub fn resolve_model_route(
@@ -544,6 +565,49 @@ pub fn resolve_model_route(
     custom_mapping: &std::collections::HashMap<String, String>,
 ) -> String {
     resolve_model_route_with_effort(original_model, custom_mapping, None)
+}
+
+#[cfg(test)]
+mod opus_route_tests {
+    use super::*;
+
+    #[test]
+    fn opus_5_5_protocol_configured_targets_are_canonical_before_selection() {
+        let aliases = [
+            "claude-opus-5-5",
+            "anthropic/claude-opus-5-5",
+            "claude-opus-5.5",
+        ];
+        for alias in aliases {
+            let mapping = HashMap::from([("client-opus".to_string(), alias.to_string())]);
+            assert_eq!(
+                resolve_configured_model_route("client-opus", &mapping).as_deref(),
+                Some("claude-opus-5-5")
+            );
+            assert_eq!(
+                resolve_model_route("client-opus", &mapping),
+                "claude-opus-5-5"
+            );
+            assert_eq!(
+                resolve_model_route(alias, &HashMap::new()),
+                "claude-opus-5-5"
+            );
+        }
+        let key = "test-opus-retired-canonical";
+        DYNAMIC_MODEL_FORWARDING_RULES.insert(key.into(), "anthropic/claude-opus-5.5".into());
+        let direct = resolve_model_route(key, &HashMap::new());
+        let chained = resolve_model_route(
+            "client-opus",
+            &HashMap::from([("client-opus".into(), key.into())]),
+        );
+        DYNAMIC_MODEL_FORWARDING_RULES.remove(key);
+        assert_eq!(direct, "claude-opus-5-5");
+        assert_eq!(chained, "claude-opus-5-5");
+        assert_eq!(
+            resolve_model_route("provider/future-model-9", &HashMap::new()),
+            "provider/future-model-9"
+        );
+    }
 }
 
 /// 解析显式路由后，根据客户端思考档位选择系统默认模型。
@@ -577,7 +641,7 @@ pub fn resolve_model_route_with_effort(
         return routed;
     }
 
-    let result = map_claude_model_to_gemini(original_model);
+    let result = resolve_forwarded_upstream_model(&map_claude_model_to_gemini(original_model));
     if result != original_model {
         crate::modules::logger::log_info(&format!(
             "[Router] 系统默认映射: {} -> {}",

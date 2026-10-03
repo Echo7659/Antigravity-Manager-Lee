@@ -844,6 +844,9 @@ mod tests {
 
     #[test]
     fn pricing_opus_5_5_includes_model_specific_cache_price() {
+        for alias in ["anthropic/claude-opus-5-5", "claude-opus-5.5"] {
+            assert_eq!(price_for_model(alias), price_for_model("claude-opus-5-5"));
+        }
         assert_eq!(
             price_for_model("claude-opus-5-5"),
             Some(ModelPrice {

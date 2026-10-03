@@ -5,9 +5,7 @@ use std::collections::HashMap;
 
 /// 标识只接受自适应思考的模型，不修改路由 ID。
 pub fn is_adaptive_thinking_model(model: &str) -> bool {
-    model
-        .trim()
-        .to_ascii_lowercase()
+    crate::proxy::common::model_mapping::canonicalize_upstream_model_id(model)
         .starts_with("claude-opus-5-5")
 }
 
