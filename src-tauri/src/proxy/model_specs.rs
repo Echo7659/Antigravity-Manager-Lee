@@ -429,22 +429,28 @@ pub fn resolve_bare_flash_route(model: &str, client_effort: Option<&str>) -> Opt
     Some(routed)
 }
 
-/// 检查模型是否匹配 `gemini-3.x-flash` 通配符且 x > 8（例如 gemini-3.9-flash, gemini-3.10-flash 等）。
-/// 若匹配且 x > 8，统一转为 3.x-flash-tiered 模型（如 "gemini-3.9-flash-tiered"）。
-/// 严格要求：x 必须大于 8，对于 3.6 / 3.7 / 3.8 等模型由专用预设接管，3.5 及其以下严格排除。
-pub fn resolve_gemini_3x_flash_tiered(model: &str) -> Option<String> {
-    let lower = model.to_lowercase();
-    let prefix = "gemini-3.";
-    let suffix = "-flash";
-    if lower.starts_with(prefix) && lower.ends_with(suffix) {
-        let middle = &lower[prefix.len()..lower.len() - suffix.len()];
-        if let Ok(x) = middle.parse::<f32>() {
-            if x > 8.0 {
-                return Some(format!("gemini-3.{}-flash-tiered", middle));
-            }
-        }
+/// 将高于 3.8 的未来 Gemini Flash 裸版本路由到同版本 Tiered 模型。
+/// 版本必须是 `major.minor[.patch...]` 整数段；3.5 至 3.8 仍由现有思考档位预设处理。
+pub fn resolve_future_gemini_flash_tiered(model: &str) -> Option<String> {
+    let lower = model.to_ascii_lowercase();
+    let version = lower.strip_prefix("gemini-")?.strip_suffix("-flash")?;
+    let segments: Vec<&str> = version.split('.').collect();
+
+    if segments.len() < 2
+        || segments
+            .iter()
+            .any(|segment| segment.is_empty() || !segment.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
     }
-    None
+
+    let major = segments[0].parse::<u32>().ok()?;
+    let minor = segments[1].parse::<u32>().ok()?;
+    if major > 3 || (major == 3 && minor > 8) {
+        Some(format!("{lower}-tiered"))
+    } else {
+        None
+    }
 }
 
 /// 依据系统 Thinking Budget 配置以及当前模型与请求参数，在协议归一化后统一解析应当发送到上游的思考预算。
@@ -983,32 +989,49 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_gemini_3x_flash_tiered_wildcard() {
-        // x > 8 命中转为 3.x-flash-tiered
+    fn test_resolve_future_gemini_flash_tiered_wildcard() {
+        // 3.8 以上的裸 Flash 版本转为同版本 Tiered。
         assert_eq!(
-            resolve_gemini_3x_flash_tiered("gemini-3.9-flash"),
+            resolve_future_gemini_flash_tiered("gemini-3.9-flash"),
             Some("gemini-3.9-flash-tiered".to_string())
         );
         assert_eq!(
-            resolve_gemini_3x_flash_tiered("gemini-3.10-flash"),
+            resolve_future_gemini_flash_tiered("gemini-3.10-flash"),
             Some("gemini-3.10-flash-tiered".to_string())
         );
         assert_eq!(
-            resolve_gemini_3x_flash_tiered("gemini-3.9.1-flash"),
+            resolve_future_gemini_flash_tiered("gemini-3.9.1-flash"),
             Some("gemini-3.9.1-flash-tiered".to_string())
         );
-
-        // x <= 8 必须返回 None，严格由专用映射接管
-        assert_eq!(resolve_gemini_3x_flash_tiered("gemini-3.8-flash"), None);
-        assert_eq!(resolve_gemini_3x_flash_tiered("gemini-3.7-flash"), None);
-        assert_eq!(resolve_gemini_3x_flash_tiered("gemini-3.6-flash"), None);
-        assert_eq!(resolve_gemini_3x_flash_tiered("gemini-3.5-flash"), None);
-
-        // 已经带有后缀或非 flash 模型不命中
         assert_eq!(
-            resolve_gemini_3x_flash_tiered("gemini-3.9-flash-high"),
-            None
+            resolve_future_gemini_flash_tiered("gemini-4.0-flash"),
+            Some("gemini-4.0-flash-tiered".to_string())
         );
-        assert_eq!(resolve_gemini_3x_flash_tiered("gemini-3.9-pro"), None);
+
+        // 3.5 至 3.8 必须交给现有的档位预设。
+        for model in [
+            "gemini-3.5-flash",
+            "gemini-3.6-flash",
+            "gemini-3.7-flash",
+            "gemini-3.8-flash",
+        ] {
+            assert_eq!(resolve_future_gemini_flash_tiered(model), None);
+        }
+
+        // 显式档位、其他模型类型和畸形版本不属于裸 Flash 路由。
+        for model in [
+            "gemini-4.0-flash-high",
+            "gemini-4.0-flash-medium",
+            "gemini-4.0-flash-low",
+            "gemini-4.0-flash-tiered",
+            "gemini-4.0-pro",
+            "gemini-4.0-flash-image",
+            "gemini-4-flash",
+            "gemini-4..0-flash",
+            "gemini-4.x-flash",
+            "gemini-4.0.-flash",
+        ] {
+            assert_eq!(resolve_future_gemini_flash_tiered(model), None);
+        }
     }
 }

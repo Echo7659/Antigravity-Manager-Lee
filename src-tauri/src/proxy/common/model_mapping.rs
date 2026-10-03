@@ -441,14 +441,13 @@ pub fn resolve_configured_model_route(
         return Some(resolve_forwarded_upstream_model(target));
     }
 
-    // 1.5 [NEW] 检查是否命中自定义映射中的通配符规则 `gemini-3.x-flash`（要求 x > 8）
-    // 统一转为 3.x-flash-tiered 模型
+    // 1.5 保留 `gemini-3.x-flash` 配置键的兼容性，并将高于 3.8 的未来 Flash 裸版本转为 Tiered。
     if custom_mapping.contains_key("gemini-3.x-flash") {
         if let Some(target) =
-            crate::proxy::model_specs::resolve_gemini_3x_flash_tiered(original_model)
+            crate::proxy::model_specs::resolve_future_gemini_flash_tiered(original_model)
         {
             crate::modules::logger::log_info(&format!(
-                "[Router] 命中内置通配符规则 gemini-3.x-flash (x > 8): {} -> {}",
+                "[Router] 命中未来 Gemini Flash Tiered 路由: {} -> {}",
                 original_model, target
             ));
             return Some(target);
@@ -1130,7 +1129,7 @@ mod tests {
             "gemini-3.8-flash-tiered"
         );
 
-        // 2. x > 8 命中通配符规则 gemini-3.x-flash，统一转为 3.x-flash-tiered
+        // 2. 高于 3.8 的未来裸 Flash 版本统一转为同版本 Tiered。
         assert_eq!(
             resolve_model_route("gemini-3.9-flash", &custom),
             "gemini-3.9-flash-tiered"
