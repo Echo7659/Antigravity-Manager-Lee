@@ -1,154 +1,150 @@
-# Antigravity Tools 发版操作指南 (Release SOP)
+# Antigravity Manager Lee 发布指南
 
-发版详细规程。提交门禁与发版红线以根目录 `AGENTS.md` 为准。
+本指南适用于 Linux 服务与 Web 管理面板。提交、审查与发布治理以根目录 `AGENTS.md` 为准；可执行门禁以 `.github/workflows/ci.yml`、`scripts/release_metadata.py` 和 `scripts/build_release_assets.py` 为准。
 
----
+## 发布通道
 
-## 一、流程概览
+| 通道 | 分支与来源约束 | 版本 / 标签 | 发布行为 |
+| --- | --- | --- | --- |
+| 正式版 | `main`；commit 必须属于 `origin/main` | `X.Y.Z` / `vX.Y.Z` | 正式标签才更新 GHCR latest 与 GitHub Latest Release |
+| 预览版 | `beta`；commit 必须属于 `origin/beta` | `X.Y.Z-beta.N` / `vX.Y.Z-beta.N` | prerelease=true、makeLatest=false，不更新 latest |
 
-```text
-[通道 A: 正式版发布]
-Pre-flight ─► checkout main ─► npm run bump <patch|minor> ─► 补充日志 ─► git push origin main ─► 打 Tag vX.Y.Z ─► 自动发布 Latest Release
+“属于”表示 commit 在对应远程分支的 Git 历史中可达，不要求已发布标签一直停留在不断前进的分支末端。版本号各数字段不得带前导零；beta 序号必须完整。发布门禁只接受表中的两种格式。
 
-[通道 B: Beta 预发布]
-Pre-flight ─► checkout beta ─► npm run bump beta ──────────► 补充日志 ─► git push origin beta ─► 打 Tag vX.Y.Z-beta.N ─► 自动发布 Pre-release (隔离无感)
-```
+main/beta 的 push 与 PR 都触发测试；PR 不发布镜像。合法分支构建仅发布 SHA 镜像，不创建 GitHub Release。完整版本标签通过校验后，才发布对应标签镜像与 Release。手动触发工作流也必须满足相同的分支、版本和来源约束。
 
-> **通道隔离与维护者协作原则**：
-> - **正式版通道 (Main)**：`main` 为**绝对纯净正式打版分支**，仅发布纯数字正式版本（如 `v4.7.14`），流水线严格拦截任何带 `-` 的预发标签。
-> - **预览版通道 (Beta)**：`beta` 为**独立预发布打版分支**，所有预发测试版本（如 `v4.7.14-beta.1`、`-cleaned` 等）在此提交并由 `beta` 触发独立构建。预发布产物自动标记为 Pre-release 且绝不打 Latest，完全不影响正式版主用户更新。
-> - **新更改优先暂存验证 (Staging on Beta First)**：凡涉及新功能、重大重构或高风险修复，**必须主动询问维护者**是否先在 `beta` 分支进行修改与验证。待验证稳定（或发布 Beta 预览版内测确认）后，方可合并进入 `main`。
+新功能、重大重构或非平凡修复按维护者暂存规则确认是否先在 beta 实施和验证；已有明确授权时沿用该决定。验证稳定后再按审查流程进入 main。开发分支从 `origin/beta` 或已获授权的 `origin/main` 建立，避免携带本地未审查祖先提交。
 
----
+## 1. 选择发布提交并同步版本
 
-## 二、操作步骤
+先检查 remote、tracking、工作树和已有 PR，确认目标分支。工作树包含无关改动时不要直接暂存全部文件；更新目标分支使用 `git fetch` 和 `git pull --ff-only`。不得通过隐式 merge、强推或移动已发布标签解决发布分歧。
 
-### 第 0 步：发版前预检 (Pre-flight)
+`npm run bump` 同步版本文件并生成更新日志骨架：
 
-确保工作区干净，且**对将被标记的提交**执行与 CI 完全一致的预检命令：
-
-```bash
-git checkout main && git pull origin main
-git status          # 应显示 nothing to commit, working tree clean
-
-cd src-tauri
-cargo fmt -- --check
-cargo clippy --all-targets --all-features
-cd ..
-npm run build
-```
-
-> CI 门禁已全量覆盖 `main` 与 `beta` 分支。正式发布前确保在 `main` 预检通过，Beta 预发前确保在 `beta` 预检通过。
-
-### 第 1 步：版本号原子同步
-
-`scripts/bump-version.mjs` 一键同步全仓库版本号并生成 CHANGELOG 骨架：
-
-| 场景 | 命令 | 示例 |
+| 操作 | 命令 | 适用通道 |
 | --- | --- | --- |
-| 补丁（Bugfix / 性能） | `npm run bump patch` | 4.7.13 → 4.7.14 |
-| 次版本（新增特性） | `npm run bump minor` | 4.7.13 → 4.8.0 |
-| 主版本（破坏性变更） | `npm run bump major` | 4.7.13 → 5.0.0 |
-| 预发布递增 | `npm run bump beta` | 4.7.13 → 4.7.14-beta.1（beta.1 → beta.2） |
-| 指定衍生版本 | `npm run bump 4.7.14-cleaned` | 同基线双版本（`-beta` / `-cleaned` / `-rc`） |
-| 指定任意合法 SemVer | `npm run bump 4.8.0` | — |
+| 补丁升级；已有 beta 转同号正式版 | `npm run bump patch` | main |
+| 次版本 / 主版本升级 | `npm run bump minor` / `npm run bump major` | main |
+| 开启下一补丁预览或递增 beta 序号 | `npm run bump beta` | beta |
+| 指定正式版本 | `npm run bump X.Y.Z` | main；将占位符替换为目标版本 |
+| 指定预览版本 | `npm run bump X.Y.Z-beta.N` | beta；填写完整数字序号 |
 
-**可选参数**：`--dry-run` 仅演练、不写盘；`--commit` 自动生成 `chore(release): bump version to ...` 提交。
+可先追加 `-- --dry-run` 检查拟更新内容。脚本的分支提示不等于发布授权，也不能代替严格发布门禁；即使脚本接受某个输入，发布仍必须符合上表格式。确认目标版本高于当前已发布版本，禁止复用既有标签。
 
-**同步范围**：`package.json`、`package-lock.json`（根版本镜像，两处）、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`、`src-tauri/tauri.conf.json`、`Casks/antigravity-tools.rb`、`README.md`、`README_EN.md`、`src/components/layout/MiniView.tsx`、`src/pages/Settings.tsx`、`CHANGELOG.md`、`CHANGELOG_EN.md`。
+同步目标为：
 
-> 版本串匹配采用**结构锚定**而非精确匹配当前版本号：`package-lock.json` 按字段位置锚定，README 按 `(v数字…)` / `Version-数字…-blue` 形态锚定。这样即使历史轮次（如预发布跳过 README）造成版本串滞后，下一轮同步仍能正确命中。
+- `package.json` 与 `package-lock.json` 的两个根版本；
+- `src-tauri/Cargo.toml`、`src-tauri/Cargo.lock`；
+- Web 设置页 `src/pages/Settings.tsx` 中的版本显示；
+- `CHANGELOG.md`、`CHANGELOG_EN.md`；
+- 正式版本的 `README.md`、`README_EN.md`、`README_ZH.md` 标题。
 
-**内置防呆**：目标版本必须严格高于当前版本，否则红色拦截，杜绝版本回退。
+beta 不更新 README 中最新正式版的版本号与摘要。脚本只负责版本同步和日志骨架，不负责写完发布内容或验收；完成后必须检查 diff，不得把脚本成功当作发布成功。
 
-**预发布版本号形态**：`npm run bump beta` 生成 `X.Y.Z-beta.N`（首次为 `beta.1`，后续递增为 `beta.2`）。该版本串同时决定脚本插入的 CHANGELOG 骨架标题与后续 Tag 名，**三者必须完全一致**（详见第 2 步提示与第 4 步）。
+## 2. 补齐变更说明与贡献者归属
 
-### 第 2 步：回溯提交与补充更新日志
+选择正确的上次发布标签，完整审计 `<last-tag>..HEAD` 的 Git 历史、作者、`Co-authored-by:` trailers、已合并 PR 及关联 Issue。PR 列表应覆盖整个发布区间，不能只依赖固定数量的最近记录。
 
-在填写更新日志前，**必须以 Git 提交历史与已合入 PR 为客观事实依据进行完整回溯**，严防遗漏贡献者署名或 Issue 关联：
+两份 changelog 的版本标题必须与将发布的 tag 逐字符一致，包括 `v` 和完整 beta 后缀。例如可使用 `## vX.Y.Z`，或既有列表格式 `**vX.Y.Z-beta.N (日期)**`，其中版本占位符必须替换为实际值。CI 会拒绝缺失或不匹配的标题，不会降级为占位发布文案。
 
-```bash
-# 1. 扫描上个版本以来的全部提交、Author 与 Co-Authored-By 署名
-git log $(git describe --tags --abbrev=0)..HEAD --format="Commit: %h | %an <%ae> | %s%n%(trailers:key=Co-Authored-By)"
+每项变更注明问题、最终行为、影响范围和未验证路径；关联对应的 `Fixes #xxx`、`PR #xxx`。识别出的外部贡献者在对应条目行内使用 `Thanks to @username` 致谢。优先使用贡献者自己的 PR 完成 squash；代理合入时保留作者或明确的 `Co-authored-by:`。不能把工具与文档缺口归责于贡献者。
 
-# 2. 列出在此期间合并的 PR 与关联 Issue
-gh pr list --state merged --limit 20
+正式发布还必须人工同步 README 首页的更新摘要：
+
+- `README.md` 与 `README_EN.md` 的 `## 📝 Changelog`；
+- `README_ZH.md` 的 `## 📝 更新日志`。
+
+beta 内容只进入两份 changelog，不写入正式版 README 摘要。当前 Release 说明由部署包脚本生成并引用版本历史，不自动从 changelog 抽取所有条目，也未启用自动追加贡献者列表；因此必须确保仓库内的双语归属记录完整。
+
+每个 PR 保持单一问题范围，提交可独立回退。发版基建与无关功能分开审查；提交说明只描述最终实现。完成 PR 模板中的行为变化、未验证路径和回滚策略，并经过同行审查后再合入目标分支。
+
+## 3. 在精确候选提交上执行门禁
+
+版本与说明准备完成后提交并冻结候选 commit，再在该 commit 上执行检查。后续若有任何源文件变化，应重新执行受影响的检查。Rust 使用 1.96、edition 2024，Web 构建使用 Node 20。
+
+```sh
+bash scripts/check_server_only.sh
+python3 scripts/test_release_metadata.py
+python3 scripts/test_ci_smoke.py
+npm ci --legacy-peer-deps
+npm run test:dashboard
+npm run build
+cargo +1.96.0 fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo +1.96.0 check --locked --manifest-path src-tauri/Cargo.toml --all-targets
+cargo +1.96.0 clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets --all-features
 ```
 
-根据盘点结果，在脚本插入的版本骨架中填写核心亮点：
+CI 还在镜像发布前执行：
 
-- **强制关联 Issue / PR**：条目标题必须包含对应的来源单号（如 `(PR #3504)` 或 `(Fixes #3499, #3501)`）；
-- **强制行内致谢贡献者**：从提交历史和 PR 中识别出的所有外部贡献者，必须以 `(Thanks to @username)` 形式显式标注在对应条目上。Release 页面的 **Contributors 头像列表由此自动提取生成**；
-- **格式示例**：
-```markdown
-*   **版本演进**:
-    *   **v4.7.14 (2026-09-23)**:
-        -   **[核心分类] 功能重构与优化 (PR #3504)**:
-            -   **功能详述**: 核心实现说明。
-        -   **[核心分类] 涉及外部贡献的修复 (Fixes #3508, Thanks to @username)**:
-            -   **功能详述**: 致谢与修复说明。
+- `server_runtime_`、`admin_model_catalog_`、`legacy_desktop_fields_are_ignored` 定向测试；
+- `cargo test --locked --manifest-path src-tauri/Cargo.toml --lib modules::proxy_db:: -- --test-threads=1`；
+- 由 `scripts/prepare_compat_tests.py` 从当前源码生成的独立兼容性 harness，覆盖 `request_compat`、`compat_` 与 `proxy::pipeline`。
+
+状态与数据库测试使用临时数据并串行执行；不对生产数据运行测试。采用定向回归，不要求本地全量测试。若本机缺少容器运行环境或空间不足，记录未执行项，由 Linux CI 完成镜像验证；不能把脚本 fixture 通过写成容器验收通过。
+
+## 4. 推送目标分支并发布标签
+
+只提交已审查的发布文件，推送所选 main 或 beta 分支，并等待该精确 commit 的分支 CI 通过。随后再次 fetch、核对远端分支包含候选 commit，确认版本和 changelog 未变化。
+
+以下命令仅在候选 commit、通道和发布操作均已获授权后执行：
+
+```sh
+release_commit="$(git rev-parse HEAD)"
+release_version="$(node -p "require('./package.json').version")"
+release_tag="v${release_version}"
+git tag "$release_tag" "$release_commit" && \
+GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$release_tag" \
+  GITHUB_SHA="$release_commit" GITHUB_REPOSITORY=Echo7659/Antigravity-Manager-Lee \
+  GITHUB_OUTPUT=/dev/null python3 scripts/release_metadata.py && \
+git push origin "$release_tag"
 ```
 
-> 1. **标题必须与 Tag 逐字符一致**：流水线用 `awk` 以 tag 名（`github.ref_name`，含 `v` 前缀）匹配 CHANGELOG 标题行，**`v` 前缀与完整预发布后缀都要一字不差**。`npm run bump beta` 自增出的版本号形如 `X.Y.Z-beta.1`，因此 Tag 应为 `vX.Y.Z-beta.1`（而非 `vX.Y.Z-beta`），标题也须写成 `**vX.Y.Z-beta.1 (日期)**`。不匹配时正文会静默退化为占位文案 `See the assets to download this version and install.`。
-> 2. 已开启 `generateReleaseNotes: true`，GitHub 会自动追加 `What's Changed` 与 `New Contributors`（含 PR 链接与贡献者主页）。
-> 3. **测试版不进入 README**：Tag 含 `-` 的预发布 / 衍生版本（`-beta` / `-cleaned` / `-rc` 等）**只在 `CHANGELOG.md` 记录**，不得写入任何 README 的版本号、Shields 徽章或「最新版本」段落。README 始终只反映最新**正式版**。`bump-version.mjs` 已内置该判定：预发布版本自动跳过两个 README，仅同步其余版本配置文件。
-> 4. **贡献者致谢写在条目行内**：不单列致谢块，外部贡献者统一以 `(Thanks to @username)` 标注在对应条目上。Release 页的 **Contributors 头像列表由正文中的 `@username` 自动生成** —— 增删提及即增删头像，条目内没有 `@username` 时该列表为空。
-> 5. **正式版发版强制同步双语 README 更新日志**：发布正式版时，除了更新 `CHANGELOG.md`（及 `CHANGELOG_EN.md`），还必须同步将最新正式版的重要更新摘要更新至 `README.md`（`## 📝 更新日志`）与 `README_EN.md`（`## 📝 Changelog`），严禁仅更新 CHANGELOG 而遗漏 README 首页的最新版本说明。
+在推送标签前，必须确认本地校验成功。若失败，停止发布，修正来源、版本或日志问题；不要继续执行后面的 push。CI 会在任何镜像 push 前再次检查：
 
-### 第 3 步：提交并推送目标分支
+1. checkout 的 HEAD 等于 GITHUB_SHA，且属于版本对应的 origin/main 或 origin/beta；
+2. Web、npm lock、Cargo manifest 与 Cargo lock 版本完全相等；
+3. 两份 changelog 存在完整版本标题；
+4. tag 精确等于 `v` 加版本，且指向同一 commit。
 
-```bash
-# 正式版：提交并推送到 main 分支
-git checkout main
-git add -A
-git commit -m "chore(release): bump version to 4.7.14 and update changelog"
-git push origin main
+不得通过修改已发布 tag 绕过门禁。若必须改写共享历史，先检查进行中的 PR、保留本地 `backup/*` 回滚引用，并遵守维护者授权与零内容漂移核对要求。
 
-# Beta 预发版：提交并推送到 beta 分支（严禁推到 main，保持 main 纯净）
-git checkout beta
-git add -A
-git commit -m "chore(release): bump version to 4.7.14-beta.1 and update changelog"
-git push origin beta
-```
+## 5. CI 镜像与发布包验收
 
-### 第 4 步：打 Tag 并推送
+工作流名称为 **Test, Publish Image and Release**，唯一镜像构建入口是 `docker/Dockerfile`。发布目标为 `ghcr.io/echo7659/antigravity-manager-lee` 的 **linux/amd64** 镜像。
 
-```bash
-# 正式版：从 main 打纯数字 Tag（触发正式发布，更新 Latest）
-git tag v4.7.14
-git push origin v4.7.14
+构建层使用 Node 20、Rust 1.96 及实际原生依赖；git 用于 boring-sys2 构建时的 init/apply。最终运行层执行 ldd 缺库检查。CI 构建并加载镜像后启动无账号临时容器，验证：
 
-# Beta 预发版：从 beta 打预发布 Tag（触发隔离构建，不更新 Latest）
-git tag v4.7.14-beta.1
-git push origin v4.7.14-beta.1
-```
+- health 状态与版本；
+- 管理接口未鉴权返回 401，管理密码鉴权成功；
+- 动态模型目录结构；
+- index.html 与 JS/CSS 资源；
+- 已删除 API 返回 404；
+- 容器自身 health check 最终为 healthy。
 
-> Tag 串必须与 CHANGELOG 中该版本的标题**逐字符相同**（`v` 前缀 + 完整预发布后缀），否则 Release 正文会退化为占位文案。
+全部通过后，CI 给**同一个已验证镜像**打 SHA/版本标签并推送，不重新构建另一个待发布镜像。只有正式标签更新 latest；beta 的 GitHub Release 明确设置 prerelease=true、makeLatest=false。
 
-**分支与标签严格门禁**：流水线内置分支与标签匹配断言。
-- 带有 `-` 的预发布 Tag 若打在 `main` 独有提交上，流水线立即拦截阻断，拒绝构建与发布；
-- 不带 `-` 的正式版 Tag 若打在 `beta` 独有提交上，流水线立即拦截阻断。
-- 预发布版本自动降级为 NSIS、不更新 Latest、不更新正式用户的 `updater.json`，主用户客户端绝不受任何影响。
+标签发布生成：
 
-### 第 5 步：验收
+- `antigravity-manager-lee-<完整 tag>-deployment.tar.gz`；
+- `image-manifest.json`，记录完整 tag、版本、通道、精确源 commit、平台与镜像 digest；
+- `SHA256SUMS`，用于校验部署归档。
 
-推送 Tag 后流水线自动接管，无需人工干预：
+归档包含固定镜像 digest 的 compose、空凭据模板、manifest 与部署说明，不包含业务数据或真实密钥。发布验收必须核对 Actions 成功记录、Release 附件、归档校验值以及 `ghcr.io/echo7659/antigravity-manager-lee@sha256:...`；不能只核对可变镜像标签。
 
-1. **进度**：仓库 `Actions` 页的 `Release` 工作流；
-2. **构建矩阵**：Windows（`.msi` / NSIS `.exe`）、macOS（`.dmg`，Apple Silicon 与 Intel 双架构）、Linux（`.AppImage` / `.deb` / `.rpm`）、Docker 多架构镜像推送 Docker Hub；产出 `updater.json`（配置 `TAURI_SIGNING_PRIVATE_KEY` 时含签名）；
-3. **验收**：约 10~15 分钟后在 `Releases` 页确认 `Antigravity Tools vX.Y.Z` 及附件齐全。
+## 6. 精确 digest 部署与回滚
 
----
+生产部署仅使用通过全部 CI 的精确 commit 和 GHCR digest。部署操作需要相应授权，发布成功本身不代表已部署。
 
-## 三、异常与救急
+部署前记录旧镜像 digest、端口、环境变量、宿主数据路径与账号数量，并保留旧镜像。对原数据目录制作一致性备份；SQLite、账号 JSON、凭据、配置与代理绑定成套保留。容器端口维持 8045，数据挂载目标维持 `/root/.antigravity_tools`。
 
-### 1. 删除误打的 Tag
+使用仓库 release compose 时，在 `.env` 中设置已验证的 `IMAGE_DIGEST`；使用发布归档时，compose 已直接固定 digest。两种方式均保持原 `ABV_HOST_DATA_DIR`、密钥和挂载，不用空目录覆盖原数据。具体启动命令见 [Docker 指南](../docker/README.md)。
 
-```bash
-git tag -d v4.7.14
-git push origin :refs/tags/v4.7.14
-```
+部署后分别核对容器 health、Web 登录、账号数量、动态模型目录、账号代理绑定、日志与 Token/成本统计，再按发布范围验收真实上游请求。HTTP 200 或 healthy 不能证明真实账号资格、协议转换或计费行为正确。
 
-### 2. 防呆保护报错
+需要回滚时，恢复旧 IMAGE_DIGEST；固定 image 的发布包则恢复旧镜像引用。以原环境、端口和数据挂载重新创建容器，复核 health 与核心业务。不要删除数据卷或重建账号。只有在明确需要且得到授权时才恢复数据备份，避免覆盖新版本运行期间产生的数据。
 
-报错 `✗ 错误: 防呆保护生效：目标版本号 [...] 必须严格高于当前版本号 [...]！` 说明目标版本小于或等于当前版本。版本号必须严格单调递增，请传入更高版本（如 `npm run bump patch`）。
+## 7. 失败处理
+
+校验失败时先修正具体的分支、版本、标题或 tag 指向错误，再重新提交和验证。不要以忽略失败、强推、复用标签或降低门禁替代修复。
+
+未成功发布的本地标签可在核对精确目标后处理；已推送标签、镜像或 Release 的删除/改写需单独评估引用方并取得相应授权。已发布版本出现问题时优先回滚到已验证的旧 digest，再用新版本号发布修复。记录失败原因、已执行动作和仍未验收项，不承诺固定构建时长。
