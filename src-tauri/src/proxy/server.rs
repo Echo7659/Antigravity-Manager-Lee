@@ -486,6 +486,11 @@ pub struct AxumServer {
 }
 
 impl AxumServer {
+    /// 返回当前生效的 API key，供内部探活读取共享鉴权状态。
+    pub(crate) async fn current_api_key(&self) -> String {
+        self.security_state.read().await.api_key.clone()
+    }
+
     /// 返回代理当前使用的模型目录。
     pub async fn list_models(&self) -> Vec<String> {
         let only_raw = *self.only_raw_quota_models.read().await;
@@ -1186,6 +1191,14 @@ mod admin_model_catalog_tests {
     async fn admin_runtime_config_updates_one_state_running_and_stopped() {
         let fixture = crate::runtime::tests::ServerFixture::new().await;
         let manager = fixture.runtime.server.token_manager.clone();
+        let user_agents = [
+            "antigravity/4.9.10 linux/arm64",
+            "antigravity/4.9.11 linux/arm64",
+        ];
+        assert_ne!(
+            crate::constants::sanitize_egress_user_agent(user_agents[0]),
+            crate::constants::sanitize_egress_user_agent(user_agents[1])
+        );
         for running in [true, false] {
             if !running {
                 fixture.stop_proxy().await;
@@ -1193,7 +1206,7 @@ mod admin_model_catalog_tests {
             let mut config = fixture.config.clone();
             config.proxy.debug_logging.enabled = running;
             config.proxy.debug_logging.output_dir = Some(format!("debug-{running}"));
-            config.proxy.user_agent_override = Some(format!("runtime-test-{running}"));
+            config.proxy.user_agent_override = Some(user_agents[usize::from(!running)].into());
             config.circuit_breaker.enabled = !running;
             config.circuit_breaker.backoff_steps =
                 if running { vec![17, 31] } else { vec![23, 47] };
@@ -1221,6 +1234,12 @@ mod admin_model_catalog_tests {
                 Some(if running { "enabled" } else { "disabled" }.into());
             config.proxy.multimodal.max_fresh_images = if running { 7 } else { 9 };
             fixture.save_config(&config).await;
+            assert_eq!(
+                fixture.runtime.server.upstream.get_user_agent().await,
+                crate::constants::sanitize_egress_user_agent(
+                    config.proxy.user_agent_override.as_ref().unwrap()
+                )
+            );
             assert!(std::sync::Arc::ptr_eq(
                 &manager,
                 &fixture.runtime.server.token_manager

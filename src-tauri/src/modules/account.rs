@@ -710,6 +710,24 @@ fn read_location_pointer() -> Option<PathBuf> {
     Some(cleaned)
 }
 
+/// 解析当前数据目录，不创建目录或更新目录指针。
+pub fn resolve_data_dir_read_only() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("ABV_DATA_DIR") {
+        if !path.trim().is_empty() {
+            return Ok(normalize_data_dir_path(&path));
+        }
+    }
+    if let Ok(guard) = data_dir_override_slot().read() {
+        if let Some(path) = guard.as_ref() {
+            return Ok(normalize_data_dir_path(path));
+        }
+    }
+    match read_location_pointer() {
+        Some(path) => Ok(path),
+        None => default_data_dir(),
+    }
+}
+
 /// Get data directory path
 pub fn get_data_dir() -> Result<PathBuf, String> {
     // 显式环境变量优先于已有目录指针。

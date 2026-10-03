@@ -121,6 +121,38 @@ fn apply_startup_overrides(
     Ok(changed)
 }
 
+/// 优先读取显式环境凭据，缺省时只读配置文件，不执行配置迁移。
+fn health_check_api_key(env: impl Fn(&str) -> Option<String>) -> Result<Option<String>, String> {
+    if let Some(key) = env("ABV_API_KEY")
+        .or_else(|| env("API_KEY"))
+        .filter(|key| !key.trim().is_empty())
+    {
+        return Ok(Some(key));
+    }
+    let path = modules::account::resolve_data_dir_read_only()?.join("gui_config.json");
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Failed to read health-check configuration: {error}"
+            ))
+        }
+    };
+    let config: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "Invalid health-check configuration JSON".to_string())?;
+    Ok(config
+        .get("proxy")
+        .and_then(|proxy| proxy.get("api_key"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
+}
+
+async fn probe_server_health(server: &proxy::AxumServer, port: u16) -> bool {
+    let api_key = server.current_api_key().await;
+    probe_health(port, Some(&api_key)).await
+}
+
 async fn probe_health(port: u16, api_key: Option<&str>) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let probe = async {
@@ -204,9 +236,7 @@ pub async fn run() -> Result<(), String> {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8045);
-        let api_key = std::env::var("ABV_API_KEY")
-            .or_else(|_| std::env::var("API_KEY"))
-            .ok();
+        let api_key = health_check_api_key(|key| std::env::var(key).ok())?;
         return if probe_health(port, api_key.as_deref()).await {
             Ok(())
         } else {
@@ -222,8 +252,8 @@ pub async fn run() -> Result<(), String> {
         modules::config::save_app_config(&config)?;
     }
     let port = config.proxy.port;
-    let api_key = config.proxy.api_key.clone();
     let runtime = ServerRuntime::start(config).await?;
+    let watchdog_server = runtime.server.clone();
     let scheduler = modules::scheduler::start_scheduler(runtime.server.token_manager.clone());
     let watchdog_enabled = std::env::var("ABV_HEALTH_WATCHDOG_ENABLED")
         .map(|value| {
@@ -240,7 +270,7 @@ pub async fn run() -> Result<(), String> {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let mut failures = 0;
         loop {
-            failures = if probe_health(port, Some(&api_key)).await {
+            failures = if probe_server_health(&watchdog_server, port).await {
                 0
             } else {
                 failures + 1
@@ -469,6 +499,43 @@ pub(crate) mod tests {
         assert!(super::probe_health(config.proxy.port, Some("fixture-key")).await);
         assert!(!super::probe_health(config.proxy.port, None).await);
         assert!(!super::probe_health(config.proxy.port, Some("wrong-key")).await);
+        config.proxy.api_key = "rotated-fixture-key".into();
+        fixture.save_config(&config).await;
+        assert!(super::probe_server_health(&fixture.runtime.server, config.proxy.port).await);
+        assert!(!super::probe_health(config.proxy.port, Some("fixture-key")).await);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn server_runtime_cli_health_key_reads_config_without_modifying_files() {
+        let fixture = ServerFixture::new().await;
+        let mut config = fixture.config.clone();
+        config.proxy.auth_mode = crate::proxy::ProxyAuthMode::Strict;
+        fixture.save_config(&config).await;
+        let path = fixture.dir.path().join("gui_config.json");
+        fs::write(&path, br#"{"proxy":{"api_key":"fixture-key"}}"#).unwrap();
+        let before = fs::read(&path).unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let key = super::health_check_api_key(|_| None).unwrap();
+        assert!(super::probe_health(config.proxy.port, key.as_deref()).await);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            super::health_check_api_key(|name| match name {
+                "ABV_API_KEY" => Some("primary".into()),
+                "API_KEY" => Some("fallback".into()),
+                _ => None,
+            })
+            .unwrap()
+            .as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            super::health_check_api_key(|name| (name == "API_KEY").then(|| "fallback".into()))
+                .unwrap()
+                .as_deref(),
+            Some("fallback")
+        );
         fixture.shutdown().await;
     }
 
