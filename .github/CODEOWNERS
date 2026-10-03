@@ -17,8 +17,10 @@
 /scripts/                           @jeikl
 
 # 其余高风险面：原作者与维护者共同审查
-# 桌面集成与进程控制：账号切换、轻量模式、托盘
+# 服务器账号、持久化、后台任务与运行时
 /src-tauri/src/modules/             @lbjlaq @jeikl
+/src-tauri/src/runtime.rs           @lbjlaq @jeikl
+/docker/                           @lbjlaq @jeikl
 /docs/                              @lbjlaq @jeikl
 # CI 与发布流水线
 /.github/workflows/                 @lbjlaq @jeikl

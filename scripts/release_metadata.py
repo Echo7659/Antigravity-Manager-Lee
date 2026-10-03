@@ -8,8 +8,8 @@ import tomllib
 root = pathlib.Path(__file__).resolve().parents[1]
 version = json.loads((root / 'package.json').read_text())['version']
 rust_version = tomllib.loads((root / 'src-tauri/Cargo.toml').read_text())['package']['version']
-tauri_version = json.loads((root / 'src-tauri/tauri.conf.json').read_text())['version']
-assert version == rust_version == tauri_version, 'Frontend, Rust and Tauri versions must match'
+lock_version = json.loads((root / 'package-lock.json').read_text())['version']
+assert version == rust_version == lock_version, 'Web, Rust and lockfile versions must match'
 ref = os.environ.get('GITHUB_REF_NAME', '')
 if os.environ.get('GITHUB_REF_TYPE') == 'tag':
     assert re.fullmatch('v' + re.escape(version) + r'(?:-lee\.[1-9][0-9]*)?', ref), 'Release tag must match the base version, optionally followed by -lee.N'

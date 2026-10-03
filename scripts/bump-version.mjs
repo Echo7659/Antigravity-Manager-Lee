@@ -246,14 +246,6 @@ const TARGET_FILES = [
         ),
     },
     {
-        name: 'src-tauri/tauri.conf.json',
-        relPath: 'src-tauri/tauri.conf.json',
-        replace: (content) => content.replace(
-            `"version": "${currentVersion}"`,
-            `"version": "${newVersion}"`
-        ),
-    },
-    {
         name: 'src-tauri/Cargo.lock',
         relPath: 'src-tauri/Cargo.lock',
         replace: (content) => content.replace(
@@ -262,18 +254,10 @@ const TARGET_FILES = [
         ),
     },
     {
-        name: 'Casks/antigravity-tools.rb',
-        relPath: 'Casks/antigravity-tools.rb',
-        replace: (content) => content.replace(
-            `version "${currentVersion}"`,
-            `version "${newVersion}"`
-        ),
-    },
-    {
         // 按结构锚定而非精确当前版本串：预发布轮次会跳过 README(stableOnly)，
         // 此时 currentVersion 已前进到如 4.7.14-beta，而 README 仍停在上一个正式版
         // (v4.7.13)，精确匹配会静默失配 —— 导致下一轮正式发版 README 不更新。
-        name: 'README.md (英文主页标题与徽章)',
+        name: 'README.md (英文主页标题)',
         relPath: 'README.md',
         stableOnly: true,
         replace: (content) => content
@@ -281,7 +265,7 @@ const TARGET_FILES = [
             .replace(/Version-[0-9][^"]*-blue/, `Version-${newVersion}-blue`),
     },
     {
-        name: 'README_ZH.md (中文主页标题与徽章)',
+        name: 'README_ZH.md (中文主页标题)',
         relPath: 'README_ZH.md',
         stableOnly: true,
         replace: (content) => content
@@ -289,19 +273,17 @@ const TARGET_FILES = [
             .replace(/Version-[0-9][^"]*-blue/, `Version-${newVersion}-blue`),
     },
     {
-        name: 'src/components/layout/MiniView.tsx',
-        relPath: 'src/components/layout/MiniView.tsx',
-        replace: (content) => content.replace(
-            `setAppVersion('${currentVersion}');`,
-            `setAppVersion('${newVersion}');`
-        ),
+        name: 'README_EN.md (英文标题)',
+        relPath: 'README_EN.md',
+        stableOnly: true,
+        replace: (content) => content.replace(/\(v[0-9][^)]*\)/, `(v${newVersion})`),
     },
     {
         name: 'src/pages/Settings.tsx',
         relPath: 'src/pages/Settings.tsx',
         replace: (content) => content.replace(
-            `useState<string>('${currentVersion}');`,
-            `useState<string>('${newVersion}');`
+            `const appVersion = '${currentVersion}';`,
+            `const appVersion = '${newVersion}';`
         ),
     },
     {
@@ -388,7 +370,7 @@ if (!isDryRun && fs.existsSync(path.join(ROOT_DIR, 'src-tauri/Cargo.toml'))) {
 
 log(`全部 ${updatedCount} 处版本配置已完成原子化同步！`);
 
-// 8. 自动化 Commit 辅助支持 (使用 execFileSync 避免 Windows cmd.exe 换行崩溃)
+// 自动提交使用独立参数传递完整提交说明。
 if (!isDryRun && autoCommit) {
     log('执行自动 Git Commit...');
     try {
@@ -420,6 +402,6 @@ ${colors.cyan}【Main 正式发布通道】后续发版三步走:${colors.reset}
   2. 提交发版准备: ${colors.cyan}git commit -am "chore(release): bump version to ${newVersion} and update changelog"${colors.reset}
   3. 推送主干与标签: ${colors.cyan}git push origin main && git tag v${newVersion} && git push origin v${newVersion}${colors.reset}
 
-${colors.green}🚀 正式说明: Main 流水线构建将标记为 Latest Release 并推送各平台正式更新。${colors.reset}
+${colors.green}🚀 正式说明: Main 流水线构建将发布 Linux 服务镜像与固定 digest 的部署包。${colors.reset}
 `);
 }

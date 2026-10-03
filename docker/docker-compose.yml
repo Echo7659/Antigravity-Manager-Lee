@@ -3,22 +3,25 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: lbjlaq/antigravity-manager
+    image: antigravity-manager:server-only
+    platform: linux/amd64
     container_name: antigravity-manager
-    network_mode: host  # 使用宿主机网络，可直接访问 localhost:8045
-    # ports:  # host 模式不需要端口映射
-    #   - "8045:8045"
+    ports:
+      - "8045:8045"
     volumes:
-      - ~/.antigravity_tools:/root/.antigravity_tools
+      - ${ABV_HOST_DATA_DIR:-~/.antigravity_tools}:/root/.antigravity_tools
     environment:
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-      - API_KEY=${API_KEY:-test}  # [重要] 請設置您的安全密鑰，若不設置則在日誌中查看隨機密鑰
-      - ABV_BIND_LOCAL_ONLY=${ABV_BIND_LOCAL_ONLY:-true}  # 僅綁定 127.0.0.1
-      - ABV_DATA_DIR=${ABV_DATA_DIR:-/root/.antigravity_tools}  # 容器内数据目录，需与上方 volume 目标路径一致
-      - ABV_HEALTH_WATCHDOG_ENABLED=${ABV_HEALTH_WATCHDOG_ENABLED:-true}
-      - ABV_PROXY_HEALTH_BATCH_SIZE=${ABV_PROXY_HEALTH_BATCH_SIZE:-25}
-      - ABV_PROXY_HEALTH_CONCURRENCY=${ABV_PROXY_HEALTH_CONCURRENCY:-5}
-      - ABV_PROXY_HEALTH_START_DELAY_SECS=${ABV_PROXY_HEALTH_START_DELAY_SECS:-60}
+      API_KEY: ${API_KEY:?Set API_KEY in .env}
+      WEB_PASSWORD: ${WEB_PASSWORD:?Set WEB_PASSWORD in .env}
+      RUST_LOG: ${LOG_LEVEL:-info}
+      ABV_AUTH_MODE: ${ABV_AUTH_MODE:-all_except_health}
+      ABV_BIND_LOCAL_ONLY: "false"
+      ABV_DATA_DIR: /root/.antigravity_tools
+      ABV_MAX_BODY_SIZE: ${ABV_MAX_BODY_SIZE:-104857600}
+      ABV_HEALTH_WATCHDOG_ENABLED: ${ABV_HEALTH_WATCHDOG_ENABLED:-true}
+      ABV_PROXY_HEALTH_BATCH_SIZE: ${ABV_PROXY_HEALTH_BATCH_SIZE:-25}
+      ABV_PROXY_HEALTH_CONCURRENCY: ${ABV_PROXY_HEALTH_CONCURRENCY:-5}
+      ABV_PROXY_HEALTH_START_DELAY_SECS: ${ABV_PROXY_HEALTH_START_DELAY_SECS:-60}
     restart: unless-stopped
     logging:
       driver: json-file

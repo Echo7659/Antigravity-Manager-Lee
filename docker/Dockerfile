@@ -1,134 +1,42 @@
-# --- Frontend Build Stage ---
+# syntax=docker/dockerfile:1
 FROM node:20-slim AS frontend-builder
-ARG USE_MIRROR=auto
 WORKDIR /app
-
-# Use npm mirror if needed
-RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
-    echo "Using npm mirror..."; \
-    npm config set registry https://registry.npmmirror.com; \
-    else \
-    echo "Using default npm registry..."; \
-    fi
-
 COPY package*.json ./
-RUN --mount=type=cache,target=/root/.npm \
-    npm ci --legacy-peer-deps --prefer-offline --no-audit --no-fund
+RUN --mount=type=cache,target=/root/.npm npm ci --legacy-peer-deps --no-audit --no-fund
 COPY tsconfig.json tsconfig.node.json vite.config.ts tailwind.config.js postcss.config.cjs index.html ./
 COPY public ./public
 COPY src ./src
-COPY src-tauri/icons ./src-tauri/icons
 RUN npm run build
 
-# --- Backend Build Stage ---
-FROM rust:1-slim-bookworm AS backend-builder
-ARG USE_MIRROR=auto
-
-# Conditionally use Aliyun mirror for APT
-RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
-    echo "Using Aliyun mirror for APT..."; \
-    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources || \
-    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
-    else \
-    echo "Using default APT sources..."; \
-    fi
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    pkg-config \
-    build-essential \
-    curl \
-    wget \
-    file \
-    libssl-dev \
-    libgtk-3-dev \
-    libwebkit2gtk-4.1-dev \
-    libayatana-appindicator3-dev \
-    librsvg2-dev \
-    libsoup-3.0-dev \
-    libjavascriptcoregtk-4.1-dev \
-    perl \
-    cmake \
-    golang-go \
-    clang \
-    libclang-dev \
-    git \
+FROM rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3 AS backend-builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config cmake clang libclang-dev perl golang-go ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# Use Aliyun mirror for Cargo if needed (Sparse Index)
-ENV CARGO_HTTP_MULTIPLEXING=false
-RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
-    echo "Using Aliyun mirror for Cargo..."; \
-    mkdir -p /root/.cargo && \
-    echo "[source.crates-io]\nreplace-with = 'aliyun'\n\n[source.aliyun]\nregistry = \"sparse+https://mirrors.aliyun.com/crates.io-index/\"" > /root/.cargo/config.toml; \
-    else \
-    echo "Using default Cargo registry..."; \
-    fi
-
-# Verify Go installation for BoringSSL build
-RUN which go && go version || (echo "ERROR: Go compiler not found" && exit 1)
-
-WORKDIR /app
-# Copy only backend sources to keep frontend cache intact on backend-only changes
-COPY src-tauri ./src-tauri
-
-# [FIX] Copy locales for Rust compilation (needed by i18n.rs include_str!)
-COPY src/locales ./src/locales
-
-# Copy frontend dist from builder so Tauri can embed it
-COPY --from=frontend-builder /app/dist ./dist
-
-# Build the Rust backend in release mode (with BuildKit cache)
+ARG BUILD_JOBS=2
+ENV CARGO_BUILD_JOBS=${BUILD_JOBS}
 WORKDIR /app/src-tauri
+COPY src-tauri ./
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     --mount=type=cache,target=/app/src-tauri/target \
-    cargo build --release --bin antigravity-tools && \
+    cargo build --locked --release --bin antigravity-tools && \
     cp target/release/antigravity-tools /tmp/antigravity-tools
 
-# --- Final Runtime Stage ---
 FROM debian:bookworm-slim
-ARG USE_MIRROR=auto
-WORKDIR /app
-
-# Conditionally use Aliyun mirror for APT
-RUN if [ "$USE_MIRROR" = "true" ] || ( [ "$USE_MIRROR" = "auto" ] && ! timeout 3 bash -c "</dev/tcp/www.google.com/80" 2>/dev/null ); then \
-    echo "Using Aliyun mirror for APT..."; \
-    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources || \
-    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
-    else \
-    echo "Using default APT sources..."; \
-    fi
-
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    curl \
-    libssl3 \
-    libsqlite3-0 \
-    ca-certificates \
-    libgtk-3-0 \
-    libwebkit2gtk-4.1-0 \
-    libayatana-appindicator3-1 \
-    librsvg2-2 \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-
-# Copy binary from builder
+WORKDIR /app
 COPY --from=backend-builder /tmp/antigravity-tools /app/antigravity-tools
-
-# Copy frontend dist from builder
 COPY --from=frontend-builder /app/dist /app/dist
-
-# Set environment variables
-ENV ABV_DIST_PATH=/app/dist
-ENV RUST_LOG=info
-ENV PORT=8045
-
-# Expose the proxy/admin port
+# 运行镜像中验证动态链接依赖，缺失库时阻止发布。
+RUN ldd /app/antigravity-tools > /tmp/linked-libraries && \
+    cat /tmp/linked-libraries && ! grep -q 'not found' /tmp/linked-libraries && \
+    rm /tmp/linked-libraries
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
+LABEL org.opencontainers.image.source="https://github.com/Echo7659/Antigravity-Manager-Lee"
+ENV ABV_DIST_PATH=/app/dist RUST_LOG=info PORT=8045 ABV_BIND_LOCAL_ONLY=false
 EXPOSE 8045
-
-# Healthcheck for container orchestration
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://127.0.0.1:8045/health || exit 1
-
-# Run the application in headless mode
-ENTRYPOINT ["/app/antigravity-tools", "--headless"]
+HEALTHCHECK --interval=30s --timeout=8s --start-period=30s --retries=3 \
+    CMD ["/app/antigravity-tools", "--health-check"]
+ENTRYPOINT ["/app/antigravity-tools"]

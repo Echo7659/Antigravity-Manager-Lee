@@ -23,7 +23,15 @@
 
 - [ ] `cd src-tauri && cargo fmt -- --check`
 - [ ] `cd src-tauri && cargo clippy --all-targets --all-features`
+- [ ] `cd src-tauri && cargo check --locked --all-targets`
+- [ ] `bash scripts/check_server_only.sh`
+- [ ] `npm run test:dashboard`
 - [ ] `npm run build`
-- [ ] 改动涉及的模块已在本地运行单测（`cargo test` 不在 CI 门禁内，不做全量跑测）
+- [ ] 定向 Rust 状态、配置与协议兼容性测试通过（不做全量跑测）
+- [ ] Linux/amd64 镜像构建、容器 health check 与 `scripts/ci_smoke.py` 通过
+
+## 未验证路径与回滚策略
+
+说明未验证的核心 API、环境限制、旧镜像 digest 与数据挂载保留方式。
 
 ## 署名

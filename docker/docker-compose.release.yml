@@ -1,6 +1,7 @@
 services:
   antigravity-manager:
-    image: ghcr.io/echo7659/antigravity-manager-lee:latest
+    image: ghcr.io/echo7659/antigravity-manager-lee@${IMAGE_DIGEST:?Set IMAGE_DIGEST to the verified sha256 digest}
+    platform: linux/amd64
     container_name: antigravity-manager
     restart: unless-stopped
     ports:
@@ -8,13 +9,17 @@ services:
     environment:
       API_KEY: ${API_KEY:?Set API_KEY in .env}
       WEB_PASSWORD: ${WEB_PASSWORD:?Set WEB_PASSWORD in .env}
+      RUST_LOG: ${LOG_LEVEL:-info}
+      ABV_AUTH_MODE: ${ABV_AUTH_MODE:-all_except_health}
       ABV_BIND_LOCAL_ONLY: "false"
+      ABV_DATA_DIR: /root/.antigravity_tools
+      ABV_MAX_BODY_SIZE: ${ABV_MAX_BODY_SIZE:-104857600}
       ABV_HEALTH_WATCHDOG_ENABLED: ${ABV_HEALTH_WATCHDOG_ENABLED:-true}
       ABV_PROXY_HEALTH_BATCH_SIZE: ${ABV_PROXY_HEALTH_BATCH_SIZE:-25}
       ABV_PROXY_HEALTH_CONCURRENCY: ${ABV_PROXY_HEALTH_CONCURRENCY:-5}
       ABV_PROXY_HEALTH_START_DELAY_SECS: ${ABV_PROXY_HEALTH_START_DELAY_SECS:-60}
     volumes:
-      - ./data:/root/.antigravity_tools
+      - ${ABV_HOST_DATA_DIR:-./data}:/root/.antigravity_tools
     logging:
       driver: json-file
       options:
