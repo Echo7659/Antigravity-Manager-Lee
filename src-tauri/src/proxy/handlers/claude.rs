@@ -1710,26 +1710,19 @@ pub async fn handle_messages(
             retry_after.as_deref(),
         );
 
-        if classification.is_model_not_found() {
+        if let Some(response) = crate::proxy::handlers::common::build_model_not_found_response(
+            "claude",
+            &classification,
+            status_code,
+            &request_with_mapped.model,
+            &error_text,
+            &email,
+        ) {
             tracing::warn!(
                 "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Terminating retry loop without account lockout.",
                 trace_id, request_with_mapped.model, status_code
             );
-            let dual_err = crate::proxy::handlers::common::build_dual_track_error(
-                "claude",
-                status_code,
-                &request_with_mapped.model,
-                &error_text,
-            );
-            return (
-                StatusCode::from_u16(status_code).unwrap_or(StatusCode::NOT_FOUND),
-                [
-                    ("X-Account-Email", email.as_str()),
-                    ("X-Mapped-Model", request_with_mapped.model.as_str()),
-                ],
-                Json(dual_err),
-            )
-                .into_response();
+            return response;
         }
 
         if classification.should_lock_account() {

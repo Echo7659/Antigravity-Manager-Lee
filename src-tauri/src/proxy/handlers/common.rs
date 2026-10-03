@@ -929,6 +929,33 @@ pub fn build_dual_track_error(
     }
 }
 
+/// Builds the terminal response for an upstream model lookup failure.
+pub fn build_model_not_found_response(
+    protocol: &str,
+    classification: &crate::proxy::pipeline::UpstreamClassification,
+    status_code: u16,
+    model: &str,
+    error_text: &str,
+    account_email: &str,
+) -> Option<Response> {
+    if !classification.is_model_not_found() {
+        return None;
+    }
+
+    let body = build_dual_track_error(protocol, status_code, model, error_text);
+    Some(
+        (
+            StatusCode::from_u16(status_code).unwrap_or(StatusCode::NOT_FOUND),
+            [
+                ("X-Account-Email", account_email),
+                ("X-Mapped-Model", model),
+            ],
+            Json(body),
+        )
+            .into_response(),
+    )
+}
+
 #[cfg(test)]
 mod retry_after_tests {
     use super::*;
@@ -1050,6 +1077,54 @@ mod retry_after_tests {
         assert_eq!(gemini_res["error"]["status"], "NOT_FOUND");
         assert!(gemini_res["error"]["gateway_error"].is_object());
         assert!(gemini_res["error"]["upstream_error"].is_object());
+    }
+
+    #[tokio::test]
+    async fn task_model_not_found_response_terminates_openai_chat_and_gemini() {
+        let status_code = 400;
+        let model = "models/invalid-preview";
+        let error_text = r#"{"error":{"code":400,"message":"invalid model"}}"#;
+        let classification =
+            crate::proxy::pipeline::UpstreamClassification::classify(status_code, error_text, None);
+        assert!(classification.is_model_not_found());
+
+        for protocol in ["openai", "gemini"] {
+            let response = build_model_not_found_response(
+                protocol,
+                &classification,
+                status_code,
+                model,
+                error_text,
+                "account@example.test",
+            )
+            .expect("invalid models must terminate the handler retry loop");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers()["X-Account-Email"],
+                "account@example.test"
+            );
+            assert_eq!(response.headers()["X-Mapped-Model"], model);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["upstream_error"]["status"], status_code);
+        }
+
+        let retryable = crate::proxy::pipeline::UpstreamClassification::classify(
+            429,
+            "RESOURCE_EXHAUSTED",
+            Some("1"),
+        );
+        assert!(build_model_not_found_response(
+            "openai",
+            &retryable,
+            429,
+            model,
+            "RESOURCE_EXHAUSTED",
+            "account@example.test",
+        )
+        .is_none());
     }
 
     #[test]

@@ -2812,13 +2812,29 @@ pub async fn handle_chat_completions(
             .await;
         }
 
-        let strategy = account_retry_strategy(status_code);
         // 统一流水线决策判定：协议无关的限流与错误判定
         let classification = crate::proxy::pipeline::UpstreamClassification::classify(
             status_code,
             &error_text,
             retry_after.as_deref(),
         );
+
+        if let Some(response) = crate::proxy::handlers::common::build_model_not_found_response(
+            "openai",
+            &classification,
+            status_code,
+            &mapped_model,
+            &error_text,
+            &email,
+        ) {
+            tracing::warn!(
+                "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Terminating chat retry loop without account lockout.",
+                trace_id, mapped_model, status_code
+            );
+            return Ok(response);
+        }
+
+        let strategy = account_retry_strategy(status_code);
 
         if classification.is_thought_signature_error() {
             if !retried_without_thinking {
@@ -4629,31 +4645,23 @@ pub async fn handle_completions(
             retry_after.as_deref(),
         );
 
-        if classification.is_model_not_found() {
+        if let Some(response) = crate::proxy::handlers::common::build_model_not_found_response(
+            if is_responses_api {
+                "responses"
+            } else {
+                "openai"
+            },
+            &classification,
+            status_code,
+            &mapped_model,
+            &error_text,
+            &email,
+        ) {
             tracing::warn!(
                 "[{}] Pipeline: Target model [{}] not found on upstream (HTTP {}). Terminating completions retry loop without account lockout.",
                 trace_id, mapped_model, status_code
             );
-            let protocol = if is_responses_api {
-                "responses"
-            } else {
-                "openai"
-            };
-            let dual_err = crate::proxy::handlers::common::build_dual_track_error(
-                protocol,
-                status_code,
-                &mapped_model,
-                &error_text,
-            );
-            return Response::builder()
-                .status(StatusCode::from_u16(status_code).unwrap_or(StatusCode::NOT_FOUND))
-                .header("X-Account-Email", email.as_str())
-                .header("X-Mapped-Model", mapped_model.as_str())
-                .body(Body::from(
-                    serde_json::to_string(&dual_err).unwrap_or_default(),
-                ))
-                .unwrap()
-                .into_response();
+            return response;
         }
 
         if classification.should_lock_account() {

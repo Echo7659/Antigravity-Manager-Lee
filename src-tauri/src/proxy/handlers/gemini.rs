@@ -948,6 +948,28 @@ pub async fn handle_generate(
             .await;
         }
 
+        // 统一流水线决策判定：协议无关的限流与错误判定
+        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
+            status_code,
+            &error_text,
+            retry_after.as_deref(),
+        );
+
+        if let Some(response) = crate::proxy::handlers::common::build_model_not_found_response(
+            "gemini",
+            &classification,
+            status_code,
+            &mapped_model,
+            &error_text,
+            &email,
+        ) {
+            tracing::warn!(
+                "[Gemini] Pipeline: Target model [{}] not found on upstream (HTTP {}). Terminating retry loop without account lockout.",
+                mapped_model, status_code
+            );
+            return Ok(response);
+        }
+
         // [FIX] 403 时优先检测 VALIDATION_REQUIRED 并设置 is_forbidden / validation_block 状态，确保及时提取 URL 与更新 UI
         if status_code == 403 {
             if let Some(acc_id) = token_manager.get_account_id_by_email(&email) {
@@ -991,12 +1013,6 @@ pub async fn handle_generate(
         }
 
         let strategy = account_retry_strategy(status_code);
-        // 统一流水线决策判定：协议无关的限流与错误判定
-        let classification = crate::proxy::pipeline::UpstreamClassification::classify(
-            status_code,
-            &error_text,
-            retry_after.as_deref(),
-        );
         if classification.abandons_sticky_account() {
             token_manager.abandon_session(&affinity_key, &account_id);
             tracing::debug!(
