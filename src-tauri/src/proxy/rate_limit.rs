@@ -4,6 +4,13 @@ use std::time::{Duration, SystemTime};
 
 const MAX_LOCKOUT_SECONDS: u64 = 300;
 
+/// Converts a deadline delta to whole seconds without waking before the deadline.
+fn remaining_wait_seconds(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RetryParserMode {
     Current,
@@ -129,7 +136,7 @@ impl RateLimitTracker {
             .into_iter()
             .filter_map(|key| self.limits.get(key))
             .filter_map(|info| info.reset_time.duration_since(now).ok())
-            .map(|duration| duration.as_secs().max(1))
+            .map(remaining_wait_seconds)
             .max()
             .unwrap_or(0)
             .max(self.get_quota_wait(account_id, model, false));
@@ -147,7 +154,7 @@ impl RateLimitTracker {
                         .limits
                         .get(&std_key)
                         .and_then(|info| info.reset_time.duration_since(now).ok())
-                        .map(|duration| duration.as_secs().max(1))
+                        .map(remaining_wait_seconds)
                         .unwrap_or(0)
                         .max(self.get_quota_wait(account_id, Some(&std_id), false));
                     if std_wait > 0 {
@@ -170,7 +177,7 @@ impl RateLimitTracker {
                     && (!weekly_only || entry.weekly)
             })
             .filter_map(|entry| entry.reset_time?.duration_since(now).ok())
-            .map(|duration| duration.as_secs().max(1))
+            .map(remaining_wait_seconds)
             .max()
             .unwrap_or(0)
     }
@@ -947,6 +954,18 @@ impl Default for RateLimitTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_remaining_wait_seconds_rounds_up_fractional_deadlines() {
+        assert_eq!(remaining_wait_seconds(Duration::ZERO), 0);
+        assert_eq!(remaining_wait_seconds(Duration::from_nanos(1)), 1);
+        assert_eq!(remaining_wait_seconds(Duration::from_secs(1)), 1);
+        assert_eq!(
+            remaining_wait_seconds(Duration::from_secs(1) + Duration::from_nanos(1)),
+            2
+        );
+        assert_eq!(remaining_wait_seconds(Duration::from_secs(2)), 2);
+    }
 
     #[test]
     fn test_parse_retry_time_minutes_seconds() {
