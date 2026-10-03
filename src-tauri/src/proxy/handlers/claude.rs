@@ -29,11 +29,102 @@ use axum::http::HeaderMap;
 use dashmap::DashSet;
 use std::sync::{Arc, LazyLock};
 
-/// 记录刚完成压缩总结的会话集合，提供单次续写接续免死标志 (One-Shot Post-Compaction Immunity)
-/// 彻底攻克“静态扫描消息导致一次压缩后终身免死无法再次压缩”的死穴 (Fixes #3563)
-/// 遵循纯粹的状态机单次消费逻辑：无论中间隔了多久（如电脑合盖休眠唤醒），只要第一条业务接续请求到来即刻核销清空，
-/// 绝不人为设置定时器，杜绝超时误杀！
+/// 保存总结请求登记的单次续写豁免；同一会话的首个非总结请求消费该标识。
+/// 豁免不设置时间过期，集合容量由请求入口限制。
 static COMPACTION_ONE_SHOT_SESSIONS: LazyLock<DashSet<String>> = LazyLock::new(DashSet::new);
+
+/// 总结请求登记豁免；非总结请求原子消费豁免并返回消费结果。
+fn update_compaction_continuation(
+    sessions: &DashSet<String>,
+    session_key: &str,
+    is_compaction_request: bool,
+) -> bool {
+    if is_compaction_request {
+        sessions.insert(session_key.to_owned());
+    }
+    !is_compaction_request && sessions.remove(session_key).is_some()
+}
+
+#[cfg(test)]
+mod compaction_continuation_tests {
+    use super::update_compaction_continuation;
+    use dashmap::DashSet;
+
+    #[test]
+    fn summary_preserves_immunity_for_exactly_one_continuation() {
+        let sessions = DashSet::new();
+        assert!(!update_compaction_continuation(
+            &sessions,
+            "session-a",
+            true
+        ));
+        assert!(sessions.contains("session-a"));
+        assert!(update_compaction_continuation(
+            &sessions,
+            "session-a",
+            false
+        ));
+        assert!(!sessions.contains("session-a"));
+        assert!(!update_compaction_continuation(
+            &sessions,
+            "session-a",
+            false
+        ));
+    }
+
+    #[test]
+    fn ordinary_requests_cannot_create_immunity() {
+        let sessions = DashSet::new();
+        assert!(!update_compaction_continuation(
+            &sessions, "ordinary", false
+        ));
+        assert!(!update_compaction_continuation(
+            &sessions, "ordinary", false
+        ));
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn sessions_are_isolated_and_repeated_summaries_do_not_stack_immunity() {
+        let sessions = DashSet::new();
+        assert!(!update_compaction_continuation(
+            &sessions,
+            "session-a",
+            true
+        ));
+        assert!(!update_compaction_continuation(
+            &sessions,
+            "session-b",
+            false
+        ));
+        assert!(!update_compaction_continuation(
+            &sessions,
+            "session-b",
+            true
+        ));
+        assert!(!update_compaction_continuation(
+            &sessions,
+            "session-a",
+            true
+        ));
+        assert!(update_compaction_continuation(
+            &sessions,
+            "session-a",
+            false
+        ));
+        assert!(!update_compaction_continuation(
+            &sessions,
+            "session-a",
+            false
+        ));
+        assert!(update_compaction_continuation(
+            &sessions,
+            "session-b",
+            false
+        ));
+        assert!(sessions.is_empty());
+    }
+}
 
 // ===== Task #6: OpenCode variants thinking config mapping =====
 // Helper structs for parsing thinking hints from raw JSON
@@ -709,28 +800,24 @@ pub async fn handle_messages(
             crate::proxy::mappers::common_utils::is_compaction_request_text(sys_text)
         });
 
+    let is_post_compaction = update_compaction_continuation(
+        &COMPACTION_ONE_SHOT_SESSIONS,
+        &session_key,
+        is_compaction_request,
+    );
     if is_compaction_request {
-        // [One-Shot Immunity] 为该会话发放单次免死标识，纯状态流转，用完即焚
-        COMPACTION_ONE_SHOT_SESSIONS.insert(session_key.clone());
         tracing::info!(
             "[{}] [Lifecycle] Compaction summary request detected for session {}, issued one-shot immunity flag",
             trace_id, session_key
         );
     }
 
-    // 分流 B: 已完成压缩提纯的会话接续 (Post-Compaction Continuation)
-    // 采用纯单次消费型状态机 (One-Shot Immunity):
-    // 仅豁免紧随压缩完成后的第 1 次续写请求（防止同一次交互内连续收到 400 触发客户端熔断）。
-    // 一旦消费即刻从集合中彻底移除清空！后续轮次若再次膨胀超限，将正常进入第 2、第 3 轮自愈，彻底根除“一次压缩终身免死”！
-    let is_post_compaction = if COMPACTION_ONE_SHOT_SESSIONS.remove(&session_key).is_some() {
+    if is_post_compaction {
         tracing::info!(
             "[{}] [Lifecycle] Consumed one-shot post-compaction immunity for session {}, granted 1M passthrough",
             trace_id, session_key
         );
-        true
-    } else {
-        false
-    };
+    }
 
     // 分流 C: 超限自愈假报警触发门禁 (必须自定义开启 + 双重确权)
     // 铁律：普通 Agent 与未开启配置时，绝对不拦截，100% 享受 Gemini 百万超长上下文！
