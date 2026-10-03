@@ -824,10 +824,6 @@ impl AxumServer {
                 post(admin_bind_device_profile_with_profile),
             )
             .route(
-                "/accounts/restore-original",
-                post(admin_restore_original_device),
-            )
-            .route(
                 "/accounts/:accountId/device-versions/:versionId/restore",
                 post(admin_restore_device_version),
             )
@@ -1008,6 +1004,8 @@ impl AxumServer {
             .route("/auth/url", get(admin_prepare_oauth_url_web))
             // API 未匹配路径不得落入 Web 页面的 index.html fallback。
             .fallback(|| async { StatusCode::NOT_FOUND })
+            // 动态账号路径的未注册方法与其他缺失管理端点保持一致。
+            .method_not_allowed_fallback(|| async { StatusCode::NOT_FOUND })
             // 应用管理特定鉴权层 (强制校验)
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -1438,6 +1436,7 @@ mod admin_model_catalog_tests {
 
     #[tokio::test]
     async fn removed_admin_routes_return_not_found() {
+        use crate::modules::account;
         let dist = tempfile::tempdir().unwrap();
         std::fs::write(dist.path().join("index.html"), "server-panel").unwrap();
         let previous_dist = std::env::var_os("ABV_DIST_PATH");
@@ -1453,6 +1452,18 @@ mod admin_model_catalog_tests {
             "../../tests/fixtures/removed-admin-routes.json"
         ))
         .unwrap();
+        account::bind_device_profile("fixture-account", "generate").unwrap();
+        account::bind_device_profile("fixture-account", "generate").unwrap();
+        account::set_current_account_id("fixture-account").unwrap();
+        let mut other = account::load_account("fixture-account").unwrap();
+        other.id = "other-account".into();
+        other.email = "other@example.test".into();
+        account::save_account(&other).unwrap();
+        let before = fixture.snapshot_data_files();
+        let other_path = account::get_data_dir()
+            .unwrap()
+            .join("accounts/other-account.json");
+        let other_before = std::fs::read(&other_path).unwrap();
         for (method, path) in routes {
             let response = fixture
                 .client
@@ -1466,6 +1477,8 @@ mod admin_model_catalog_tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(fixture.snapshot_data_files(), before, "{path}");
+            assert_eq!(std::fs::read(&other_path).unwrap(), other_before, "{path}");
         }
         let page = fixture
             .client
@@ -1475,6 +1488,116 @@ mod admin_model_catalog_tests {
             .unwrap();
         assert_eq!(page.status(), reqwest::StatusCode::OK);
         assert_eq!(page.text().await.unwrap(), "server-panel");
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn admin_device_profiles_preserve_web_history_operations() {
+        let fixture = crate::runtime::tests::ServerFixture::new().await;
+        let request = |method, path: &str| {
+            fixture
+                .client
+                .request(method, format!("{}/api{path}", fixture.url))
+                .bearer_auth("fixture-key")
+        };
+        let preview: serde_json::Value = request(reqwest::Method::POST, "/accounts/device-preview")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(preview["machine_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        request(
+            reqwest::Method::POST,
+            "/accounts/fixture-account/bind-device-profile",
+        )
+        .json(&serde_json::json!({"profile": preview}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+        request(
+            reqwest::Method::POST,
+            "/accounts/fixture-account/bind-device",
+        )
+        .json(&serde_json::json!({"mode": "generate"}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+        let versions: serde_json::Value = request(
+            reqwest::Method::GET,
+            "/accounts/fixture-account/device-versions",
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(versions["baseline"], preview);
+        let history = versions["history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+        let first = history[0]["id"].as_str().unwrap();
+        let second = history[1]["id"].as_str().unwrap();
+        let restored: serde_json::Value = request(
+            reqwest::Method::POST,
+            &format!("/accounts/fixture-account/device-versions/{first}/restore"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(restored, preview);
+        request(
+            reqwest::Method::DELETE,
+            &format!("/accounts/fixture-account/device-versions/{second}"),
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+        let profiles: serde_json::Value = request(
+            reqwest::Method::GET,
+            "/accounts/fixture-account/device-profiles",
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(profiles["bound_profile"], preview);
+        assert_eq!(profiles["history"].as_array().unwrap().len(), 1);
+        let baseline: serde_json::Value = request(
+            reqwest::Method::POST,
+            "/accounts/fixture-account/device-versions/baseline/restore",
+        )
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(baseline, preview);
         fixture.shutdown().await;
     }
 
@@ -3378,17 +3501,6 @@ async fn admin_bind_device_profile_with_profile(
             )
         })?;
     Ok(Json(result))
-}
-
-async fn admin_restore_original_device(
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let msg = account::restore_original_device().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
-    Ok(Json(msg))
 }
 
 async fn admin_restore_device_version(

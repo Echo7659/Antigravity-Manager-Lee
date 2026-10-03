@@ -121,18 +121,17 @@ fn apply_startup_overrides(
     Ok(changed)
 }
 
-/// 优先读取显式环境凭据，缺省时只读配置文件，不执行配置迁移。
+/// 只读持久配置中的当前凭据，缺省时回退环境变量，不执行配置迁移。
 fn health_check_api_key(env: impl Fn(&str) -> Option<String>) -> Result<Option<String>, String> {
-    if let Some(key) = env("ABV_API_KEY")
-        .or_else(|| env("API_KEY"))
-        .filter(|key| !key.trim().is_empty())
-    {
-        return Ok(Some(key));
-    }
+    let fallback = || {
+        env("ABV_API_KEY")
+            .filter(|key| !key.trim().is_empty())
+            .or_else(|| env("API_KEY").filter(|key| !key.trim().is_empty()))
+    };
     let path = modules::account::resolve_data_dir_read_only()?.join("gui_config.json");
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(fallback()),
         Err(error) => {
             return Err(format!(
                 "Failed to read health-check configuration: {error}"
@@ -145,7 +144,9 @@ fn health_check_api_key(env: impl Fn(&str) -> Option<String>) -> Result<Option<S
         .get("proxy")
         .and_then(|proxy| proxy.get("api_key"))
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string))
+        .filter(|key| !key.trim().is_empty())
+        .map(str::to_string)
+        .or_else(fallback))
 }
 
 async fn probe_server_health(server: &proxy::AxumServer, port: u16) -> bool {
@@ -511,15 +512,22 @@ pub(crate) mod tests {
         let fixture = ServerFixture::new().await;
         let mut config = fixture.config.clone();
         config.proxy.auth_mode = crate::proxy::ProxyAuthMode::Strict;
+        config.proxy.api_key = "rotated-fixture-key".into();
         fixture.save_config(&config).await;
         let path = fixture.dir.path().join("gui_config.json");
-        fs::write(&path, br#"{"proxy":{"api_key":"fixture-key"}}"#).unwrap();
         let before = fs::read(&path).unwrap();
         let modified = fs::metadata(&path).unwrap().modified().unwrap();
-        let key = super::health_check_api_key(|_| None).unwrap();
+        let key = super::health_check_api_key(|name| {
+            (name == "ABV_API_KEY").then(|| "fixture-key".into())
+        })
+        .unwrap();
+        assert_eq!(key.as_deref(), Some("rotated-fixture-key"));
         assert!(super::probe_health(config.proxy.port, key.as_deref()).await);
+        assert!(!super::probe_health(config.proxy.port, Some("fixture-key")).await);
+        assert!(!super::probe_health(config.proxy.port, Some("bad\r\nkey")).await);
         assert_eq!(fs::read(&path).unwrap(), before);
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        fs::remove_file(&path).unwrap();
         assert_eq!(
             super::health_check_api_key(|name| match name {
                 "ABV_API_KEY" => Some("primary".into()),
@@ -536,6 +544,16 @@ pub(crate) mod tests {
                 .as_deref(),
             Some("fallback")
         );
+        assert!(!path.exists());
+        fs::write(&path, br#"{"proxy":{}}"#).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert_eq!(
+            super::health_check_api_key(|name| (name == "API_KEY").then(|| "fallback".into()))
+                .unwrap()
+                .as_deref(),
+            Some("fallback")
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
         fixture.shutdown().await;
     }
 

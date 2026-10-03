@@ -7,6 +7,7 @@
   ["POST", "/accounts/import/db"],
   ["POST", "/accounts/import/db-custom"],
   ["POST", "/accounts/sync/db"],
+  ["POST", "/accounts/restore-original"],
   ["POST", "/proxy/cli/status"],
   ["POST", "/proxy/hermes/status"],
   ["POST", "/proxy/openclaw/status"],

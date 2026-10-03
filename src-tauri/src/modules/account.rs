@@ -1564,26 +1564,6 @@ pub fn delete_device_version(account_id: &str, version_id: &str) -> Result<(), S
     save_account(&account)?;
     Ok(())
 }
-/// 恢复当前账号保存的原始指纹。
-pub fn restore_original_device() -> Result<String, String> {
-    if let Some(current_id) = get_current_account_id()? {
-        if let Ok(mut account) = load_account(&current_id) {
-            if let Some(original) = crate::modules::device::load_global_original() {
-                account.device_profile = Some(original);
-                for h in account.device_history.iter_mut() {
-                    h.is_current = false;
-                }
-                save_account(&account)?;
-                return Ok(
-                    "Reset current account bound profile to original (not applied to storage)"
-                        .to_string(),
-                );
-            }
-        }
-    }
-    Err("Original profile not found, cannot restore".to_string())
-}
-
 /// Get current account ID
 pub fn get_current_account_id() -> Result<Option<String>, String> {
     let index = load_account_index()?;
