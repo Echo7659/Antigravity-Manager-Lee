@@ -4711,10 +4711,8 @@ mod tests {
 
     #[tokio::test]
     async fn targeted_batch_reload_keeps_unrelated_accounts_online() {
-        let tmp_root = std::env::temp_dir().join(format!(
-            "antigravity-targeted-reload-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let tmp_root = crate::modules::account::get_data_dir().unwrap();
         let accounts_dir = tmp_root.join("accounts");
         std::fs::create_dir_all(&accounts_dir).unwrap();
         let now = chrono::Utc::now().timestamp();
@@ -4753,16 +4751,12 @@ mod tests {
         assert!(errors.is_empty());
         assert!(!manager.tokens.contains_key("account-a"));
         assert!(manager.tokens.contains_key("account-b"));
-
-        let _ = std::fs::remove_dir_all(tmp_root);
     }
 
     #[tokio::test]
     async fn task_reload_account_preserves_live_limit_and_syncs_disabled_state() {
-        let tmp_root = std::env::temp_dir().join(format!(
-            "antigravity-token-manager-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let tmp_root = crate::modules::account::get_data_dir().unwrap();
         let accounts_dir = tmp_root.join("accounts");
         std::fs::create_dir_all(&accounts_dir).unwrap();
 
@@ -4898,16 +4892,12 @@ mod tests {
         assert!(restarted
             .rate_limit_tracker
             .is_rate_limited(account_id, Some(model)));
-
-        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
     #[tokio::test]
     async fn task_account_json_update_preserves_live_limits() {
-        let tmp_root = std::env::temp_dir().join(format!(
-            "antigravity-account-update-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let tmp_root = crate::modules::account::get_data_dir().unwrap();
         let accounts_dir = tmp_root.join("accounts");
         std::fs::create_dir_all(&accounts_dir).unwrap();
         let account_id = "acc-update";
@@ -5011,8 +5001,6 @@ mod tests {
             updated["protected_models"],
             serde_json::json!(["gemini-3-flash"])
         );
-
-        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
     #[tokio::test]
@@ -5038,10 +5026,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_short_limit_buffer_reselects_without_blocking_runtime() {
-        let tmp_root = std::env::temp_dir().join(format!(
-            "antigravity-short-limit-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let tmp_root = crate::modules::account::get_data_dir().unwrap();
         let accounts_dir = tmp_root.join("accounts");
         std::fs::create_dir_all(&accounts_dir).unwrap();
         let account_id = "acc-short-limit";
@@ -5091,16 +5077,12 @@ mod tests {
         .unwrap();
         assert_eq!(selected.3, account_id);
         assert!(!manager.is_rate_limited(account_id, Some(model)).await);
-
-        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
     #[tokio::test]
     async fn task_concurrent_image_limits_persist_and_clear_exact_bucket() {
-        let tmp_root = std::env::temp_dir().join(format!(
-            "antigravity-live-limit-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let tmp_root = crate::modules::account::get_data_dir().unwrap();
         let accounts_dir = tmp_root.join("accounts");
         std::fs::create_dir_all(&accounts_dir).unwrap();
         let account_id = "acc-concurrent";
@@ -5197,16 +5179,12 @@ mod tests {
                 .rate_limit_tracker
                 .is_rate_limited(account_id, Some("gemini-3-pro-image"))
         );
-
-        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
     #[tokio::test]
     async fn test_fixed_account_mode_skips_preferred_when_disabled_on_disk_without_reload() {
-        let tmp_root = std::env::temp_dir().join(format!(
-            "antigravity-token-manager-test-fixed-mode-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let tmp_root = crate::modules::account::get_data_dir().unwrap();
         let accounts_dir = tmp_root.join("accounts");
         std::fs::create_dir_all(&accounts_dir).unwrap();
 
@@ -5268,8 +5246,6 @@ mod tests {
         assert_eq!(email, "b@test.com");
         assert!(manager.tokens.get("acc1").is_none());
         assert!(manager.get_preferred_account().await.is_none());
-
-        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
     #[tokio::test]
@@ -5462,10 +5438,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sticky_session_skips_bound_account_when_disabled_on_disk_without_reload() {
-        let tmp_root = std::env::temp_dir().join(format!(
-            "antigravity-token-manager-test-sticky-disabled-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let tmp_root = crate::modules::account::get_data_dir().unwrap();
         let accounts_dir = tmp_root.join("accounts");
         std::fs::create_dir_all(&accounts_dir).unwrap();
 
@@ -5531,8 +5505,6 @@ mod tests {
             manager.session_accounts.get("sid1").map(|v| v.clone()),
             Some("acc1".to_string())
         );
-
-        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
     /// 创建测试用的 ProxyToken
