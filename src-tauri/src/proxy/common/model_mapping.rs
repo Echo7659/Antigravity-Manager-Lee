@@ -7,14 +7,12 @@ use std::collections::HashMap;
 pub static DYNAMIC_MODEL_FORWARDING_RULES: Lazy<DashMap<String, String>> =
     Lazy::new(|| DashMap::new());
 
-pub fn update_dynamic_forwarding_rules(old_model: String, new_model: String) {
-    if !DYNAMIC_MODEL_FORWARDING_RULES.contains_key(&old_model) {
-        crate::modules::logger::log_info(&format!(
-            "[Mapping] Registered automatic forwarding rule: {} -> {}",
-            old_model, new_model
-        ));
+/// 使用当前目录快照的规则替换动态转发规则。
+pub fn replace_dynamic_forwarding_rules(rules: HashMap<String, String>) {
+    DYNAMIC_MODEL_FORWARDING_RULES.retain(|old, new| rules.get(old) == Some(new));
+    for (old, new) in rules {
+        DYNAMIC_MODEL_FORWARDING_RULES.insert(old, new);
     }
-    DYNAMIC_MODEL_FORWARDING_RULES.insert(old_model, new_model);
 }
 
 static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|| {
@@ -236,11 +234,21 @@ pub fn map_claude_model_to_gemini(input: &str) -> String {
     input.to_string()
 }
 
+fn model_version(model: &str, prefix: &str) -> Option<(u32, u32)> {
+    let rest = model.split_once(prefix)?.1;
+    let mut parts = rest
+        .split(['-', '.'])
+        .skip_while(|part| part.parse::<u32>().is_err());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|part| part.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
 /// 核心基准线过滤器：严格遵循官方客户端当前展示的模型基准线
-/// 1. Gemini Flash 系列：基准线 3.5。版本 >= 3.5 保留；< 3.5 的除了 2.5 经典系列外全部淘汰。
+/// 1. Gemini Flash 系列：基准线 3.5，另保留 3.1 Flash Lite。
 /// 2. Claude 系列：基准线 4.6。版本 >= 4.6 保留；4.6 以下全部淘汰。
 /// 3. GPT 系列：以官方最新公布为准 (gpt-oss-120b-medium)，淘汰 gpt-4o 等历史旧模型。
-/// 4. Pro 系列：以官方最新为准 (gemini-3.1-pro-high, gemini-3.1-pro-low, gemini-2.5-pro, gemini-3-pro-image)。
+/// 4. Gemini Pro 系列：基准线 3.1，另保留 3 Pro Image。
 pub fn is_model_compliant_with_baseline(model: &str) -> bool {
     let lower = model.to_lowercase();
     let m = lower.trim();
@@ -258,19 +266,7 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
 
     // 1. Claude 系列：以 4.6 为基准线，4.6 以下全部淘汰
     if m.contains("claude") {
-        if m.contains("4-6") || m.contains("4.6") {
-            return true;
-        }
-        // 兼容未来可能发布的 >= 4.6 版本 (如 4.7+, 5.x)
-        if let Some(pos) = m.find("claude-") {
-            let rest = &m[pos + 7..];
-            for token in rest.split('-') {
-                if let Ok(ver) = token.parse::<f32>() {
-                    return ver >= 4.6;
-                }
-            }
-        }
-        return false;
+        return model_version(m, "claude-").is_some_and(|version| version >= (4, 6));
     }
 
     // 2. GPT / OpenAI 系列：以官方为准 (gpt-oss-120b-medium)
@@ -280,42 +276,18 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
 
     // 3. 图像模型保底
     if m.contains("image") {
-        return m == "gemini-3.1-flash-image" || m == "gemini-3-pro-image";
+        return m == "gemini-3-pro-image"
+            || model_version(m, "gemini-").is_some_and(|version| version >= (3, 1));
     }
 
     // 4. Gemini Pro 系列：以官方最新为准 (3.1 Pro)，淘汰 2.5 Pro 及以下历史旧模型
     if m.contains("pro") {
-        if m.contains("1.5")
-            || m.contains("2.0")
-            || m.contains("2.5")
-            || m.contains("2-5")
-            || m == "gemini-3-pro"
-            || m.contains("preview")
-        {
-            return false;
-        }
-        if m.contains("3.1") {
-            return true;
-        }
-        // 未知更高版本 pro (如 4.x)
-        if let Some(pos) = m.find("gemini-") {
-            let rest = &m[pos + 7..];
-            if let Some(pro_pos) = rest.find("-pro") {
-                if let Ok(ver) = rest[..pro_pos].parse::<f32>() {
-                    return ver >= 3.1;
-                }
-            }
-        }
-        return false;
+        return !m.contains("preview")
+            && model_version(m, "gemini-").is_some_and(|version| version >= (3, 1));
     }
 
     // 5. Gemini Flash 系列：淘汰 2.5 全系列及已 503 的 3.5-flash-lite；放行 3.1-flash-lite 与 >= 3.5 版本
     if m.contains("flash") {
-        // 2.5 全系列已退役淘汰
-        if m.contains("2.5") || m.contains("2-5") {
-            return false;
-        }
-
         // 3.1-flash-lite 特别放行（1M 上下文轻量健康模型）
         if m == "gemini-3.1-flash-lite" {
             return true;
@@ -326,34 +298,10 @@ pub fn is_model_compliant_with_baseline(model: &str) -> bool {
             return false;
         }
 
-        // 解析版本号
-        if let Some(pos) = m.find("gemini-") {
-            let rest = &m[pos + 7..];
-            if let Some(flash_pos) = rest.find("-flash") {
-                let ver_str = &rest[..flash_pos];
-                if let Ok(ver) = ver_str.parse::<f32>() {
-                    return ver >= 3.5;
-                }
-            }
-        }
-
-        // 容错匹配特定已知 >= 3.5 版本
-        if m.contains("3.8")
-            || m.contains("3-8")
-            || m.contains("3.7")
-            || m.contains("3-7")
-            || m.contains("3.6")
-            || m.contains("3-6")
-            || m.contains("3.5")
-            || m.contains("3-5")
-        {
-            return true;
-        }
-
-        return false;
+        return model_version(m, "gemini-").is_some_and(|version| version >= (3, 5));
     }
 
-    // 其他未知非 Google 系列（如用户自定义映射），予以放行
+    // 其他未知系列由上游快照决定是否进入目录。
     true
 }
 
@@ -403,23 +351,21 @@ pub fn get_supported_models() -> Vec<String> {
     .collect()
 }
 
-/// 动态获取所有可用模型列表 (包含内置与用户自定义与官方端点动态下发)
+/// 动态获取官方快照模型，以及配置允许时的用户自定义映射名称。
 pub async fn get_all_dynamic_models(
     custom_mapping: &tokio::sync::RwLock<std::collections::HashMap<String, String>>,
     token_manager: Option<&crate::proxy::token_manager::TokenManager>,
     only_raw_quota_models: bool,
 ) -> Vec<String> {
     use std::collections::HashSet;
-    let mut model_ids = HashSet::new();
+    let mut model_ids: HashSet<_> = token_manager
+        .map(|tm| tm.get_all_collected_models())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| is_model_compliant_with_baseline(id))
+        .collect();
 
-    // 1. 获取所有账号从官方接口汇聚而来的动态模型 (Quota Models)
-    if let Some(tm) = token_manager {
-        for dynamic_model in tm.get_all_collected_models() {
-            model_ids.insert(dynamic_model);
-        }
-    }
-
-    // 如果未开启 only_raw_quota_models，则追加 custom_mapping 与内置标准公开模型
+    // 配置允许时追加用户自定义映射名称。
     if !only_raw_quota_models {
         // 2. 获取所有自定义映射模型 (Custom)
         {
@@ -428,18 +374,9 @@ pub async fn get_all_dynamic_models(
                 model_ids.insert(key.clone());
             }
         }
-
-        // 3. 获取所有内置标准模型
-        for m in get_supported_models() {
-            model_ids.insert(m);
-        }
     }
 
-    // 4. 应用官方基准线过滤，彻底剔除已淘汰的旧版模型与内部虚拟 ID
-    let mut sorted_ids: Vec<_> = model_ids
-        .into_iter()
-        .filter(|id| is_model_compliant_with_baseline(id))
-        .collect();
+    let mut sorted_ids: Vec<_> = model_ids.into_iter().collect();
     sorted_ids.sort();
     sorted_ids
 }
@@ -730,6 +667,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dynamic_forwarding_removed_rules_disappear() {
+        replace_dynamic_forwarding_rules(HashMap::from([
+            ("old-a".to_string(), "new-a".to_string()),
+            ("old-b".to_string(), "new-b".to_string()),
+        ]));
+        replace_dynamic_forwarding_rules(HashMap::from([(
+            "old-b".to_string(),
+            "new-c".to_string(),
+        )]));
+        assert!(!DYNAMIC_MODEL_FORWARDING_RULES.contains_key("old-a"));
+        assert_eq!(
+            DYNAMIC_MODEL_FORWARDING_RULES.get("old-b").unwrap().value(),
+            "new-c"
+        );
+    }
+
+    #[test]
     fn test_model_mapping() {
         assert_eq!(
             map_claude_model_to_gemini("claude-3-5-sonnet-20241022"),
@@ -807,20 +761,35 @@ mod tests {
         // When only_raw_quota_models is FALSE, custom_mapping should be included
         let models_all = get_all_dynamic_models(&custom_mapping, None, false).await;
         assert!(models_all.contains(&"my-custom-model".to_string()));
+        assert!(!models_all.contains(&"gemini-3.8-flash-high".to_string()));
+
+        custom_mapping.write().await.insert(
+            "custom-gpt4".to_string(),
+            "gemini-3.8-flash-high".to_string(),
+        );
+        assert!(get_all_dynamic_models(&custom_mapping, None, false)
+            .await
+            .contains(&"custom-gpt4".to_string()));
     }
 
     #[tokio::test]
     async fn test_find_dynamic_model() {
         let custom_mapping = tokio::sync::RwLock::new(
-            [(
-                "custom-gpt4".to_string(),
-                "gemini-3.8-flash-high".to_string(),
-            )]
+            [
+                (
+                    "custom-model".to_string(),
+                    "gemini-3.8-flash-high".to_string(),
+                ),
+                (
+                    "gemini-3.1-flash-lite".to_string(),
+                    "gemini-3.1-flash-lite".to_string(),
+                ),
+            ]
             .into_iter()
             .collect(),
         );
 
-        // 1. 内置模型匹配
+        // 1. 自定义映射名称匹配
         let found = find_dynamic_model(&custom_mapping, None, false, "gemini-3.1-flash-lite").await;
         assert_eq!(found, Some("gemini-3.1-flash-lite".to_string()));
 
@@ -830,8 +799,8 @@ mod tests {
         assert_eq!(found_prefix, Some("gemini-3.1-flash-lite".to_string()));
 
         // 3. 自定义模型匹配
-        let found_custom = find_dynamic_model(&custom_mapping, None, false, "custom-gpt4").await;
-        assert_eq!(found_custom, Some("custom-gpt4".to_string()));
+        let found_custom = find_dynamic_model(&custom_mapping, None, false, "custom-model").await;
+        assert_eq!(found_custom, Some("custom-model".to_string()));
 
         // 4. 大小写宽容匹配
         let found_case =
@@ -1106,6 +1075,8 @@ mod tests {
         assert!(is_model_compliant_with_baseline("claude-sonnet-4-6"));
         assert!(is_model_compliant_with_baseline("claude-opus-4-6-thinking"));
         assert!(is_model_compliant_with_baseline("claude-sonnet-4-7"));
+        assert!(is_model_compliant_with_baseline("claude-opus-5-0"));
+        assert!(is_model_compliant_with_baseline("claude-sonnet-4-10"));
         assert!(!is_model_compliant_with_baseline("claude-sonnet-4-5"));
         assert!(!is_model_compliant_with_baseline("claude-3-5-sonnet"));
         assert!(!is_model_compliant_with_baseline("claude-3-7-sonnet"));
@@ -1119,6 +1090,7 @@ mod tests {
 
         // Gemini Flash: >= 3.5 passes, 3.1-flash-lite passes, 2.5 rejected, 3.5-flash-lite rejected
         assert!(is_model_compliant_with_baseline("gemini-3.8-flash-high"));
+        assert!(is_model_compliant_with_baseline("gemini-3.10-flash-high"));
         assert!(is_model_compliant_with_baseline("gemini-3.7-flash-medium"));
         assert!(is_model_compliant_with_baseline("gemini-3.6-flash-low"));
         assert!(is_model_compliant_with_baseline("gemini-3.5-flash-low"));
@@ -1135,6 +1107,7 @@ mod tests {
 
         // Gemini Pro: 3.1 pass, 2.5/1.5/2.0/3.0 rejected
         assert!(is_model_compliant_with_baseline("gemini-3.1-pro-high"));
+        assert!(is_model_compliant_with_baseline("gemini-11.5-pro-high"));
         assert!(is_model_compliant_with_baseline("gemini-3.1-pro-low"));
         assert!(!is_model_compliant_with_baseline("gemini-2.5-pro"));
         assert!(!is_model_compliant_with_baseline("gemini-1.5-pro"));
@@ -1144,6 +1117,7 @@ mod tests {
 
         // Image models
         assert!(is_model_compliant_with_baseline("gemini-3.1-flash-image"));
+        assert!(is_model_compliant_with_baseline("gemini-4.0-flash-image"));
         assert!(is_model_compliant_with_baseline("gemini-3-pro-image"));
 
         // Internal models

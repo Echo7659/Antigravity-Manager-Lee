@@ -54,6 +54,29 @@ fn classify_rate_limit_reason(error_body: &str) -> crate::proxy::rate_limit::Rat
 }
 
 const IMAGE_ACCOUNT_RESELECT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+const MODEL_CATALOG_FRESH_SECS: i64 = 86_400;
+
+fn select_catalog_snapshots<T>(snapshots: Vec<(i64, T)>, now: i64) -> Vec<T> {
+    let snapshots: Vec<_> = snapshots
+        .into_iter()
+        .map(|(timestamp, value)| (timestamp.min(now), value))
+        .collect();
+    let has_fresh = snapshots
+        .iter()
+        .any(|(timestamp, _)| *timestamp >= now.saturating_sub(MODEL_CATALOG_FRESH_SECS));
+    let latest = snapshots.iter().map(|(timestamp, _)| *timestamp).max();
+    snapshots
+        .into_iter()
+        .filter(|(timestamp, _)| {
+            if has_fresh {
+                *timestamp >= now.saturating_sub(MODEL_CATALOG_FRESH_SECS)
+            } else {
+                Some(*timestamp) == latest
+            }
+        })
+        .map(|(_, value)| value)
+        .collect()
+}
 
 async fn wait_for_image_account_change(
     changes: &mut tokio::sync::watch::Receiver<u64>,
@@ -345,6 +368,7 @@ impl TokenManager {
         self.current_index.store(0, Ordering::SeqCst);
         *self.last_used_account.lock().await = None;
         self.sync_image_scheduler_accounts();
+        self.get_all_collected_models();
         Ok(loaded_ids.len())
     }
 
@@ -353,6 +377,7 @@ impl TokenManager {
         let _reload_guard = self.account_reload_lock.lock().await;
         let result = self.reload_account_inner(account_id).await;
         self.sync_image_scheduler_accounts();
+        self.get_all_collected_models();
         result
     }
 
@@ -374,6 +399,7 @@ impl TokenManager {
             }
         }
         self.sync_image_scheduler_accounts();
+        self.get_all_collected_models();
         errors
     }
 
@@ -415,6 +441,7 @@ impl TokenManager {
     pub fn remove_account(&self, account_id: &str) {
         self.remove_account_from_caches(account_id);
         self.sync_image_scheduler_accounts();
+        self.get_all_collected_models();
     }
 
     fn remove_account_from_caches(&self, account_id: &str) {
@@ -789,23 +816,6 @@ impl TokenManager {
                         + std::time::Duration::from_secs(detected_at_seconds),
                     model_key,
                 );
-            }
-        }
-
-        // [NEW] 启动时自动同步持久化的淘汰模型路由表，注入热更新拦截器
-        if let Some(rules) = account
-            .get("quota")
-            .and_then(|q| q.get("model_forwarding_rules"))
-            .and_then(|r| r.as_object())
-        {
-            for (k, v) in rules {
-                if let Some(new_model) = v.as_str() {
-                    // Register dynamic forwarding rules (including those mapping to gemini-pro-agent)
-                    crate::proxy::common::model_mapping::update_dynamic_forwarding_rules(
-                        k.to_string(),
-                        new_model.to_string(),
-                    );
-                }
             }
         }
 
@@ -4027,27 +4037,56 @@ impl TokenManager {
         }
     }
 
-    /// 获取当前所有可用账号中收集到的官方下发的所有动态模型集合
+    /// 汇总选中快照的具体模型 ID，并同步这些快照的模型转发规则。
+    /// 无新鲜成功快照时仅使用最新历史快照。
     pub fn get_all_collected_models(&self) -> std::collections::HashSet<String> {
-        let mut all_models = std::collections::HashSet::new();
-        for entry in self.tokens.iter() {
-            let token = entry.value();
-
-            // Keep the raw quota model IDs for /v1/models discovery. `model_quotas`
-            // intentionally stores normalized protection buckets (e.g. gemini-3-flash),
-            // but clients need concrete usable IDs such as gemini-3-flash-agent.
-            if let Some(raw_models) = Self::get_available_models_from_json(&token.account_path) {
-                for model_id in raw_models {
-                    all_models.insert(model_id);
+        let now = chrono::Utc::now().timestamp();
+        let mut snapshots: Vec<_> = self
+            .tokens
+            .iter()
+            .filter_map(|entry| {
+                let content = std::fs::read_to_string(&entry.value().account_path).ok()?;
+                let account: serde_json::Value = serde_json::from_str(&content).ok()?;
+                let quota = account.get("quota")?;
+                let timestamp = quota.get("last_updated")?.as_i64().filter(|t| *t > 0)?;
+                quota.get("models")?.as_array()?.iter().find(|model| {
+                    model
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|name| !name.trim().is_empty())
+                })?;
+                Some((timestamp, (entry.key().clone(), quota.clone())))
+            })
+            .collect();
+        snapshots.sort_by(|(left_time, (left_id, _)), (right_time, (right_id, _))| {
+            (left_time.min(&now), left_id).cmp(&(right_time.min(&now), right_id))
+        });
+        let mut models = HashSet::new();
+        let mut rules = HashMap::new();
+        for (_, quota) in select_catalog_snapshots(snapshots, now) {
+            if let Some(raw_models) = quota.get("models").and_then(|v| v.as_array()) {
+                for model in raw_models {
+                    if let Some(name) = model.get("name").and_then(|v| v.as_str()) {
+                        let id = name.trim().to_ascii_lowercase();
+                        if !id.is_empty() {
+                            models.insert(id);
+                        }
+                    }
                 }
             }
-
-            // Also keep normalized bucket IDs for existing quota/protection behavior.
-            for model_id in token.model_quotas.keys() {
-                all_models.insert(model_id.clone());
+            if let Some(forwarding) = quota
+                .get("model_forwarding_rules")
+                .and_then(|v| v.as_object())
+            {
+                for (old, new) in forwarding {
+                    if let Some(target) = new.as_str() {
+                        rules.insert(old.clone(), target.to_string());
+                    }
+                }
             }
         }
-        all_models
+        crate::proxy::common::model_mapping::replace_dynamic_forwarding_rules(rules);
+        models
     }
 
     /// [NEW] 从指定账号的动态额度数据中获取特定模型的 max_output_tokens
@@ -4209,6 +4248,40 @@ mod tests {
     use super::*;
     use std::cmp::Ordering;
     use std::time::Duration;
+
+    #[test]
+    fn model_catalog_uses_every_fresh_snapshot() {
+        let selected = select_catalog_snapshots(vec![(100, "a"), (101, "b")], 101);
+        assert_eq!(selected, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn model_catalog_drops_stale_models_when_fresh_data_exists() {
+        let now = 100_000;
+        let selected = select_catalog_snapshots(
+            vec![
+                (now - MODEL_CATALOG_FRESH_SECS - 1, "stale"),
+                (now, "fresh"),
+            ],
+            now,
+        );
+        assert_eq!(selected, vec!["fresh"]);
+    }
+
+    #[test]
+    fn model_catalog_falls_back_to_latest_snapshot_when_all_are_stale() {
+        let selected =
+            select_catalog_snapshots(vec![(1, "old"), (2, "latest"), (2, "tie")], 100_000);
+        assert_eq!(selected, vec!["latest", "tie"]);
+    }
+
+    #[test]
+    fn model_catalog_clamps_future_timestamp_to_now() {
+        let now = 100_000;
+        let selected =
+            select_catalog_snapshots(vec![(now + 5, "future"), (now - 1, "recent")], now);
+        assert_eq!(selected, vec!["future", "recent"]);
+    }
 
     fn weekly_quota_account(now: i64) -> serde_json::Value {
         let reset = |seconds| {
@@ -4975,10 +5048,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_collected_models_preserve_raw_quota_model_names_for_model_listing() {
-        let tmp_root = std::env::temp_dir().join(format!(
-            "antigravity-token-manager-test-raw-models-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let tmp_root = crate::modules::account::get_data_dir().unwrap();
         let accounts_dir = tmp_root.join("accounts");
         std::fs::create_dir_all(&accounts_dir).unwrap();
 
@@ -4994,6 +5065,8 @@ mod tests {
                 "expiry_timestamp": now + 3600
             },
             "quota": {
+                "last_updated": now,
+                "model_forwarding_rules": {"retired-catalog-test-model": "gemini-3-flash-agent"},
                 "models": [
                     { "name": "gemini-3-flash-agent", "percentage": 88 }
                 ]
@@ -5014,10 +5087,33 @@ mod tests {
 
         let collected_models = manager.get_all_collected_models();
         assert!(collected_models.contains("gemini-3-flash-agent"));
-        // Keep the normalized quota bucket too; it is used for quota/protection checks.
-        assert!(collected_models.contains("gemini-3-flash"));
+        assert!(!collected_models.contains("gemini-3-flash"));
+        assert!(
+            crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
+                .contains_key("retired-catalog-test-model")
+        );
 
-        let _ = std::fs::remove_dir_all(&tmp_root);
+        let mut refreshed = account_json;
+        refreshed["quota"]["last_updated"] = serde_json::json!(now + 1);
+        refreshed["quota"]["models"] = serde_json::json!([{"name": "claude-sonnet-4-7"}]);
+        refreshed["quota"]["model_forwarding_rules"] = serde_json::json!({});
+        std::fs::write(&account_path, refreshed.to_string()).unwrap();
+        manager.reload_account("acc1").await.unwrap();
+        let refreshed_models = manager.get_all_collected_models();
+        assert!(refreshed_models.contains("claude-sonnet-4-7"));
+        assert!(!refreshed_models.contains("gemini-3-flash-agent"));
+        let listing = crate::proxy::common::model_mapping::get_all_dynamic_models(
+            &tokio::sync::RwLock::new(HashMap::new()),
+            Some(&manager),
+            false,
+        )
+        .await;
+        assert!(listing.contains(&"claude-sonnet-4-7".to_string()));
+        assert!(!listing.contains(&"gemini-3.8-flash-high".to_string()));
+        assert!(
+            !crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
+                .contains_key("retired-catalog-test-model")
+        );
     }
 
     #[tokio::test]
