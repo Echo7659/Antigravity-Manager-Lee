@@ -484,7 +484,7 @@ impl SignatureCache {
         }
     }
 
-    /// Clear all caches (for testing or manual reset)
+    /// Clear all process-local caches. Persistent thinking data is managed separately.
     #[allow(dead_code)] // Used in tests
     pub fn clear(&self) {
         if let Ok(mut cache) = self.tool_signatures.lock() {
@@ -556,7 +556,7 @@ mod tests {
         let cache = SignatureCache::new();
         let sig1 = "a".repeat(60);
         let sig2 = "b".repeat(80); // Longer, should replace
-        let sig3 = "c".repeat(40); // Too short, should be ignored
+        let sig3 = "c".repeat(MIN_SIGNATURE_LENGTH - 1); // Too short, should be ignored
 
         // Initially empty
         assert!(cache.get_session_signature("sid-test123").is_none());
@@ -601,18 +601,23 @@ mod tests {
     fn test_clear_all_caches() {
         let cache = SignatureCache::new();
         let sig = "x".repeat(60);
+        let key = SignatureCache::scoped_tool_key("scope", "tool_1").unwrap();
 
-        cache.cache_tool_signature("scope", "tool_1", sig.clone());
+        cache
+            .tool_signatures
+            .lock()
+            .unwrap()
+            .insert(key, CacheEntry::new(sig.clone()));
         cache.cache_thinking_family(sig.clone(), "model".to_string());
         cache.cache_session_signature("sid-1", sig.clone(), 1);
 
-        assert!(cache.get_tool_signature("scope", "tool_1").is_some());
+        assert!(cache.get_cached_tool_signature("scope", "tool_1").is_some());
         assert!(cache.get_signature_family(&sig).is_some());
         assert!(cache.get_session_signature("sid-1").is_some());
 
         cache.clear();
 
-        assert!(cache.get_tool_signature("scope", "tool_1").is_none());
+        assert!(cache.get_cached_tool_signature("scope", "tool_1").is_none());
         assert!(cache.get_signature_family(&sig).is_none());
         assert!(cache.get_session_signature("sid-1").is_none());
     }
