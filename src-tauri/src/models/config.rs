@@ -209,11 +209,44 @@ mod tests {
 
     #[test]
     fn legacy_desktop_fields_are_ignored() {
-        let config: AppConfig = serde_json::from_str(include_str!(
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let legacy: serde_json::Value = serde_json::from_str(include_str!(
             "../../tests/fixtures/legacy-desktop-config.json"
         ))
         .unwrap();
+        let mut config = AppConfig::new();
+        config.proxy.api_key = "legacy-config-key".into();
+        config.proxy.custom_mapping.clear();
+        config
+            .proxy
+            .custom_mapping
+            .insert("gemini-3.x-flash".into(), "3.x-flash-tiered".into());
+        config
+            .proxy
+            .custom_mapping
+            .insert("custom-model".into(), "gemini-3.8-flash".into());
+        config.proxy.thinking_budget.flash_high_legacy_migrated = true;
+        let mut value = serde_json::to_value(config).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(legacy.as_object().unwrap().clone());
+        let original = format!("  {}\n\n", serde_json::to_string_pretty(&value).unwrap());
+        let (_, migrated) = crate::modules::config::parse_and_migrate_config(&original).unwrap();
+        assert!(!migrated, "fixture must already satisfy current migrations");
+        let path = crate::modules::account::get_data_dir()
+            .unwrap()
+            .join("gui_config.json");
+        std::fs::write(&path, original.as_bytes()).unwrap();
+
+        let config = crate::modules::config::load_app_config().unwrap();
         assert_eq!(config.language, "zh");
+        assert_eq!(config.proxy.api_key, "legacy-config-key");
+        assert_eq!(
+            config.proxy.custom_mapping.get("custom-model").unwrap(),
+            "gemini-3.8-flash"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
         let saved = serde_json::to_value(config).unwrap();
         assert!(saved.get("auto_launch").is_none());
     }

@@ -335,6 +335,7 @@ struct AccountResponse {
     id: String,
     email: String,
     name: Option<String>,
+    custom_label: Option<String>,
     priority: u8,
     is_current: bool,
     disabled: bool,
@@ -428,6 +429,7 @@ fn to_account_response(
         id: account.id.clone(),
         email: account.email.clone(),
         name: account.name.clone(),
+        custom_label: account.custom_label.clone(),
         priority: account.priority,
         is_current: current_id.as_ref() == Some(&account.id),
         disabled: account.disabled,
@@ -788,6 +790,10 @@ impl AxumServer {
             .route("/accounts/switch", post(admin_switch_account))
             .route("/accounts/refresh", post(admin_refresh_all_quotas))
             .route("/accounts/:accountId", delete(admin_delete_account))
+            .route(
+                "/accounts/:accountId/label",
+                post(admin_update_account_label),
+            )
             .route("/accounts/:accountId/bind-device", post(admin_bind_device))
             .route(
                 "/accounts/:accountId/device-profiles",
@@ -1151,6 +1157,82 @@ impl AxumServer {
 #[cfg(test)]
 mod admin_model_catalog_tests {
     #[tokio::test]
+    async fn admin_account_label_preserves_other_fields() {
+        let fixture = crate::runtime::tests::ServerFixture::new().await;
+        let path = crate::modules::account::get_accounts_dir()
+            .unwrap()
+            .join("fixture-account.json");
+        let mut original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        original["future_field"] = serde_json::json!({"keep": [1, "value", true]});
+        original["custom_label"] = serde_json::Value::Null;
+        std::fs::write(&path, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
+        let url = format!("{}/api/accounts/fixture-account/label", fixture.url);
+        let bytes = std::fs::read(&path).unwrap();
+        let unauthorized = fixture
+            .client
+            .post(&url)
+            .json(&serde_json::json!({"label": "blocked"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        for label in ["标签测试中文字符一二三四五六七", ""] {
+            let response = fixture
+                .client
+                .post(&url)
+                .bearer_auth("fixture-key")
+                .json(&serde_json::json!({"label": label}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let mut expected = original.clone();
+            expected["custom_label"] = if label.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(label)
+            };
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved, expected, "only custom_label may change");
+            let listed: serde_json::Value = fixture
+                .client
+                .get(format!("{}/api/accounts", fixture.url))
+                .bearer_auth("fixture-key")
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let account = listed["accounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|account| account["id"] == "fixture-account")
+                .unwrap();
+            assert_eq!(account["custom_label"], expected["custom_label"]);
+        }
+        let before_rejection = std::fs::read(&path).unwrap();
+        let response = fixture
+            .client
+            .post(&url)
+            .bearer_auth("fixture-key")
+            .json(&serde_json::json!({"label": "字".repeat(16)}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read(&path).unwrap(), before_rejection);
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn removed_admin_routes_return_not_found() {
         let dist = tempfile::tempdir().unwrap();
         std::fs::write(dist.path().join("index.html"), "server-panel").unwrap();
@@ -1434,6 +1516,7 @@ async fn admin_list_accounts(
                 id: acc.id,
                 email: acc.email,
                 name: acc.name,
+                custom_label: acc.custom_label,
                 priority: acc.priority,
                 is_current,
                 disabled: acc.disabled,
@@ -1516,6 +1599,7 @@ async fn admin_get_current_account(
                 id: acc.id,
                 email: acc.email,
                 name: acc.name,
+                custom_label: acc.custom_label,
                 priority: acc.priority,
                 is_current: true,
                 disabled: acc.disabled,
@@ -2920,6 +3004,20 @@ struct ToggleProxyRequest {
 struct AccountPriorityRequest {
     #[serde(deserialize_with = "crate::models::account::deserialize_priority")]
     priority: u8,
+}
+
+#[derive(Deserialize)]
+struct AccountLabelRequest {
+    label: String,
+}
+
+async fn admin_update_account_label(
+    Path(account_id): Path<String>,
+    Json(payload): Json<AccountLabelRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    account::update_account_label(&account_id, &payload.label)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?;
+    Ok(StatusCode::OK)
 }
 
 async fn admin_update_account_priority(

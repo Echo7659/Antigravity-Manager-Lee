@@ -1046,6 +1046,39 @@ pub fn update_account_priority(account_id: &str, priority: u8) -> Result<(), Str
     save_account(&account)
 }
 
+/// 更新账号标签；空字符串清除标签，其余 JSON 字段保持原值。
+pub fn update_account_label(account_id: &str, label: &str) -> Result<(), String> {
+    if label.chars().count() > 15 {
+        return Err("标签长度不能超过15个字符".to_string());
+    }
+    if account_id.is_empty() || account_id.contains(['/', '\\']) {
+        return Err("账号 ID 无效".to_string());
+    }
+    let _account_write = lock_account_file_updates()?;
+    let account_lock = get_account_lock(account_id);
+    let _guard = account_lock
+        .lock()
+        .map_err(|e| format!("failed_to_acquire_lock: {}", e))?;
+    let path = get_accounts_dir()?.join(format!("{}.json", account_id));
+    let content = fs::read(&path).map_err(|e| format!("读取账号文件失败: {}", e))?;
+    let mut account_json: serde_json::Value =
+        serde_json::from_slice(&content).map_err(|e| format!("解析账号文件失败: {}", e))?;
+    let object = account_json
+        .as_object_mut()
+        .ok_or("账号数据必须为 JSON 对象")?;
+    object.insert(
+        "custom_label".into(),
+        if label.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::String(label.to_string())
+        },
+    );
+    let content = serde_json::to_vec_pretty(&account_json)
+        .map_err(|e| format!("序列化账号数据失败: {}", e))?;
+    crate::utils::fs::write_atomic(&path, &content)
+}
+
 /// List all accounts
 pub fn list_accounts() -> Result<Vec<Account>, String> {
     crate::modules::logger::log_info("Listing accounts...");
