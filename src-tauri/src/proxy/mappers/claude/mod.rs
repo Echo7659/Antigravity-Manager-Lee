@@ -118,7 +118,7 @@ where
                                 }
                             });
                             yield Ok(state.emit("error", error_json));
-                            break;
+                            return;
                         }
                     }
                 }
@@ -156,7 +156,7 @@ where
                             }
                         });
                         yield Ok(state.emit("error", error_json));
-                        break;
+                        return;
                     }
                     tracing::debug!(
                         "[{}] SSE idle ping #{}/{}",
@@ -184,92 +184,15 @@ where
              buffer.clear();
         }
 
-        // [FIX #Bug3] Post-thinking interruption recovery
-        // If we have sent thinking but NO content (text/tool_use) and the stream ended,
-        // we must provide a fallback to prevent loop hang on client side.
-        if state.has_thinking && !state.has_content {
-            tracing::warn!("[{}] Stream interrupted after thinking (No Content). Triggering recovery...", trace_id);
-
-            // 1. Force close thinking block if open
-            if state.current_block_type() == crate::proxy::mappers::claude::streaming::BlockType::Thinking {
-               let close_chunks = state.end_block();
-               for chunk in close_chunks {
-                   yield Ok(chunk);
-               }
-            }
-
-            // 2. Inject recovery text block to inform user
-            let recovery_msg = "\n\n[System] Upstream model interrupted after thinking. (Recovered by Antigravity)";
-            let start_chunks = state.start_block(
-                crate::proxy::mappers::claude::streaming::BlockType::Text,
-                serde_json::json!({ "type": "text", "text": recovery_msg })
-            );
-            for chunk in start_chunks { yield Ok(chunk); }
-            let stop_chunks = state.end_block();
-            for chunk in stop_chunks { yield Ok(chunk); }
-
-            // 3. Mark as content received
-            state.has_content = true;
-
-            // 4. [FIX #Bug3] Explicitly emit message_delta + message_stop.
-            // Previously, the recovery path relied on emit_force_stop() below,
-            // but if message_stop_sent was already true (e.g. from a partial finish),
-            // emit_force_stop() would be a no-op and the client would hang in loop.
-            if !state.message_stop_sent {
-                let recovery_usage = crate::proxy::mappers::claude::models::Usage {
-                    input_tokens: 0,
-                    output_tokens: 100, // Minimal non-zero to satisfy client
-                    cache_read_input_tokens: None,
-                    cache_creation_input_tokens: None,
-                    server_tool_use: None,
-                };
-                let delta = serde_json::json!({
-                    "type": "message_delta",
-                    "delta": { "stop_reason": "end_turn", "stop_sequence": null },
-                    "usage": recovery_usage
-                });
-                yield Ok(state.emit("message_delta", delta));
-                yield Ok(Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
-                state.message_stop_sent = true;
-            }
-        } else if !state.has_content && !state.has_thinking {
-            // [FIX #3359] Empty response recovery (e.g. single dot prompt health check)
-            // If the upstream ended immediately without generating thinking or text content,
-            // we must ensure message_start and at least one text block are sent before termination.
-            if !state.message_start_sent {
-                let dummy_start = serde_json::json!({
-                    "responseId": format!("msg_recovered_{}", chrono::Utc::now().timestamp_millis()),
-                    "modelVersion": "gemini-auto",
-                });
-                yield Ok(state.emit_message_start(&dummy_start));
-            }
-
-            let start_chunks = state.start_block(
-                crate::proxy::mappers::claude::streaming::BlockType::Text,
-                serde_json::json!({ "type": "text", "text": "." }),
-            );
-            for chunk in start_chunks {
-                yield Ok(chunk);
-            }
-            let stop_chunks = state.end_block();
-            for chunk in stop_chunks {
-                yield Ok(chunk);
-            }
-            state.has_content = true;
-
-            let recovery_usage = crate::proxy::mappers::claude::models::Usage {
-                input_tokens: 1,
-                output_tokens: 1,
-                cache_read_input_tokens: None,
-                cache_creation_input_tokens: None,
-                server_tool_use: None,
-            };
-            let delta = serde_json::json!({
-                "type": "message_delta",
-                "delta": { "stop_reason": "end_turn", "stop_sequence": null },
-                "usage": recovery_usage
-            });
-            yield Ok(state.emit("message_delta", delta));
+        if !state.message_stop_sent && !state.has_content {
+            yield Ok(state.emit("error", serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "upstream_error",
+                    "message": "Upstream ended without an answer or tool call (empty_response)"
+                }
+            })));
+            return;
         }
 
         if let Some(sid) = state.session_id.clone() {
@@ -322,6 +245,21 @@ fn process_sse_line(
     // 发送 message_start
     if !state.message_start_sent {
         chunks.push(state.emit_message_start(raw_json));
+    }
+
+    // 非终帧用量仍需进入监控，后续断流不能抹掉已发生的消耗。
+    if raw_json.pointer("/candidates/0/finishReason").is_none() {
+        if let Some(usage) = raw_json.get("usageMetadata") {
+            chunks.push(state.emit(
+                "message_delta",
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {},
+                    "usage": crate::proxy::pipeline::CanonicalUsage::from_gemini(usage)
+                        .to_claude_usage(state.scaling_enabled, state.context_limit)
+                }),
+            ));
+        }
     }
 
     // 捕获 groundingMetadata (Web Search)
@@ -605,7 +543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_thinking_only_interruption_recovery() {
+    async fn compat_thinking_only_interruption_reports_error() {
         use futures::StreamExt;
 
         // 1. 模拟一个只发送 Thinking 然后就结束的流
@@ -648,15 +586,10 @@ mod tests {
         }
         let output = all_chunks.join("");
 
-        // 4. 验证恢复逻辑
-        // 必须包含 Thinking
         assert!(output.contains("Thinking..."));
-
-        // 必须包含恢复的系统提示
-        assert!(output.contains("Recovered by Antigravity"));
-
-        // 必须包含模拟的 Usage
-        assert!(output.contains("\"usage\":"));
-        assert!(output.contains("\"output_tokens\":100")); // Should contain the recovery usage
+        assert!(output.contains("empty_response"));
+        assert!(!output.contains("Recovered by Antigravity"));
+        assert!(!output.contains("\"output_tokens\":100"));
+        assert!(!output.contains("event: message_stop"));
     }
 }

@@ -7,15 +7,14 @@
 //! 架构设计规范：出站发散由各协议 mapper 适配器独立实现（Gemini -> 各协议线缆格式）。
 //! 出站不设统一流水线，保持协议发散的灵活性与流式稳定性。
 
-pub mod auto_heal;
 pub mod estimator;
 pub mod inbound;
 #[cfg(test)]
 mod official_alignment_tests;
 pub mod policy;
+pub mod response_guard;
 pub mod usage;
 
-pub use auto_heal::{wrap_stream_with_empty_thinking_auto_heal, ThinkingAutoHealContext};
 pub use estimator::{estimate_tokens, PipelineTokenEstimator};
 pub use inbound::{extract_client_thinking_switch, InboundThinkingPipeline};
 pub use policy::UpstreamClassification;

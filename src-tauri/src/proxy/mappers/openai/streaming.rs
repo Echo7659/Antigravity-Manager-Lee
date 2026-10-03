@@ -355,6 +355,14 @@ where
                             }
                         }
                         Some(Err(e)) => {
+                            // 错误终止也必须透传本次调用已报告的用量。
+                            if let Some(ref usage) = final_usage {
+                                let usage_chunk = json!({
+                                    "id": &stream_id, "object": "chat.completion.chunk", "model": &model,
+                                    "choices": [], "usage": usage
+                                });
+                                yield Ok(Bytes::from(format!("data: {}\n\n", usage_chunk)));
+                            }
                             let report = report_stream_error(
                                 "openai",
                                 "create_openai_sse_stream_with_anchor",
@@ -2161,6 +2169,7 @@ mod tests {
 
         let mut all_content = String::new();
         let mut final_finish_reason: Option<String> = None;
+        let mut saw_empty_response_error = false;
 
         while let Some(result) = openai_stream.next().await {
             if let Ok(bytes) = result {
@@ -2169,6 +2178,9 @@ mod tests {
                     if line.starts_with("data: ") && !line.contains("[DONE]") {
                         let json_str = line.trim_start_matches("data: ").trim();
                         if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                            saw_empty_response_error |=
+                                json.pointer("/error/code").and_then(Value::as_str)
+                                    == Some("empty_response");
                             if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                                 if let Some(choice) = choices.first() {
                                     if let Some(delta) = choice.get("delta") {
@@ -2197,6 +2209,7 @@ mod tests {
             "Expected empty content, got: {}",
             all_content
         );
-        assert_eq!(final_finish_reason, Some("stop".to_string()));
+        assert_eq!(final_finish_reason, None);
+        assert!(saw_empty_response_error);
     }
 }
