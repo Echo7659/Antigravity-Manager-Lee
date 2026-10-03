@@ -17,6 +17,8 @@ A Linux server and Web management panel built on Rust, Axum and React. It normal
 
 Published images target **Linux/amd64** at `ghcr.io/echo7659/antigravity-manager-lee`. Use a digest from a successful CI run for the exact source commit.
 
+Stable tags `vX.Y.Z` must belong to `origin/main`; beta tags `vX.Y.Z-beta.N` must belong to `origin/beta`. CI validates the exact tag, manifest versions and bilingual changelog before any image push. Only stable main tags update latest; beta releases are prereleases and never become latest. Branch builds publish SHA images only.
+
 Copy `docker/.env.example` to `docker/.env`, then set `API_KEY`, `WEB_PASSWORD` and `IMAGE_DIGEST=sha256:...`. For existing deployments, set `ABV_HOST_DATA_DIR` to the existing absolute data path before starting.
 
 ```sh

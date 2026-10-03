@@ -17,6 +17,8 @@
 
 发布镜像为 **Linux/amd64**，名称固定为 `ghcr.io/echo7659/antigravity-manager-lee`。从目标 commit 的成功 CI 记录中取得精确镜像 digest。
 
+正式标签 `vX.Y.Z` 必须属于 `origin/main`，预览标签 `vX.Y.Z-beta.N` 必须属于 `origin/beta`。CI 在任何镜像推送前校验标签、各版本文件及中英 changelog 版本标题。只有 main 正式标签更新 latest；beta 标记为 prerelease 且不更新 latest，分支构建仅发布 SHA 镜像。
+
 复制 `docker/.env.example` 为 `docker/.env`，填写 `API_KEY`、`WEB_PASSWORD` 和 `IMAGE_DIGEST=sha256:...`。已有部署必须先将 `ABV_HOST_DATA_DIR` 指向原有数据目录的绝对路径。
 
 ```sh

@@ -2,9 +2,15 @@
 
 项目只提供 Linux/amd64 服务镜像和 Web 管理面板。唯一构建入口是 `docker/Dockerfile`，包含 Node 20 Web 构建、Rust 1.96 服务编译及最小运行镜像。
 
+构建依赖为 build-essential、pkg-config、cmake、clang、libclang-dev、perl、golang-go、git 与 ca-certificates。boring-sys2 构建需要 git init/apply；git 仅安装于构建层。运行层显式安装 ca-certificates 与 curl，实际动态库完整性由最终镜像中的 ldd 门禁验证。
+
 ## 发布镜像
 
 镜像名称：`ghcr.io/echo7659/antigravity-manager-lee`。发布 compose 按 digest 固定镜像，不自动跟随 latest。
+
+正式标签 `vX.Y.Z` 必须属于 `origin/main`；预览标签 `vX.Y.Z-beta.N` 必须属于 `origin/beta`。标签、Web/Rust/lockfile 版本及中英 changelog 中的版本标题必须完全一致。CI 在任何镜像推送前验证这些条件和标签指向的精确 commit。main/beta 分支构建只发布 SHA 镜像；只有通过校验的 main 正式标签更新镜像 latest 和 GitHub Latest Release。beta 发布设置 prerelease=true、makeLatest=false，并保留完整 beta 标签作为镜像及部署归档名称。
+
+本地可用 `python3 scripts/test_release_metadata.py` 验证通道、命名与交叉分支拒绝行为；该临时 Git fixture 不创建仓库正式标签，也不推送镜像。源码测试和 fixture 不能替代 Linux 镜像构建、容器运行与真实业务验收。
 
 1. 从目标 commit 的成功 GitHub Actions 记录或发布附件取得 `sha256:...`。
 2. 复制 `docker/.env.example` 为 `docker/.env`，填写独立的 `API_KEY`、`WEB_PASSWORD` 与 `IMAGE_DIGEST`。

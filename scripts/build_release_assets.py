@@ -5,15 +5,16 @@ import os
 import pathlib
 import re
 import tarfile
+from release_metadata import validate_release
 
 root = pathlib.Path(__file__).resolve().parents[1]
 output = pathlib.Path(os.environ['RELEASE_DIR'])
-output.mkdir(parents=True, exist_ok=True)
 tag = os.environ['RELEASE_TAG']
-assert re.fullmatch(r'v\d+\.\d+\.\d+(?:-lee\.[1-9][0-9]*)?', tag)
+version, channel, _ = validate_release(root, tag, os.environ['GITHUB_SHA'])
 image = os.environ['IMAGE_NAME']
 digest = os.environ['IMAGE_DIGEST']
 assert re.fullmatch(r'sha256:[0-9a-f]{64}', digest)
+output.mkdir(parents=True, exist_ok=True)
 reference = image + '@' + digest
 compose = (root / 'docker/docker-compose.release.yml').read_text()
 image_line = '    image: ghcr.io/echo7659/antigravity-manager-lee@${IMAGE_DIGEST:?Set IMAGE_DIGEST to the verified sha256 digest}'
@@ -21,7 +22,7 @@ assert compose.count(image_line) == 1, 'Release compose image declaration change
 compose = compose.replace(image_line, '    image: ' + reference)
 (output / 'docker-compose.yml').write_text(compose)
 (output / '.env.example').write_text((root / 'docker/.env.example').read_text().replace('IMAGE_DIGEST=', 'IMAGE_DIGEST=' + digest))
-manifest = {'release': tag, 'base_version': json.loads((root / 'package.json').read_text())['version'], 'source_revision': os.environ['GITHUB_SHA'], 'image': reference, 'platform': 'linux/amd64'}
+manifest = {'release': tag, 'base_version': version, 'channel': channel, 'source_revision': os.environ['GITHUB_SHA'], 'image': reference, 'platform': 'linux/amd64'}
 (output / 'image-manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
 (output / 'README.md').write_text(f'''# Antigravity Manager Lee {tag}
 
@@ -32,7 +33,7 @@ manifest = {'release': tag, 'base_version': json.loads((root / 'package.json').r
 首次部署时复制 `.env.example` 为 `.env` 并填写两个密钥，然后执行 `docker compose up -d`。
 现有部署应保留原端口、环境变量和数据挂载，不能直接覆盖已有数据目录。
 
-附件是部署配置包；容器镜像从 GHCR 获取。基础应用版本为 {manifest['base_version']}，Lee 发布标签单独标识定制修复。
+附件是部署配置包；容器镜像从 GHCR 获取。应用版本为 {version}，发布通道为 {channel}，标签与更新日志标题完全一致。
 
 升级前记录旧镜像 digest，备份数据目录并保留原挂载与密钥；回滚时将 compose 的 image 恢复为旧 digest 后重新启动。
 ''')

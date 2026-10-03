@@ -2,10 +2,10 @@ name: Test, Publish Image and Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, beta]
     tags: ['v*']
   pull_request:
-    branches: [main]
+    branches: [main, beta]
   workflow_dispatch:
 
 permissions:
@@ -25,6 +25,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # pinned Rust toolchain
         with:
           toolchain: 1.96.0
@@ -37,8 +39,9 @@ jobs:
         run: |
           bash scripts/check_server_only.sh
           python3 scripts/test_ci_smoke.py
+          python3 scripts/test_release_metadata.py
       - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake clang libclang-dev perl golang-go ca-certificates
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake clang libclang-dev perl golang-go git ca-certificates
       - name: Test and build Web panel
         run: |
           npm ci --legacy-peer-deps
@@ -65,6 +68,7 @@ jobs:
           cargo test --locked --manifest-path src-tauri/Cargo.toml server_runtime_ -- --test-threads=1
           cargo test --locked --manifest-path src-tauri/Cargo.toml admin_model_catalog_ -- --test-threads=1
           cargo test --locked --manifest-path src-tauri/Cargo.toml legacy_desktop_fields_are_ignored -- --test-threads=1
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --lib modules::proxy_db:: -- --test-threads=1
       - name: Test request normalization
         run: cargo test --locked --manifest-path "$RUNNER_TEMP/compat-tests/Cargo.toml" --lib request_compat
       - name: Test usage, streams and account failover
@@ -85,11 +89,16 @@ jobs:
     outputs:
       image: ${{ steps.release_meta.outputs.image }}
       digest: ${{ steps.push.outputs.digest }}
+      prerelease: ${{ steps.release_meta.outputs.prerelease }}
+      make_latest: ${{ steps.release_meta.outputs.make_latest }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
       - name: Validate release metadata
         id: release_meta
-        run: python3 scripts/release_metadata.py
+        run: |
+          python3 scripts/release_metadata.py
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Image tags and labels
         id: meta
@@ -98,10 +107,9 @@ jobs:
           images: ${{ steps.release_meta.outputs.image }}
           flavor: latest=false
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ steps.release_meta.outputs.make_latest == 'true' }}
             type=sha,format=long
             type=ref,event=tag
-            type=semver,pattern={{version}}
       - name: Build and load image for validation
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -171,23 +179,28 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
       - name: Create versioned deployment assets
         env:
           RELEASE_DIR: ${{ runner.temp }}/release
           RELEASE_TAG: ${{ github.ref_name }}
           IMAGE_NAME: ${{ needs.publish.outputs.image }}
           IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
-        run: python3 scripts/build_release_assets.py
+        run: |
+          python3 scripts/build_release_assets.py
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_DIR: ${{ runner.temp }}/release
+          PRERELEASE: ${{ needs.publish.outputs.prerelease }}
+          MAKE_LATEST: ${{ needs.publish.outputs.make_latest }}
         run: |
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR/image-manifest.json" "$RELEASE_DIR/SHA256SUMS" --clobber
-            gh release edit "$RELEASE_TAG" --notes-file "$RELEASE_DIR/RELEASE_NOTES.md"
+            gh release edit "$RELEASE_TAG" --notes-file "$RELEASE_DIR/RELEASE_NOTES.md" --prerelease="$PRERELEASE" --latest="$MAKE_LATEST"
           else
-            gh release create "$RELEASE_TAG" "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR/image-manifest.json" "$RELEASE_DIR/SHA256SUMS" --title "Antigravity Manager Lee $RELEASE_TAG" --notes-file "$RELEASE_DIR/RELEASE_NOTES.md" --verify-tag --latest
+            gh release create "$RELEASE_TAG" "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR/image-manifest.json" "$RELEASE_DIR/SHA256SUMS" --title "Antigravity Manager Lee $RELEASE_TAG" --notes-file "$RELEASE_DIR/RELEASE_NOTES.md" --verify-tag --prerelease="$PRERELEASE" --latest="$MAKE_LATEST"
           fi

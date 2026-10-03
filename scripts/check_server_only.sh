@@ -18,6 +18,7 @@ reject 'tauri::|tauri-plugin|tauri_build|gtk|webkit|appindicator' src-tauri/Carg
 reject 'cloudflared|opencode_sync|hermes_sync|openclaw_sync|droid_sync|cli_sync' src-tauri/src src
 reject '/apikey-fun|nav\.apikey_fun|apiKeyFun' src
 reject 'libgtk|webkit|appindicator|src-tauri/icons|--headless' docker/Dockerfile
+rg -q 'golang-go git ca-certificates' docker/Dockerfile
 reject 'Dockerfile\.(compat|backend)|tauri\.conf' .github/workflows scripts/release_metadata.py
 reject 'tauri\.conf|tauri-action|tauri build|MiniView|Casks/|\.dmg|\.AppImage|\.msi' \
     .github/workflows scripts/bump-version.mjs scripts/build_release_assets.py scripts/release_metadata.py

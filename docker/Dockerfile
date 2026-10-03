@@ -10,7 +10,7 @@ RUN npm run build
 
 FROM rust:1.96-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3 AS backend-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential pkg-config cmake clang libclang-dev perl golang-go ca-certificates \
+    build-essential pkg-config cmake clang libclang-dev perl golang-go git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 ARG BUILD_JOBS=2
 ENV CARGO_BUILD_JOBS=${BUILD_JOBS}
