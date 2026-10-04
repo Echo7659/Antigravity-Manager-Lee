@@ -35,6 +35,8 @@ jobs:
         with:
           node-version: 20
           cache: npm
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake clang libclang-dev perl golang-go git ca-certificates ripgrep
       - name: Check server-only boundaries
         run: |
           bash scripts/check_server_only.sh
@@ -42,8 +44,6 @@ jobs:
           python3 scripts/test_release_metadata.py
           node --test scripts/test_bump_version.mjs
           node scripts/bump-version.mjs --check
-      - name: Install native build dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config cmake clang libclang-dev perl golang-go git ca-certificates
       - name: Test and build Web panel
         run: |
           npm ci --legacy-peer-deps
