@@ -572,11 +572,11 @@ mod opus_route_tests {
             );
             assert_eq!(
                 resolve_model_route("client-opus", &mapping),
-                "claude-opus-5-5"
+                "claude-opus-5-5-high"
             );
             assert_eq!(
                 resolve_model_route(alias, &HashMap::new()),
-                "claude-opus-5-5"
+                "claude-opus-5-5-high"
             );
         }
         let key = "test-opus-retired-canonical";
@@ -588,11 +588,37 @@ mod opus_route_tests {
             &HashMap::from([("client-opus".into(), key.into())]),
         );
         DYNAMIC_MODEL_FORWARDING_RULES.remove(key);
-        assert_eq!(direct, "claude-opus-5-5");
-        assert_eq!(chained, "claude-opus-5-5");
+        assert_eq!(direct, "claude-opus-5-5-high");
+        assert_eq!(chained, "claude-opus-5-5-high");
         assert_eq!(
             resolve_model_route("provider/future-model-9", &HashMap::new()),
             "provider/future-model-9"
+        );
+    }
+
+    #[test]
+    fn opus_5_5_alias_routes_by_effort_and_preserves_physical_ids() {
+        let empty = HashMap::new();
+        for (effort, expected) in [
+            (None, "claude-opus-5-5-high"),
+            (Some("low"), "claude-opus-5-5-low"),
+            (Some("medium"), "claude-opus-5-5-medium"),
+            (Some("high"), "claude-opus-5-5-high"),
+        ] {
+            assert_eq!(
+                resolve_model_route_with_effort("claude-opus-5-5", &empty, effort),
+                expected
+            );
+        }
+        assert_eq!(
+            resolve_model_route_with_effort("claude-opus-5-5-high", &empty, Some("low")),
+            "claude-opus-5-5-high"
+        );
+
+        let custom = HashMap::from([("client-opus".into(), "claude-opus-5-5".into())]);
+        assert_eq!(
+            resolve_model_route_with_effort("client-opus", &custom, Some("medium")),
+            "claude-opus-5-5-medium"
         );
     }
 }
@@ -604,6 +630,13 @@ pub fn resolve_model_route_with_effort(
     client_effort: Option<&str>,
 ) -> String {
     if let Some(target) = resolve_configured_model_route(original_model, custom_mapping) {
+        return crate::proxy::model_specs::resolve_opus_5_5_route(&target, client_effort)
+            .unwrap_or(target);
+    }
+
+    if let Some(target) =
+        crate::proxy::model_specs::resolve_opus_5_5_route(original_model, client_effort)
+    {
         return target;
     }
 

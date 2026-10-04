@@ -9,6 +9,27 @@ pub fn is_adaptive_thinking_model(model: &str) -> bool {
         .starts_with("claude-opus-5-5")
 }
 
+pub fn resolve_opus_5_5_route(model: &str, client_effort: Option<&str>) -> Option<String> {
+    let canonical = crate::proxy::common::model_mapping::canonicalize_upstream_model_id(model);
+    if canonical != "claude-opus-5-5" {
+        return None;
+    }
+    let normalized_effort = client_effort.map(|value| value.trim().to_ascii_lowercase());
+    let tier = match normalized_effort.as_deref() {
+        Some("low") => "low",
+        Some("medium") => "medium",
+        _ => "high",
+    };
+    Some(format!("claude-opus-5-5-{tier}"))
+}
+
+pub fn is_opus_5_5_physical_variant(model: &str) -> bool {
+    matches!(
+        crate::proxy::common::model_mapping::canonicalize_upstream_model_id(model).as_str(),
+        "claude-opus-5-5-low" | "claude-opus-5-5-medium" | "claude-opus-5-5-high"
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub max_output_tokens: Option<u64>,
@@ -699,6 +720,36 @@ pub fn resolve_custom_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opus_5_5_alias_effort_routes_to_physical_tiers() {
+        for (effort, expected) in [
+            (None, "claude-opus-5-5-high"),
+            (Some("high"), "claude-opus-5-5-high"),
+            (Some("medium"), "claude-opus-5-5-medium"),
+            (Some("low"), "claude-opus-5-5-low"),
+            (Some("unexpected"), "claude-opus-5-5-high"),
+        ] {
+            assert_eq!(
+                resolve_opus_5_5_route("claude-opus-5-5", effort).as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(resolve_opus_5_5_route("claude-opus-5-5-high", Some("low")).is_none());
+    }
+
+    #[test]
+    fn opus_5_5_physical_variant_detection_is_exact() {
+        for model in [
+            "claude-opus-5-5-low",
+            "claude-opus-5-5-medium",
+            "claude-opus-5-5-high",
+        ] {
+            assert!(is_opus_5_5_physical_variant(model));
+        }
+        assert!(!is_opus_5_5_physical_variant("claude-opus-5-5"));
+        assert!(!is_opus_5_5_physical_variant("claude-opus-5-5-preview"));
+    }
 
     #[test]
     fn test_gemini_version_checks() {
