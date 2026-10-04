@@ -601,6 +601,13 @@ pub async fn handle_messages(
         || model_lower.ends_with("-extra-low");
 
     let thinking_hint = extract_thinking_hint(&original_body);
+    // 路由使用客户端原始档位；后续思考预算兼容处理可能改写 output_config.effort。
+    let routing_effort_hint = request
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.clone())
+        .or_else(|| request.thinking.as_ref().and_then(|t| t.effort.clone()))
+        .or_else(|| thinking_hint.level.clone());
     let tb_config = crate::proxy::config::get_thinking_budget_config();
     let is_client_control =
         tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
@@ -1021,12 +1028,22 @@ pub async fn handle_messages(
 
         // 2. 模型路由解析
         let mapped_model = if configured_model.is_some() {
-            request_for_body.model.clone()
+            model_specs::resolve_opus_5_5_route(
+                &request_for_body.model,
+                routing_effort_hint.as_deref(),
+            )
+            .unwrap_or_else(|| request_for_body.model.clone())
         } else {
+            let route_effort =
+                if model_specs::resolve_opus_5_5_route(&request_for_body.model, None).is_some() {
+                    routing_effort_hint.as_deref()
+                } else {
+                    effort_hint.as_deref()
+                };
             crate::proxy::common::model_mapping::resolve_model_route_with_effort(
                 &request_for_body.model,
                 &*state.custom_mapping.read().await,
-                effort_hint.as_deref(),
+                route_effort,
             )
         };
         last_mapped_model = Some(mapped_model.clone());

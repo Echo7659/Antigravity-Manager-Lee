@@ -60,6 +60,133 @@ async fn assert_forced_error(response: Response, protocol: &str, model: &str) {
     );
 }
 
+fn assert_mapped_model(response: Response, expected: &str) {
+    assert_eq!(
+        response
+            .headers()
+            .get("X-Mapped-Model")
+            .and_then(|v| v.to_str().ok()),
+        Some(expected),
+        "status: {}",
+        response.status()
+    );
+}
+
+#[tokio::test]
+async fn opus_5_5_claude_handler_routes_configured_alias_from_original_effort() {
+    let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+    let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK.lock().unwrap();
+    let saved_config = crate::proxy::config::get_thinking_budget_config();
+    let state = empty_state();
+    {
+        let mut mapping = state.custom_mapping.write().await;
+        mapping.insert("client-opus".into(), "claude-opus-5-5".into());
+        mapping.insert("claude-opus-5-5".into(), "claude-opus-5-5-low".into());
+    }
+
+    for control_source in [
+        crate::proxy::config::ThinkingControlSource::Gateway,
+        crate::proxy::config::ThinkingControlSource::Client,
+    ] {
+        let mut config = saved_config.clone();
+        config.control_source = control_source;
+        crate::proxy::config::update_thinking_budget_config(config);
+        for (effort, expected) in [
+            (Some("low"), "claude-opus-5-5-low"),
+            (Some("medium"), "claude-opus-5-5-medium"),
+            (Some("high"), "claude-opus-5-5-high"),
+            (Some("unrecognized"), "claude-opus-5-5-high"),
+            (None, "claude-opus-5-5-high"),
+        ] {
+            let mut body = json!({"model":"client-opus","max_tokens":64,"messages":[{"role":"user","content":"Hello"}]});
+            if let Some(effort) = effort {
+                body["reasoning_effort"] = json!(effort);
+            }
+            let response = handlers::claude::handle_messages(
+                State(state.clone()),
+                HeaderMap::new(),
+                None,
+                None,
+                Json(body),
+            )
+            .await;
+            assert_mapped_model(response, expected);
+        }
+    }
+    crate::proxy::config::update_thinking_budget_config(saved_config);
+}
+
+#[tokio::test]
+async fn opus_5_5_handlers_preserve_mapping_boundaries_and_physical_ids() {
+    let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+    let state = empty_state();
+    let retired = "opus-5-5-retired-handler-test";
+    crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
+        .insert(retired.into(), "claude-opus-5-5".into());
+    {
+        let mut mapping = state.custom_mapping.write().await;
+        mapping.insert("client-opus".into(), "claude-opus-5-5".into());
+        mapping.insert("claude-opus-5-5".into(), "claude-opus-5-5-low".into());
+    }
+
+    for (model, effort, expected) in [
+        ("client-opus", Some("medium"), "claude-opus-5-5-medium"),
+        ("client-opus", None, "claude-opus-5-5-high"),
+        (retired, Some("medium"), "claude-opus-5-5-medium"),
+        ("claude-opus-5-5-high", Some("low"), "claude-opus-5-5-high"),
+    ] {
+        let mut chat = json!({"model":model,"messages":[{"role":"user","content":"Hello"}]});
+        if let Some(effort) = effort {
+            chat["reasoning_effort"] = json!(effort);
+        }
+        let response = handlers::openai::handle_chat_completions(
+            State(state.clone()),
+            HeaderMap::new(),
+            None,
+            None,
+            Json(chat),
+        )
+        .await
+        .into_response();
+        assert_mapped_model(response, expected);
+    }
+
+    for (field, expected) in [
+        ("reasoningEffort", "claude-opus-5-5-medium"),
+        ("thinkingLevel", "claude-opus-5-5-medium"),
+        ("thinking_level", "claude-opus-5-5-medium"),
+    ] {
+        let mut body = json!({"model":"client-opus","max_tokens":64,"messages":[{"role":"user","content":"Hello"}]});
+        body[field] = json!("medium");
+        let response = handlers::claude::handle_messages(
+            State(state.clone()),
+            HeaderMap::new(),
+            None,
+            None,
+            Json(body),
+        )
+        .await;
+        assert_mapped_model(response, expected);
+    }
+    for (model, effort, expected) in [
+        ("client-opus", "medium", "claude-opus-5-5-medium"),
+        (retired, "medium", "claude-opus-5-5-medium"),
+        ("claude-opus-5-5-high", "low", "claude-opus-5-5-high"),
+    ] {
+        let body = json!({"model":model,"max_tokens":64,"messages":[{"role":"user","content":"Hello"}],"output_config":{"effort":effort}});
+        let response = handlers::claude::handle_messages(
+            State(state.clone()),
+            HeaderMap::new(),
+            None,
+            None,
+            Json(body),
+        )
+        .await;
+        assert_mapped_model(response, expected);
+    }
+    crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES.remove(retired);
+}
+
 #[tokio::test]
 async fn opus_5_5_protocol_handlers_reject_alias_forced_tools_before_account_selection() {
     let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
