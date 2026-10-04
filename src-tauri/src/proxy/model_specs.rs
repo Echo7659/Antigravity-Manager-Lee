@@ -25,7 +25,7 @@ pub fn resolve_opus_5_5_route(model: &str, client_effort: Option<&str>) -> Optio
 
 pub fn is_opus_5_5_physical_variant(model: &str) -> bool {
     matches!(
-        crate::proxy::common::model_mapping::canonicalize_upstream_model_id(model).as_str(),
+        model,
         "claude-opus-5-5-low" | "claude-opus-5-5-medium" | "claude-opus-5-5-high"
     )
 }
@@ -749,6 +749,10 @@ mod tests {
         }
         assert!(!is_opus_5_5_physical_variant("claude-opus-5-5"));
         assert!(!is_opus_5_5_physical_variant("claude-opus-5-5-preview"));
+        assert!(!is_opus_5_5_physical_variant(
+            "anthropic/claude-opus-5-5-high"
+        ));
+        assert!(!is_opus_5_5_physical_variant("claude-opus-5.5-high"));
     }
 
     #[test]

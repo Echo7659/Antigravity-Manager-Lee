@@ -921,6 +921,17 @@ mod tests {
             model_ids_from_catalog(["claude-sonnet-5-5-high".to_string()], &mapping, false),
             vec!["claude-sonnet-5-5-high"]
         );
+        assert_eq!(
+            model_ids_from_catalog(
+                [
+                    "anthropic/claude-opus-5-5-high".to_string(),
+                    "claude-opus-5.5-high".to_string(),
+                ],
+                &mapping,
+                false,
+            ),
+            vec!["anthropic/claude-opus-5-5-high", "claude-opus-5.5-high"]
+        );
     }
 
     #[tokio::test]
