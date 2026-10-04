@@ -170,7 +170,7 @@ pub struct ProxyToken {
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
 }
 
-/// Opus 5.5 仅允许 Ultra 或具有明确付费证据的 Pro。
+/// Opus 5.5 的订阅等级必须为 Ultra 或具有明确付费证据的 Pro。
 pub fn is_opus_5_5_eligible(tier: &str, paid: bool) -> bool {
     match crate::models::quota::normalize_subscription_tier(tier).as_str() {
         "ULTRA" => true,
@@ -180,11 +180,18 @@ pub fn is_opus_5_5_eligible(tier: &str, paid: bool) -> bool {
 }
 
 fn is_model_account_eligible(token: &ProxyToken, model: &str) -> bool {
-    !crate::proxy::model_specs::is_adaptive_thinking_model(model)
-        || is_opus_5_5_eligible(
-            token.subscription_tier.as_deref().unwrap_or(""),
-            token.is_paid_subscription,
-        )
+    if !crate::proxy::model_specs::is_adaptive_thinking_model(model) {
+        return true;
+    }
+
+    let canonical = crate::proxy::common::model_mapping::canonicalize_upstream_model_id(model);
+    let physical_model =
+        crate::proxy::model_specs::resolve_opus_5_5_route(&canonical, None).unwrap_or(canonical);
+
+    is_opus_5_5_eligible(
+        token.subscription_tier.as_deref().unwrap_or(""),
+        token.is_paid_subscription,
+    ) && token.exact_model_quotas.contains_key(&physical_model)
 }
 
 fn is_account_quota_protected(token: &ProxyToken, protection_enabled: bool) -> bool {
@@ -4349,17 +4356,55 @@ mod tests {
             let mut token = create_test_token("test", Some(tier), 1.0, None, Some(100));
             token.is_paid_subscription = paid;
             for model in [
+                "claude-opus-5-5-low",
+                "claude-opus-5-5-medium",
+                "claude-opus-5-5-high",
+            ] {
+                token.exact_model_quotas.insert(model.to_string(), 100);
+            }
+            for model in [
                 "claude-opus-5-5",
                 "claude-opus-5-5-low",
                 "claude-opus-5-5-medium",
                 "claude-opus-5-5-high",
-                "claude-opus-5-5-20261001",
                 "anthropic/claude-opus-5-5",
                 "claude-opus-5.5",
                 "models/anthropic/claude-opus-5.5",
                 "models/models/anthropic/anthropic/claude-opus-5.5",
             ] {
                 assert_eq!(is_model_account_eligible(&token, model), eligible);
+            }
+            assert!(!is_model_account_eligible(
+                &token,
+                "claude-opus-5-5-20261001"
+            ));
+            token.exact_model_quotas.clear();
+            assert!(!is_model_account_eligible(&token, "claude-opus-5-5-high"));
+            token
+                .exact_model_quotas
+                .insert("claude-opus-5-5-20261001".to_string(), 100);
+            assert_eq!(
+                is_model_account_eligible(&token, "claude-opus-5-5-20261001"),
+                eligible
+            );
+            token.exact_model_quotas.clear();
+            token
+                .exact_model_quotas
+                .insert("claude-opus-5-5-low".to_string(), 100);
+            assert_eq!(
+                is_model_account_eligible(&token, "claude-opus-5-5-low"),
+                eligible
+            );
+            assert_eq!(
+                is_model_account_eligible(&token, "models/anthropic/claude-opus-5-5-low"),
+                eligible
+            );
+            for unavailable in [
+                "claude-opus-5-5",
+                "claude-opus-5-5-medium",
+                "claude-opus-5-5-high",
+            ] {
+                assert!(!is_model_account_eligible(&token, unavailable));
             }
             assert!(is_model_account_eligible(&token, "claude-opus-4-6"));
             assert!(is_model_account_eligible(&token, "gemini-3.1-pro"));
@@ -4388,6 +4433,18 @@ mod tests {
                 serde_json::json!({"opus-eligibility-retired-test":"anthropic/claude-opus-5.5"});
             if let Some(paid) = paid {
                 account["quota"]["is_paid_subscription"] = serde_json::json!(paid);
+            }
+            if id == "ultra" {
+                account["quota"]["models"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "name": "claude-opus-5-5-high",
+                        "percentage": 100,
+                        "reset_time": chrono::DateTime::from_timestamp(now + 7200, 0)
+                            .unwrap()
+                            .to_rfc3339()
+                    }));
             }
             std::fs::write(accounts.join(format!("{id}.json")), account.to_string()).unwrap();
         }
@@ -4425,25 +4482,18 @@ mod tests {
             "retired Opus 5.5 aliases use the default physical tier"
         );
         for model in [
-            "claude-opus-5-5-20261001",
             "anthropic/claude-opus-5-5",
             "claude-opus-5.5",
             canonical.as_str(),
             forwarded.as_str(),
         ] {
             excluded.clear();
-            for _ in 0..2 {
-                let (_, _, _, selected, _) = manager
-                    .get_token_filtered("claude", false, Some("session"), model, &excluded)
-                    .await
-                    .unwrap();
-                assert!(matches!(selected.as_str(), "ultra" | "paid"));
-                assert!(excluded.insert(selected));
-            }
-            assert_eq!(
-                excluded,
-                HashSet::from(["ultra".to_string(), "paid".to_string()])
-            );
+            let (_, _, _, selected, _) = manager
+                .get_token_filtered("claude", false, Some("session"), model, &excluded)
+                .await
+                .unwrap();
+            assert_eq!(selected, "ultra");
+            assert!(excluded.insert(selected));
             assert!(manager
                 .get_token_filtered(
                     "claude",
@@ -4455,6 +4505,16 @@ mod tests {
                 .await
                 .is_err());
         }
+        assert!(manager
+            .get_token_filtered(
+                "claude",
+                false,
+                None,
+                "claude-opus-5-5-20261001",
+                &HashSet::new(),
+            )
+            .await
+            .is_err());
         crate::proxy::common::model_mapping::DYNAMIC_MODEL_FORWARDING_RULES
             .remove("opus-eligibility-retired-test");
         let (_, _, _, selected, _) = manager
@@ -4465,6 +4525,24 @@ mod tests {
         let mut paid_account: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(accounts.join("paid.json")).unwrap())
                 .unwrap();
+        paid_account["quota"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": "claude-opus-5-5-high",
+                "percentage": 100,
+                "reset_time": chrono::DateTime::from_timestamp(now + 7200, 0)
+                    .unwrap()
+                    .to_rfc3339()
+            }));
+        std::fs::write(accounts.join("paid.json"), paid_account.to_string()).unwrap();
+        manager.reload_account("paid").await.unwrap();
+        excluded.remove("paid");
+        let (_, _, _, selected, _) = manager
+            .get_token_filtered("claude", false, None, "claude-opus-5-5", &excluded)
+            .await
+            .unwrap();
+        assert_eq!(selected, "paid");
         paid_account["quota"]["is_paid_subscription"] = serde_json::json!(false);
         std::fs::write(accounts.join("paid.json"), paid_account.to_string()).unwrap();
         manager.reload_account("paid").await.unwrap();
