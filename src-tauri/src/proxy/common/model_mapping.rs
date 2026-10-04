@@ -316,6 +316,14 @@ pub fn model_ids_from_catalog(
         .filter(|id| is_public_snapshot_model_id(id))
         .collect();
 
+    let has_opus_5_5 = model_ids
+        .iter()
+        .any(|model| crate::proxy::model_specs::is_opus_5_5_physical_variant(model));
+
+    if !only_raw_quota_models && has_opus_5_5 {
+        model_ids.insert("claude-opus-5-5".to_string());
+    }
+
     // 配置允许时追加用户自定义映射名称。
     if !only_raw_quota_models {
         for key in custom_mapping.keys() {
@@ -889,6 +897,29 @@ mod tests {
                 "nova-pro-image-flash-v9",
                 "nova-x-1"
             ]
+        );
+    }
+
+    #[test]
+    fn opus_5_5_catalog_alias_is_dynamic_and_not_raw() {
+        let physical = [
+            "claude-opus-5-5-low".to_string(),
+            "claude-opus-5-5-medium".to_string(),
+            "claude-opus-5-5-high".to_string(),
+        ];
+        let mapping = HashMap::new();
+
+        let normal = model_ids_from_catalog(physical.clone(), &mapping, false);
+        assert!(normal.contains(&"claude-opus-5-5".to_string()));
+        for model in &physical {
+            assert!(normal.contains(model));
+        }
+
+        let raw = model_ids_from_catalog(physical, &mapping, true);
+        assert!(!raw.contains(&"claude-opus-5-5".to_string()));
+        assert_eq!(
+            model_ids_from_catalog(["claude-sonnet-5-5-high".to_string()], &mapping, false),
+            vec!["claude-sonnet-5-5-high"]
         );
     }
 
