@@ -72,10 +72,19 @@ fn assert_mapped_model(response: Response, expected: &str) {
     );
 }
 
-#[tokio::test]
-async fn opus_5_5_claude_handler_routes_configured_alias_from_original_effort() {
-    let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+#[test]
+fn opus_5_5_claude_handler_routes_configured_alias_from_original_effort() {
+    // 全局思考预算配置锁覆盖完整异步调用，避免并行测试改写控制模式。
     let _config_lock = crate::proxy::config::TEST_CONFIG_LOCK.lock().unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(opus_5_5_claude_handler_routes_configured_alias_body());
+}
+
+async fn opus_5_5_claude_handler_routes_configured_alias_body() {
+    let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
     let saved_config = crate::proxy::config::get_thinking_budget_config();
     let state = empty_state();
     {
