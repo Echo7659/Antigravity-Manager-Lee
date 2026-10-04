@@ -4417,7 +4417,10 @@ mod tests {
             "opus-eligibility-retired-test",
             &HashMap::new(),
         );
-        assert_eq!(forwarded, "claude-opus-5-5");
+        assert_eq!(
+            forwarded, "claude-opus-5-5-high",
+            "retired Opus 5.5 aliases use the default physical tier"
+        );
         for model in [
             "claude-opus-5-5-20261001",
             "anthropic/claude-opus-5-5",

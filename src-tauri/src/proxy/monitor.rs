@@ -123,7 +123,10 @@ pub(crate) mod prompt_log_tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(billing_model, "claude-opus-5-5");
+        assert_eq!(
+            billing_model, "claude-opus-5-5-high",
+            "billing uses the resolved default physical tier"
+        );
         let models = crate::modules::token_stats::get_model_stats(1).unwrap();
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].model, "claude-opus-5-5");
