@@ -4350,6 +4350,9 @@ mod tests {
             token.is_paid_subscription = paid;
             for model in [
                 "claude-opus-5-5",
+                "claude-opus-5-5-low",
+                "claude-opus-5-5-medium",
+                "claude-opus-5-5-high",
                 "claude-opus-5-5-20261001",
                 "anthropic/claude-opus-5-5",
                 "claude-opus-5.5",

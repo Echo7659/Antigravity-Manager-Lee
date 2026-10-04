@@ -846,6 +846,9 @@ mod tests {
     fn pricing_opus_5_5_includes_model_specific_cache_price() {
         for alias in [
             "anthropic/claude-opus-5-5",
+            "claude-opus-5-5-low",
+            "claude-opus-5-5-medium",
+            "claude-opus-5-5-high",
             "claude-opus-5.5",
             "models/anthropic/claude-opus-5.5",
             "models/models/anthropic/anthropic/claude-opus-5.5",

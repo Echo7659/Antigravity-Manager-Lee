@@ -143,6 +143,41 @@ fn opus_5_5_protocol_gemini_disabled_and_manual_budget() {
 }
 
 #[test]
+fn opus_5_5_physical_tiers_keep_adaptive_thinking() {
+    for model in [
+        "claude-opus-5-5-low",
+        "claude-opus-5-5-medium",
+        "claude-opus-5-5-high",
+    ] {
+        let mut generation_config = json!({
+            "thinkingConfig": {"thinkingBudget": 4096, "budgetTokens": 2048},
+            "thinking_config": {"budget_tokens": 1024}
+        });
+        super::InboundThinkingPipeline::configure_inbound_thinking(
+            model,
+            &mut generation_config,
+            crate::proxy::pipeline::inbound::ClientThinkingSwitch::Default,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            generation_config,
+            json!({
+                "thinkingConfig": {"includeThoughts": true}
+            }),
+            "unexpected thinking configuration for {model}"
+        );
+        for field in ["thinkingBudget", "budgetTokens", "budget_tokens"] {
+            assert!(
+                generation_config.to_string().find(field).is_none(),
+                "{field} must be absent for {model}"
+            );
+        }
+    }
+}
+
+#[test]
 fn opus_5_5_protocol_unknown_model_passthrough() {
     let model = "future-model-9";
     assert_eq!(
