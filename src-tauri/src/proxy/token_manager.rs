@@ -191,11 +191,28 @@ fn is_model_account_eligible(token: &ProxyToken, model: &str) -> bool {
     is_opus_5_5_eligible(
         token.subscription_tier.as_deref().unwrap_or(""),
         token.is_paid_subscription,
-    ) && token.exact_model_quotas.contains_key(&physical_model)
+    ) && token
+        .exact_model_quotas
+        .get(&physical_model)
+        .is_some_and(|percentage| *percentage > 0)
 }
 
 fn is_account_quota_protected(token: &ProxyToken, protection_enabled: bool) -> bool {
     protection_enabled && !token.protected_models.is_empty()
+}
+
+fn is_model_quota_protected(
+    token: &ProxyToken,
+    protection_enabled: bool,
+    target_model: &str,
+) -> bool {
+    if !protection_enabled {
+        return false;
+    }
+
+    let protected_key = crate::proxy::common::model_mapping::normalize_to_standard_id(target_model)
+        .unwrap_or_else(|| target_model.to_string());
+    token.protected_models.contains(&protected_key)
 }
 
 fn normalized_protection_models(models: &[String]) -> Vec<String> {
@@ -1455,7 +1472,7 @@ impl TokenManager {
         let mut available: Vec<&ProxyToken> = candidates
             .iter()
             .filter(|t| !attempted.contains(&t.account_id))
-            .filter(|t| !is_account_quota_protected(t, quota_protection_enabled))
+            .filter(|t| !is_model_quota_protected(t, quota_protection_enabled, &normalized_target))
             .collect();
 
         // Keep lower-priority groups for retries; only this draw is restricted.
@@ -1766,7 +1783,7 @@ impl TokenManager {
         if protection_enabled {
             tokens_snapshot.retain(|t| {
                 !self.quota_refresh_inflight.contains_key(&t.account_id)
-                    && !is_account_quota_protected(t, true)
+                    && !is_model_quota_protected(t, true, target_model)
             });
         }
 
@@ -1907,8 +1924,11 @@ impl TokenManager {
                         let is_rate_limited = self
                             .is_rate_limited(&preferred_token.account_id, Some(&normalized_target))
                             .await;
-                        let is_quota_protected =
-                            is_account_quota_protected(&preferred_token, quota_protection_enabled);
+                        let is_quota_protected = is_model_quota_protected(
+                            &preferred_token,
+                            quota_protection_enabled,
+                            target_model,
+                        );
 
                         if !is_rate_limited && !is_quota_protected {
                             tracing::info!(
@@ -2155,15 +2175,22 @@ impl TokenManager {
                             );
                             self.session_accounts.remove(sid);
                         } else if !attempted.contains(&bound_id)
-                            && !is_account_quota_protected(bound_token, quota_protection_enabled)
+                            && !is_model_quota_protected(
+                                bound_token,
+                                quota_protection_enabled,
+                                target_model,
+                            )
                         {
                             // 3. 账号可用且未被标记为尝试失败，优先复用
                             tracing::info!("Sticky Session: Successfully reusing bound account {} for session {}", bound_token.email, sid);
                             target_token = Some(bound_token.clone());
                             need_update_last_used =
                                 Some((bound_token.account_id.clone(), std::time::Instant::now()));
-                        } else if is_account_quota_protected(bound_token, quota_protection_enabled)
-                        {
+                        } else if is_model_quota_protected(
+                            bound_token,
+                            quota_protection_enabled,
+                            target_model,
+                        ) {
                             tracing::debug!("Sticky Session: Bound account {} is weekly-quota-protected, unbinding and switching.", bound_token.email);
                             self.session_accounts.remove(sid);
                         } else if attempted.contains(&bound_id) {
@@ -2201,7 +2228,11 @@ impl TokenManager {
                                 if !self
                                     .is_rate_limited(&found.account_id, Some(&normalized_target))
                                     .await
-                                    && !is_account_quota_protected(found, quota_protection_enabled)
+                                    && !is_model_quota_protected(
+                                        found,
+                                        quota_protection_enabled,
+                                        target_model,
+                                    )
                                 {
                                     tracing::debug!(
                                         "60s Window: Force reusing last account: {}",
@@ -2363,7 +2394,11 @@ impl TokenManager {
                                             Some(&normalized_target),
                                         )
                                         .await
-                                    || is_account_quota_protected(token, quota_protection_enabled)
+                                    || is_model_quota_protected(
+                                        token,
+                                        quota_protection_enabled,
+                                        target_model,
+                                    )
                                 {
                                     continue;
                                 }
@@ -3068,7 +3103,7 @@ impl TokenManager {
             }
 
             // 2. 检查是否被配额保护(如果启用)
-            if is_account_quota_protected(token, quota_protection_enabled) {
+            if is_model_quota_protected(token, quota_protection_enabled, target_model) {
                 tracing::debug!(
                     "[Fallback Check] Account {} is weekly-quota-protected, skipping",
                     token.email
@@ -4409,6 +4444,47 @@ mod tests {
             assert!(is_model_account_eligible(&token, "claude-opus-4-6"));
             assert!(is_model_account_eligible(&token, "gemini-3.1-pro"));
         }
+    }
+
+    #[test]
+    fn quota_protection_only_blocks_the_requested_model_family() {
+        let mut token = create_test_token("ultra", Some("ULTRA"), 1.0, None, Some(100));
+        token
+            .protected_models
+            .insert("gemini-3-pro-high".to_string());
+        assert!(!is_model_quota_protected(
+            &token,
+            true,
+            "claude-opus-5-5-low"
+        ));
+
+        token.protected_models.insert("claude".to_string());
+        assert!(is_model_quota_protected(
+            &token,
+            true,
+            "claude-opus-5-5-low"
+        ));
+        assert!(!is_model_quota_protected(
+            &token,
+            false,
+            "claude-opus-5-5-low"
+        ));
+    }
+
+    #[test]
+    fn opus_5_5_requires_positive_exact_variant_quota() {
+        let mut token = create_test_token("ultra", Some("ULTRA"), 1.0, None, Some(100));
+        token.is_paid_subscription = true;
+        token
+            .exact_model_quotas
+            .insert("claude-opus-5-5-low".to_string(), 0);
+        token
+            .exact_model_quotas
+            .insert("claude-opus-5-5-high".to_string(), 100);
+
+        assert!(!is_model_account_eligible(&token, "claude-opus-5-5-low"));
+        assert!(is_model_account_eligible(&token, "claude-opus-5-5-high"));
+        assert!(!is_model_account_eligible(&token, "claude-opus-5-5-medium"));
     }
 
     #[tokio::test]
