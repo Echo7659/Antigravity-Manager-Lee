@@ -174,6 +174,7 @@ fn health_check_api_key(env: impl Fn(&str) -> Option<String>) -> Result<Option<S
         .or_else(fallback))
 }
 
+#[cfg(test)]
 async fn probe_server_health(server: &proxy::AxumServer, port: u16) -> bool {
     let api_key = server.current_api_key().await;
     probe_health(port, Some(&api_key)).await
