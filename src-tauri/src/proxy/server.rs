@@ -491,6 +491,7 @@ pub struct AxumServer {
 
 impl AxumServer {
     /// 返回当前生效的 API key，供内部探活读取共享鉴权状态。
+    #[cfg(test)]
     pub(crate) async fn current_api_key(&self) -> String {
         self.security_state.read().await.api_key.clone()
     }

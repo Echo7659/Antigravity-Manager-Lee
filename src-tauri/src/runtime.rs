@@ -239,10 +239,20 @@ fn run_blocking_health_check(port: u16, api_key: Option<&str>, timeout: Duration
     }
 
     let mut response = [0_u8; 256];
-    let Ok(read) = stream.read(&mut response) else {
-        return false;
-    };
-    response[..read].starts_with(b"HTTP/1.1 200 ") || response[..read].starts_with(b"HTTP/1.0 200 ")
+    let mut read = 0;
+    while read < response.len() && !response[..read].windows(2).any(|part| part == b"\r\n") {
+        match stream.read(&mut response[read..]) {
+            Ok(0) => break,
+            Ok(count) => read += count,
+            Err(_) => return false,
+        }
+    }
+    let status_line_end = response[..read]
+        .windows(2)
+        .position(|part| part == b"\r\n")
+        .unwrap_or(read);
+    let status_line = &response[..status_line_end];
+    status_line.starts_with(b"HTTP/1.1 200 ") || status_line.starts_with(b"HTTP/1.0 200 ")
 }
 
 fn record_watchdog_probe(failures: &mut u8, healthy: bool) -> bool {
@@ -746,6 +756,31 @@ pub(crate) mod tests {
         .await
         .unwrap());
         fixture.shutdown().await;
+    }
+
+    #[test]
+    fn blocking_health_probe_accepts_split_status_line() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 ").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            stream
+                .write_all(b"200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+
+        assert!(super::run_blocking_health_check(
+            port,
+            None,
+            std::time::Duration::from_secs(2)
+        ));
+        server.join().unwrap();
     }
 
     #[test]

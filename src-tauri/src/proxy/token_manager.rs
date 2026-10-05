@@ -300,6 +300,24 @@ impl TokenManager {
         *count
     }
 
+    async fn handle_invalid_grant_failure<DisableFuture>(
+        &self,
+        account_id: &str,
+        disable: DisableFuture,
+    ) -> (u32, bool)
+    where
+        DisableFuture: std::future::Future<Output = ()>,
+    {
+        let count = self.record_invalid_grant_failure(account_id);
+        if count < 2 {
+            return (count, false);
+        }
+
+        disable.await;
+        self.invalid_grant_failures.remove(account_id);
+        (count, true)
+    }
+
     pub(crate) fn register_image_scheduler(&self, scheduler: &Arc<ImageScheduler>) {
         if let Ok(mut slot) = self.image_scheduler.write() {
             *slot = Some(Arc::downgrade(scheduler));
@@ -1763,10 +1781,7 @@ impl TokenManager {
         let target_model = canonical_model.as_str();
         let mut tokens_snapshot: Vec<ProxyToken> =
             self.tokens.iter().map(|e| e.value().clone()).collect();
-        tokens_snapshot.retain(|token| {
-            !excluded_accounts.contains(&token.account_id)
-                && is_model_account_eligible(token, target_model)
-        });
+        tokens_snapshot.retain(|token| !excluded_accounts.contains(&token.account_id));
         let mut total = tokens_snapshot.len();
         if total == 0 {
             return Err("Token pool is empty".to_string());
@@ -1781,11 +1796,31 @@ impl TokenManager {
 
         // 仅保留明确拥有该模型配额的账号
         // 这一步确保了 "保证有模型才可以进入轮询"，特别是对 Opus 4.6 等高端模型
-        let candidate_count_before = tokens_snapshot.len();
+        tokens_snapshot.retain(|token| is_model_account_eligible(token, target_model));
+        if tokens_snapshot.is_empty() {
+            tracing::warn!(
+                "No account is eligible for model {} based on subscription tier and exact model quota",
+                normalized_target
+            );
+            return Err(format!(
+                "No accounts available with quota for model: {}",
+                normalized_target
+            ));
+        }
 
         // 此处假设所有受支持的模型都会出现在 model_quotas 中
         // 如果 API 返回的配额信息不完整，可能会导致误杀，但为了严格性，我们执行此过滤
         tokens_snapshot.retain(|t| t.model_quotas.contains_key(&normalized_target));
+        if tokens_snapshot.is_empty() {
+            tracing::warn!(
+                "No eligible account advertises quota for model {}",
+                normalized_target
+            );
+            return Err(format!(
+                "No accounts available with quota for model: {}",
+                normalized_target
+            ));
+        }
         let protection_enabled = crate::modules::config::load_app_config()
             .map(|config| config.quota_protection.enabled)
             .unwrap_or(false);
@@ -1797,19 +1832,16 @@ impl TokenManager {
         }
 
         if tokens_snapshot.is_empty() {
-            if candidate_count_before > 0 {
-                // 如果过滤前有账号，过滤后没了，说明所有账号都没有该模型的配额
-                tracing::warn!(
-                    "No accounts have satisfied quota for model: {}",
-                    normalized_target
-                );
-                return Err(format!(
-                    "No accounts available with quota for model: {}",
-                    normalized_target
-                ));
-            }
-            return Err("Token pool is empty".to_string());
+            tracing::warn!(
+                "Eligible accounts for model {} are unavailable during quota refresh or model quota protection",
+                normalized_target
+            );
+            return Err(format!(
+                "No accounts available with quota for model: {}",
+                normalized_target
+            ));
         }
+        total = tokens_snapshot.len();
 
         tokens_snapshot.sort_by(|a, b| {
             let priority_cmp = a.priority.cmp(&b.priority);
@@ -2550,22 +2582,21 @@ impl TokenManager {
                                 let is_grant_error =
                                     e.contains("\"invalid_grant\"") || e.contains("invalid_grant");
                                 if is_grant_error {
-                                    let current_fails =
-                                        self.record_invalid_grant_failure(&token.account_id);
-                                    if current_fails >= 2 {
-                                        tracing::error!(
-                                            "账号 {} 连续 {} 次确认为 invalid_grant，正式执行停用",
-                                            token.email,
-                                            current_fails
-                                        );
-                                        let _ = self
-                                            .disable_account(
-                                                &token.account_id,
-                                                &format!("invalid_grant: {}", e),
-                                            )
-                                            .await;
-                                        self.invalid_grant_failures.remove(&token.account_id);
-                                    } else {
+                                    let (current_fails, disabled) = self
+                                        .handle_invalid_grant_failure(&token.account_id, async {
+                                            tracing::error!(
+                                                "账号 {} 连续达到 invalid_grant 阈值，正式执行停用",
+                                                token.email,
+                                            );
+                                            let _ = self
+                                                .disable_account(
+                                                    &token.account_id,
+                                                    &format!("invalid_grant: {}", e),
+                                                )
+                                                .await;
+                                        })
+                                        .await;
+                                    if !disabled {
                                         tracing::warn!(
                                             "账号 {} 首次确认为 invalid_grant (计数 {}/2)，暂不停用，跳过本次调度",
                                             token.email,
@@ -4383,15 +4414,30 @@ mod tests {
         assert!(!manager.abandon_session("session", "account-a"));
     }
 
-    #[test]
-    fn invalid_grant_counter_releases_map_guard_before_follow_up_work() {
+    #[tokio::test]
+    async fn invalid_grant_threshold_runs_async_disable_and_cleans_counter() {
         let manager = TokenManager::new(PathBuf::new());
-        assert_eq!(manager.record_invalid_grant_failure("account-a"), 1);
-        assert_eq!(manager.record_invalid_grant_failure("account-a"), 2);
-        assert_eq!(
-            manager.invalid_grant_failures.remove("account-a"),
-            Some(("account-a".to_string(), 2))
-        );
+        let disabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let (count, did_disable) = manager
+            .handle_invalid_grant_failure("account-a", async {})
+            .await;
+        assert_eq!((count, did_disable), (1, false));
+        assert_eq!(*manager.invalid_grant_failures.get("account-a").unwrap(), 1);
+
+        let disabled_after_await = disabled.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.handle_invalid_grant_failure("account-a", async move {
+                tokio::task::yield_now().await;
+                disabled_after_await.store(true, std::sync::atomic::Ordering::SeqCst);
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, (2, true));
+        assert!(disabled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!manager.invalid_grant_failures.contains_key("account-a"));
     }
 
     #[test]
