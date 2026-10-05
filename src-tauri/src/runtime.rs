@@ -1,6 +1,31 @@
 use crate::{models::AppConfig, modules, proxy};
 use std::{sync::Arc, time::Duration};
 
+struct WatchdogHandle {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WatchdogHandle {
+    fn disabled() -> Self {
+        Self {
+            stop: None,
+            thread: None,
+        }
+    }
+
+    fn stop(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            tracing::warn!("Health watchdog thread panicked during shutdown");
+        }
+    }
+}
+
 /// 常驻 HTTP 服务及其监听任务；逻辑代理开关不销毁账号池。
 pub struct ServerRuntime {
     pub server: proxy::AxumServer,
@@ -184,6 +209,92 @@ async fn probe_health(port: u16, api_key: Option<&str>) -> bool {
     )
 }
 
+fn run_blocking_health_check(port: u16, api_key: Option<&str>, timeout: Duration) -> bool {
+    use std::io::{Read, Write};
+
+    let address = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, timeout) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        return false;
+    }
+
+    let mut request =
+        String::from("GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
+    if let Some(key) = api_key.filter(|key| !key.is_empty()) {
+        if key.contains(['\r', '\n']) {
+            return false;
+        }
+        request.push_str("Authorization: Bearer ");
+        request.push_str(key);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    let mut response = [0_u8; 256];
+    let Ok(read) = stream.read(&mut response) else {
+        return false;
+    };
+    response[..read].starts_with(b"HTTP/1.1 200 ") || response[..read].starts_with(b"HTTP/1.0 200 ")
+}
+
+fn record_watchdog_probe(failures: &mut u8, healthy: bool) -> bool {
+    if healthy {
+        *failures = 0;
+        return false;
+    }
+    *failures = failures.saturating_add(1);
+    *failures >= 3
+}
+
+fn spawn_health_watchdog_loop<Probe, Exit>(
+    startup_delay: Duration,
+    interval: Duration,
+    mut probe: Probe,
+    mut exit: Exit,
+) -> Result<WatchdogHandle, String>
+where
+    Probe: FnMut() -> bool + Send + 'static,
+    Exit: FnMut() + Send + 'static,
+{
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("antigravity-health-watchdog".to_string())
+        .spawn(move || {
+            if !matches!(
+                stop_rx.recv_timeout(startup_delay),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                return;
+            }
+
+            let mut failures = 0;
+            loop {
+                if record_watchdog_probe(&mut failures, probe()) {
+                    exit();
+                    return;
+                }
+                if !matches!(
+                    stop_rx.recv_timeout(interval),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+            }
+        })
+        .map_err(|error| format!("Failed to start health watchdog: {error}"))?;
+    Ok(WatchdogHandle {
+        stop: Some(stop_tx),
+        thread: Some(thread),
+    })
+}
+
 async fn select_shutdown_signal(
     interrupt: impl std::future::Future<Output = Result<(), String>>,
     terminate: impl std::future::Future<Output = Result<(), String>>,
@@ -219,14 +330,13 @@ async fn shutdown_signal() -> Result<(), String> {
 async fn shutdown_after_signal(
     runtime: ServerRuntime,
     scheduler: tokio::task::JoinHandle<()>,
-    watchdog: tokio::task::JoinHandle<()>,
+    watchdog: WatchdogHandle,
     signal: impl std::future::Future<Output = Result<(), String>>,
 ) -> Result<(), String> {
     let result = signal.await;
     scheduler.abort();
     let _ = scheduler.await;
-    watchdog.abort();
-    let _ = watchdog.await;
+    watchdog.stop();
     runtime.shutdown().await;
     result
 }
@@ -254,7 +364,6 @@ pub async fn run() -> Result<(), String> {
     }
     let port = config.proxy.port;
     let runtime = ServerRuntime::start(config).await?;
-    let watchdog_server = runtime.server.clone();
     let scheduler = modules::scheduler::start_scheduler(runtime.server.token_manager.clone());
     let watchdog_enabled = std::env::var("ABV_HEALTH_WATCHDOG_ENABLED")
         .map(|value| {
@@ -264,25 +373,28 @@ pub async fn run() -> Result<(), String> {
             )
         })
         .unwrap_or(true);
-    let watchdog = tokio::spawn(async move {
-        if !watchdog_enabled {
-            return;
-        }
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        let mut failures = 0;
-        loop {
-            failures = if probe_server_health(&watchdog_server, port).await {
-                0
-            } else {
-                failures + 1
-            };
-            if failures >= 3 {
+    let watchdog = if watchdog_enabled {
+        spawn_health_watchdog_loop(
+            Duration::from_secs(30),
+            Duration::from_secs(15),
+            move || {
+                let api_key = match health_check_api_key(|key| std::env::var(key).ok()) {
+                    Ok(api_key) => api_key,
+                    Err(error) => {
+                        tracing::warn!("Health watchdog could not load API key: {error}");
+                        return false;
+                    }
+                };
+                run_blocking_health_check(port, api_key.as_deref(), Duration::from_secs(5))
+            },
+            || {
                 tracing::error!("HTTP runtime is unresponsive; exiting for supervisor restart");
                 std::process::exit(1);
-            }
-            tokio::time::sleep(Duration::from_secs(15)).await;
-        }
-    });
+            },
+        )?
+    } else {
+        WatchdogHandle::disabled()
+    };
     shutdown_after_signal(runtime, scheduler, watchdog, shutdown_signal()).await
 }
 
@@ -570,9 +682,14 @@ pub(crate) mod tests {
             } = fixture;
             let server = runtime.server.clone();
             let scheduler = tokio::spawn(std::future::pending::<()>());
-            let watchdog = tokio::spawn(std::future::pending::<()>());
+            let watchdog = super::spawn_health_watchdog_loop(
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+                || true,
+                || {},
+            )
+            .unwrap();
             let scheduler_status = scheduler.abort_handle();
-            let watchdog_status = watchdog.abort_handle();
             let (interrupt_tx, interrupt_rx) = tokio::sync::oneshot::channel();
             let (terminate_tx, terminate_rx) = tokio::sync::oneshot::channel();
             if terminate {
@@ -593,7 +710,6 @@ pub(crate) mod tests {
             .unwrap();
             assert!(server.is_stopped());
             assert!(scheduler_status.is_finished());
-            assert!(watchdog_status.is_finished());
             assert!(
                 tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
                     .await
@@ -607,5 +723,55 @@ pub(crate) mod tests {
             }
             drop(dir);
         }
+    }
+
+    #[test]
+    fn watchdog_failure_counter_resets_and_trips_on_third_failure() {
+        let mut failures = 0;
+        assert!(!super::record_watchdog_probe(&mut failures, false));
+        assert!(!super::record_watchdog_probe(&mut failures, false));
+        assert!(super::record_watchdog_probe(&mut failures, false));
+        assert!(!super::record_watchdog_probe(&mut failures, true));
+        assert_eq!(failures, 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_health_probe_matches_async_health_semantics() {
+        let fixture = ServerFixture::new().await;
+        let port = fixture.config.proxy.port;
+        assert!(tokio::task::spawn_blocking(move || {
+            super::run_blocking_health_check(port, None, std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap());
+        fixture.shutdown().await;
+    }
+
+    #[test]
+    fn watchdog_thread_is_independent_and_interruptible() {
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let exits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probe_count = probes.clone();
+        let exit_count = exits.clone();
+        let watchdog = super::spawn_health_watchdog_loop(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(1),
+            move || {
+                probe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                false
+            },
+            move || {
+                exit_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while exits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 3);
+        watchdog.stop();
     }
 }
