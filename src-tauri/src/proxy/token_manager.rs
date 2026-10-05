@@ -291,6 +291,15 @@ impl TokenManager {
         }
     }
 
+    fn record_invalid_grant_failure(&self, account_id: &str) -> u32 {
+        let mut count = self
+            .invalid_grant_failures
+            .entry(account_id.to_string())
+            .or_insert(0);
+        *count += 1;
+        *count
+    }
+
     pub(crate) fn register_image_scheduler(&self, scheduler: &Arc<ImageScheduler>) {
         if let Ok(mut slot) = self.image_scheduler.write() {
             *slot = Some(Arc::downgrade(scheduler));
@@ -2541,12 +2550,8 @@ impl TokenManager {
                                 let is_grant_error =
                                     e.contains("\"invalid_grant\"") || e.contains("invalid_grant");
                                 if is_grant_error {
-                                    let mut fail_count = self
-                                        .invalid_grant_failures
-                                        .entry(token.account_id.clone())
-                                        .or_insert(0);
-                                    *fail_count += 1;
-                                    let current_fails = *fail_count;
+                                    let current_fails =
+                                        self.record_invalid_grant_failure(&token.account_id);
                                     if current_fails >= 2 {
                                         tracing::error!(
                                             "账号 {} 连续 {} 次确认为 invalid_grant，正式执行停用",
@@ -4376,6 +4381,17 @@ mod tests {
         assert!(manager.abandon_session("session", "account-a"));
         assert!(!manager.session_accounts.contains_key("session"));
         assert!(!manager.abandon_session("session", "account-a"));
+    }
+
+    #[test]
+    fn invalid_grant_counter_releases_map_guard_before_follow_up_work() {
+        let manager = TokenManager::new(PathBuf::new());
+        assert_eq!(manager.record_invalid_grant_failure("account-a"), 1);
+        assert_eq!(manager.record_invalid_grant_failure("account-a"), 2);
+        assert_eq!(
+            manager.invalid_grant_failures.remove("account-a"),
+            Some(("account-a".to_string(), 2))
+        );
     }
 
     #[test]
