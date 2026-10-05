@@ -6232,8 +6232,7 @@ mod tests {
     }
 
     #[test]
-    fn test_p2c_skips_weekly_protected_account_for_every_model() {
-        // 任一周额度保护标记都应让整账号退出 P2C 候选池。
+    fn test_p2c_applies_weekly_protection_to_requested_model_only() {
         let manager = TokenManager::new(PathBuf::from("/tmp/test"));
 
         let mut protected = HashSet::new();
@@ -6247,9 +6246,15 @@ mod tests {
         let candidates = vec![protected_account, normal_account];
         let attempted: HashSet<String> = HashSet::new();
 
-        let result = manager.select_with_p2c(&candidates, &attempted, "gemini-3-flash", true);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().email, "normal@test.com");
+        let claude = manager
+            .select_with_p2c(&candidates, &attempted, "claude-sonnet", true)
+            .unwrap();
+        assert_eq!(claude.email, "normal@test.com");
+
+        let gemini = manager
+            .select_with_p2c(&candidates, &attempted, "gemini-3-flash", true)
+            .unwrap();
+        assert_eq!(gemini.email, "protected@test.com");
     }
 
     #[test]
