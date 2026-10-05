@@ -1,3 +1,14 @@
+## v4.9.1-lee.1-beta.1
+
+2026-10-06. Beta stability update based on Lee release 4.9.1-lee.1. It uses the beta preview channel and does not update `latest`.
+
+- Fixed a gateway hang caused by retaining a DashMap guard across the asynchronous account-disable path after repeated `invalid_grant` failures.
+- Opus 5.5 now selects only Ultra or explicitly paid Pro accounts with a positive exact quota for the requested `low`, `medium`, or `high` physical variant.
+- Quota protection is now scoped to the requested model; protected Gemini models no longer exclude an otherwise eligible Claude/Opus account.
+- Moved the headless HTTP watchdog to an independent OS thread so it can terminate the process for a supervisor restart when the Tokio runtime is unresponsive.
+- Validation: 54 focused TokenManager tests, 9 serialized runtime tests, `cargo fmt -- --check`, and `cargo clippy --all-targets --all-features`.
+- Maintained by @Echo7659.
+
 ## v4.9.1-lee.1
 
 2026-10-04. Upstream base: 4.9.1. Lee release: 4.9.1-lee.1, using the stable main channel.

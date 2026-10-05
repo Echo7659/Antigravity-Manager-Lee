@@ -1,3 +1,14 @@
+## v4.9.1-lee.1-beta.1
+
+2026-10-06。基于 Lee 正式版 4.9.1-lee.1 的 Beta 稳定性更新；使用 beta 预览通道，不更新 latest。
+
+- 修复 `invalid_grant` 连续失败时 DashMap guard 跨越异步停用流程导致的网关假死。
+- Opus 5.5 只调度 Ultra 或有付费证据的 Pro 账号，并要求目标 `low` / `medium` / `high` 物理变体具有正的精确配额。
+- 配额保护改为按当前请求模型生效；Gemini 模型的保护不再误排除 Claude/Opus 候选账号。
+- Headless HTTP watchdog 改为独立 OS 线程，Tokio runtime 无响应时仍可退出进程并交由容器监管器重启。
+- 验证：TokenManager 54 项定向测试、runtime 9 项串行测试、`cargo fmt -- --check` 与 `cargo clippy --all-targets --all-features`。
+- 本次变更由 @Echo7659 维护。
+
 ## v4.9.1-lee.1
 
 2026-10-04。上游基础版本为 4.9.1，Lee 正式发布版本为 4.9.1-lee.1；使用 main 正式通道。

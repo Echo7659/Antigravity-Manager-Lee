@@ -19,7 +19,7 @@ function Settings() {
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const appVersion = '4.9.1-lee.1';
+    const appVersion = '4.9.1-lee.1-beta.1';
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
