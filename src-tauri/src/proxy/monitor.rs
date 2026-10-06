@@ -338,10 +338,51 @@ impl MaintenanceSchedule {
     }
 }
 
+/// 两种日志保留策略来自同一只读快照；读取失败时沿用各自默认值。
+fn load_maintenance_retention() -> (crate::proxy::config::LogRetentionConfig, u64) {
+    crate::modules::config::load_app_config_read_only()
+        .map(|config| {
+            (
+                config.proxy.log_retention,
+                config.proxy.internal_error_log_retention.budget_bytes(),
+            )
+        })
+        // 0 由内部错误日志的 setter 解释为默认预算。
+        .unwrap_or_else(|_| (Default::default(), 0))
+}
+
 #[cfg(test)]
 mod maintenance_schedule_tests {
     use super::MaintenanceSchedule;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn monitor_retention_policies_share_one_readonly_snapshot() {
+        let _dir = super::prompt_log_tests::TestDataDir::new();
+        let path = crate::modules::account::resolve_data_dir_read_only()
+            .unwrap()
+            .join("gui_config.json");
+        let mut config = crate::models::AppConfig::new();
+        config.proxy.log_retention.max_rows = 4321;
+        config.proxy.internal_error_log_retention.max_storage_mb = 1234;
+        let expected_budget = config.proxy.internal_error_log_retention.budget_bytes();
+        let bytes = serde_json::to_vec(&config).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let snapshot = super::load_maintenance_retention();
+        assert!(std::fs::read(&path).unwrap() == bytes);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(snapshot.0.max_rows, 4321);
+        assert_eq!(snapshot.1, expected_budget);
+
+        let fallback = super::load_maintenance_retention();
+        assert_eq!(
+            fallback.0.max_rows,
+            crate::proxy::config::LogRetentionConfig::default().max_rows
+        );
+        assert_eq!(fallback.1, 0);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn monitor_thinking_retries_do_not_accelerate_hourly_log_retention() {
@@ -381,12 +422,10 @@ impl ProxyMonitor {
                 let (thinking_due, logs_due) = schedule.due(std::time::Instant::now());
                 let mut state = std::mem::take(&mut thinking_state);
                 let result = tokio::task::spawn_blocking(move || {
-                    let retention_res = logs_due.then(|| {
-                        let retention = crate::modules::config::load_app_config()
-                            .map(|config| config.proxy.log_retention)
-                            .unwrap_or_default();
-                        crate::modules::proxy_db::apply_retention(&retention)
-                    });
+                    let retention = logs_due.then(load_maintenance_retention);
+                    let retention_res = retention
+                        .as_ref()
+                        .map(|(proxy, _)| crate::modules::proxy_db::apply_retention(proxy));
                     let thinking_res = thinking_due.then(|| {
                         if logs_due {
                             state.reopen_completed_categories();
@@ -394,8 +433,8 @@ impl ProxyMonitor {
                         let days = crate::proxy::config::get_thinking_retention_days() as i64;
                         crate::modules::proxy_db::cleanup_thinking_storage(days, &mut state)
                     });
-                    let error_log_res = logs_due.then(|| {
-                        crate::modules::logger::sync_internal_error_log_budget_from_config();
+                    let error_log_res = retention.as_ref().map(|(_, error_budget)| {
+                        crate::modules::logger::set_internal_error_log_budget_bytes(*error_budget);
                         crate::modules::logger::apply_internal_error_log_retention()
                     });
                     (state, retention_res, thinking_res, error_log_res)
