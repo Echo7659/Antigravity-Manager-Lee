@@ -1,3 +1,16 @@
+## v4.9.1-lee.1-beta.2
+
+2026-10-06. Stability fixes for ThinkingStore maintenance and automatic quota refresh, using only the beta channel without updating main or latest.
+
+- Move synchronous ThinkingStore database waits behind one Tokio MultiThread blocking boundary so database lock contention cannot starve independent HTTP health requests. Preserve synchronous behavior outside that runtime and on CurrentThread.
+- Select expired sessions through a time index and delete bounded record batches. Scan orphan candidates through primary-key windows before applying retention rules; persist the scan cursor in the same transaction as deletion. Preserve active sessions, user retention settings and signature semantics.
+- Limit each batch to 128 deleted records or 512 scanned orphan candidates, and each round to 16 batches. SQLite callbacks and explicit loop checkpoints share a time budget. Maintenance yields to pending foreground requests, rolls back interrupted work and restores the connection. Rotate categories across rounds so repeated interruption of one category cannot starve another.
+- Serialize startup and hourly maintenance, reporting deletions, scans, elapsed time and deferral. Budgets are not hard deadlines for disk I/O or SQLite busy waits; the existing watchdog remains enabled.
+- Exclude disabled accounts from automatic protected quota refresh while preserving manual full refresh and existing forbidden, reset-time and proxy-disabled behavior. Run the account regressions in CI.
+- Regression coverage includes real database contention with responsive HTTP, TTL boundaries, large-session batches, cursor continuation, interruption rollback, short-statement budgets and maintenance fairness, alongside ThinkingStore, monitor, runtime, account, Rust fmt/clippy and Web build checks.
+- First startup creates an index on thinking_sessions. Historical backlogs drain over multiple rounds; deletion reuses pages without immediately shrinking database files. Migration time, real upstream generation and the hourly maintenance window require separate acceptance on the deployed image.
+- This increment is maintained by @Echo7659. Attribution and linked PRs for previously integrated upstream work remain in the historical entries below.
+
 ## v4.9.1-lee.1-beta.1
 
 2026-10-06. Beta stability update based on Lee release 4.9.1-lee.1. It uses the beta preview channel and does not update `latest`.
