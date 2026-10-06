@@ -1,3 +1,15 @@
+## v4.9.1-lee.1-beta.3
+
+2026-10-06. Bound ThinkingStore history hydration and cache admission on beta only, without updating main or latest.
+
+- Read a finite newest-history window from SQLite and check budgets before copying fields or decoding. Skip complete oversized AGZ1, RAW1 and legacy records while preserving persistent history; never truncate thoughts or signatures.
+- Apply the existing turn and 64MiB content limits to append, merge, upgrade, hydration and point-lookup refill. Enforce the existing 2000-session cap through a short admission critical section that excludes database I/O.
+- Bound per-request history supplements separately by count and content bytes while retaining signature and tool recovery outside the initial window. Initial snapshots, supplements and in-flight requests still require additional memory; these are not process RSS or global memory guarantees.
+- Persist new records and previously persisted latest-turn upgrades independently of RAM admission. Preserve historical-upgrade persistence and matching semantics. Partial caches prune RAM only and cannot infer deletion of unloaded SQLite history; existing retention and explicit session-end rules still apply.
+- Add small-budget regressions for decoding, field allocation, concurrent admission, historical signatures, ordering and partial-cache pruning, and include ThinkingStore tests in CI. Retain beta.2 maintenance, blocking-boundary, quota-refresh and watchdog fixes.
+- Preserve user configuration and database schema; switching to the previous image remains available. Production memory trends and real requests require separate verification on the deployed image.
+- Maintained by @Echo7659 (Thanks to @Echo7659). Existing upstream attribution is preserved.
+
 ## v4.9.1-lee.1-beta.2
 
 2026-10-06. Stability fixes for ThinkingStore maintenance and automatic quota refresh, using only the beta channel without updating main or latest.
