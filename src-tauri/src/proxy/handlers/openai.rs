@@ -2091,8 +2091,11 @@ pub async fn handle_chat_completions(
 
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
     let mapped_model = if configured_model.is_some() {
-        crate::proxy::model_specs::resolve_opus_5_5_route(&openai_req.model, effort_hint.as_deref())
-            .unwrap_or_else(|| openai_req.model.clone())
+        crate::proxy::model_specs::resolve_claude_tier_route(
+            &openai_req.model,
+            effort_hint.as_deref(),
+        )
+        .unwrap_or_else(|| openai_req.model.clone())
     } else {
         crate::proxy::common::model_mapping::resolve_model_route_with_effort(
             &openai_req.model,

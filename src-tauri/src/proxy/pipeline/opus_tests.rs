@@ -1,5 +1,81 @@
 use serde_json::{json, Value};
 
+#[test]
+fn claude_5_5_all_protocols_preserve_adaptive_thinking_and_output_limits() {
+    with_control_sources(|| {
+        for family in ["opus", "sonnet"] {
+            for tier in ["low", "medium", "high"] {
+                let model = format!("claude-{family}-5-5-{tier}");
+                for (requested, expected) in [
+                    (None, 128_000),
+                    (Some(100), 100),
+                    (Some(65_536), 65_536),
+                    (Some(100_000), 100_000),
+                    (Some(200_000), 128_000),
+                ] {
+                    let claude = serde_json::from_value(json!({
+                        "model":model, "max_tokens":requested,
+                        "messages":[{"role":"user","content":"Hello"}],
+                        "thinking":{"type":"enabled","budget_tokens":4096}
+                    }))
+                    .unwrap();
+                    let mut bodies =
+                        vec![crate::proxy::mappers::claude::transform_claude_request_in(
+                            &claude,
+                            "project",
+                            false,
+                            None,
+                            "claude55-test",
+                            None,
+                        )
+                        .unwrap()];
+                    for responses in [false, true] {
+                        let request = serde_json::from_value(json!({
+                            "model":model, "max_tokens":requested,
+                            "messages":[{"role":"user","content":"Hello"}],
+                            "reasoning":{"max_tokens":4096}, "thinking":{"type":"disabled"}
+                        }))
+                        .unwrap();
+                        let (body, ..) =
+                            crate::proxy::mappers::openai::transform_openai_request_with_session(
+                                &request,
+                                "project",
+                                &model,
+                                None,
+                                "claude55-test",
+                                None,
+                                responses,
+                            );
+                        bodies.push(body);
+                    }
+                    let mut gemini = json!({
+                        "contents":[{"role":"user","parts":[{"text":"Hello"}]}],
+                        "generationConfig":{"thinkingConfig":{"thinkingBudget":4096,"includeThoughts":false}}
+                    });
+                    if let Some(limit) = requested {
+                        gemini["generationConfig"]["maxOutputTokens"] = json!(limit);
+                    }
+                    bodies.push(crate::proxy::mappers::gemini::wrap_request_v2(
+                        &gemini, "project", &model, None, None, None, None, None, None,
+                    ));
+                    for (protocol, body) in bodies.iter().enumerate() {
+                        assert_eq!(body["model"], model);
+                        assert_eq!(
+                            body["request"]["generationConfig"]["thinkingConfig"],
+                            json!({"includeThoughts":true}),
+                            "{model} protocol {protocol}"
+                        );
+                        assert_eq!(
+                            body["request"]["generationConfig"]["maxOutputTokens"], expected,
+                            "{model} protocol {protocol}, requested {requested:?}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
 const MODEL: &str = "claude-opus-5-5";
 
 fn with_control_sources(mut test: impl FnMut()) {
@@ -47,6 +123,8 @@ fn opus_5_5_protocol_forced_tools_across_adapters() {
             MODEL,
             "models/anthropic/claude-opus-5.5",
             "models/models/anthropic/anthropic/claude-opus-5.5",
+            "models/anthropic/claude-sonnet-5.5",
+            "claude-sonnet-5-5-high",
         ] {
             let error = super::InboundThinkingPipeline::validate_request_constraints(model, &body)
                 .unwrap_err();

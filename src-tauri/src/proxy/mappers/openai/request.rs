@@ -1013,7 +1013,8 @@ pub fn transform_openai_request_with_session(
         } else {
             65536
         };
-        if val > safe_limit {
+        // 自适应模型由共享流水线按官方目录限制输出，保留客户端原始上限。
+        if val > safe_limit && !model_specs::is_adaptive_thinking_model(mapped_model) {
             tracing::warn!(
                 "[Generation-Config] Capping maxOutputTokens from {} to {} to prevent 400 Invalid Argument",
                 val, safe_limit

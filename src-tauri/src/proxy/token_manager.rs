@@ -170,8 +170,8 @@ pub struct ProxyToken {
     pub model_limits: HashMap<String, u64>, // [NEW] max_output_tokens per model from quota data
 }
 
-/// Opus 5.5 的订阅等级必须为 Ultra 或具有明确付费证据的 Pro。
-pub fn is_opus_5_5_eligible(tier: &str, paid: bool) -> bool {
+/// Claude 5 及以上模型的订阅等级必须为 Ultra 或具有明确付费证据的 Pro。
+pub fn is_advanced_claude_tier_eligible(tier: &str, paid: bool) -> bool {
     match crate::models::quota::normalize_subscription_tier(tier).as_str() {
         "ULTRA" => true,
         "PRO" => paid,
@@ -180,15 +180,15 @@ pub fn is_opus_5_5_eligible(tier: &str, paid: bool) -> bool {
 }
 
 fn is_model_account_eligible(token: &ProxyToken, model: &str) -> bool {
-    if !crate::proxy::model_specs::is_adaptive_thinking_model(model) {
+    if !crate::proxy::model_specs::requires_exact_claude_quota(model) {
         return true;
     }
 
     let canonical = crate::proxy::common::model_mapping::canonicalize_upstream_model_id(model);
     let physical_model =
-        crate::proxy::model_specs::resolve_opus_5_5_route(&canonical, None).unwrap_or(canonical);
+        crate::proxy::model_specs::resolve_claude_tier_route(&canonical, None).unwrap_or(canonical);
 
-    is_opus_5_5_eligible(
+    is_advanced_claude_tier_eligible(
         token.subscription_tier.as_deref().unwrap_or(""),
         token.is_paid_subscription,
     ) && token
@@ -4449,7 +4449,7 @@ mod tests {
             ("FREE", true, false),
             ("", true, false),
         ] {
-            assert_eq!(is_opus_5_5_eligible(tier, paid), eligible);
+            assert_eq!(is_advanced_claude_tier_eligible(tier, paid), eligible);
             let mut token = create_test_token("test", Some(tier), 1.0, None, Some(100));
             token.is_paid_subscription = paid;
             for model in [
@@ -4534,6 +4534,51 @@ mod tests {
     }
 
     #[test]
+    fn claude_5_5_strict_quota_does_not_cross_family_or_tier() {
+        for (tier, paid, eligible) in [
+            ("ULTRA", false, true),
+            ("PRO", true, true),
+            ("PRO", false, false),
+            ("FREE", true, false),
+            ("", true, false),
+        ] {
+            let mut token = create_test_token("test", Some(tier), 1.0, None, Some(100));
+            token.is_paid_subscription = paid;
+            token.model_quotas.insert("claude".into(), 100);
+            for family in ["opus", "sonnet"] {
+                let model = format!("claude-{family}-5-5-medium");
+                token.exact_model_quotas.clear();
+                token.model_limits.insert(model.clone(), 128_000);
+                assert!(!is_model_account_eligible(&token, &model));
+                token.exact_model_quotas.insert(model.clone(), 0);
+                assert!(!is_model_account_eligible(&token, &model));
+                token.exact_model_quotas.insert(model.clone(), 50);
+                assert_eq!(is_model_account_eligible(&token, &model), eligible);
+                assert_eq!(
+                    is_model_account_eligible(
+                        &token,
+                        &format!("models/anthropic/{}", model.replace("5-5", "5.5"))
+                    ),
+                    eligible
+                );
+                assert!(!is_model_account_eligible(
+                    &token,
+                    &format!("claude-{family}-5-5-low")
+                ));
+                let other = if family == "opus" { "sonnet" } else { "opus" };
+                assert!(!is_model_account_eligible(
+                    &token,
+                    &format!("claude-{other}-5-5-medium")
+                ));
+                assert_eq!(
+                    is_model_account_eligible(&token, &format!("claude-{family}-5-5")),
+                    eligible && family == "sonnet"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn opus_5_5_requires_positive_exact_variant_quota() {
         let mut token = create_test_token("ultra", Some("ULTRA"), 1.0, None, Some(100));
         token.is_paid_subscription = true;
@@ -4547,6 +4592,84 @@ mod tests {
         assert!(!is_model_account_eligible(&token, "claude-opus-5-5-low"));
         assert!(is_model_account_eligible(&token, "claude-opus-5-5-high"));
         assert!(!is_model_account_eligible(&token, "claude-opus-5-5-medium"));
+    }
+
+    #[tokio::test]
+    async fn claude_5_5_sonnet_selection_rejects_ineligible_sticky_preferred_and_retry() {
+        let _data_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let data_dir = crate::modules::account::get_data_dir().unwrap();
+        let accounts = data_dir.join("accounts");
+        std::fs::create_dir(&accounts).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        for (id, model, paid, quota) in [
+            ("opus-only", "claude-opus-5-5-medium", true, 100),
+            ("zero", "claude-sonnet-5-5-medium", true, 0),
+            ("trial", "claude-sonnet-5-5-medium", false, 100),
+            ("low-only", "claude-sonnet-5-5-low", true, 100),
+            ("sonnet", "claude-sonnet-5-5-medium", true, 100),
+        ] {
+            let mut account = weekly_quota_account(now);
+            account["id"] = serde_json::json!(id);
+            account["email"] = serde_json::json!(format!("{id}@example.test"));
+            account["quota"]["subscription_tier"] = serde_json::json!("PRO");
+            account["quota"]["is_paid_subscription"] = serde_json::json!(paid);
+            account["quota"]["models"].as_array_mut().unwrap().push(serde_json::json!({
+                "name": model, "percentage": quota,
+                "reset_time": chrono::DateTime::from_timestamp(now + 7200, 0).unwrap().to_rfc3339()
+            }));
+            std::fs::write(accounts.join(format!("{id}.json")), account.to_string()).unwrap();
+        }
+        let manager = TokenManager::new(data_dir);
+        manager.load_accounts().await.unwrap();
+        manager
+            .set_preferred_account(Some("opus-only".into()))
+            .await;
+        manager
+            .session_accounts
+            .insert("sonnet-session".into(), "trial".into());
+        let excluded = HashSet::new();
+        for model in [
+            "claude-sonnet-5-5",
+            "models/anthropic/claude-sonnet-5.5-medium",
+        ] {
+            let (_, _, _, selected, _) = manager
+                .get_token_filtered("claude", false, Some("sonnet-session"), model, &excluded)
+                .await
+                .unwrap();
+            assert_eq!(selected, "sonnet");
+        }
+        let excluded = HashSet::from(["sonnet".to_string()]);
+        assert!(manager
+            .get_token_filtered(
+                "claude",
+                true,
+                Some("sonnet-session"),
+                "claude-sonnet-5-5-medium",
+                &excluded
+            )
+            .await
+            .is_err());
+        let mut account: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(accounts.join("sonnet.json")).unwrap())
+                .unwrap();
+        account["quota"]["models"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .filter(|entry| entry["name"] == "claude-sonnet-5-5-medium")
+            .for_each(|entry| entry["percentage"] = serde_json::json!(0));
+        std::fs::write(accounts.join("sonnet.json"), account.to_string()).unwrap();
+        manager.reload_account("sonnet").await.unwrap();
+        assert!(manager
+            .get_token_filtered(
+                "claude",
+                false,
+                Some("sonnet-session"),
+                "claude-sonnet-5-5",
+                &HashSet::new()
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]

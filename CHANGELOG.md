@@ -1,3 +1,14 @@
+## v4.9.1-lee.1-beta.4
+
+2026-10-06。定向移植上游 v4.9.6 的 Claude 5.5 支持，保留 beta.3 稳定性修复；不代表完整升级到 v4.9.6，不更新 main/latest。
+
+- 同步 Opus/Sonnet 5.5 的 low、medium、high 六个官方模型规格，包括自适应思考、100 万上下文和 128000 输出上限。来源：上游 af5b791，关联 lbjlaq/Antigravity-Manager#3593（Thanks to @lbjlaq）。
+- 将 Opus 专用路由替换为目录驱动的 Claude 档位解析；沿用上游 fd9c30c/4e8487d 的真实档位选择方式（Thanks to @jeikl）。Sonnet 裸别名默认 medium，既有 Opus 裸别名继续默认 high，显式档位不被客户端 effort 覆盖；不改变 Gemini 路由。
+- Claude 5 及以上继续要求 Ultra 或有付费证据的 Pro，且目标物理模型存在正配额；其他家族、其他档位、模型输出能力或归一化 claude 配额均不能代替准入证据。不移植上游能力未知账号回退。
+- 共享流水线依据官方自适应元数据去除数字思考预算、限制强制工具选择并限制输出上限；移除适配器对这些模型的旧 64K 限制和 Gemini 自动抬高输出，保留客户端较小输出值。
+- 新增模型目录、双家族路由、账号选择/重载/重试与四协议参数回归，纳入 CI。本地和 CI 验证不等于真实账号能力；部署后按实际可用账号验收，不做并发压测。
+- 不修改账号、密码、API key、端口或数据库 schema。维护与兼容性移植由 @Echo7659 完成（Thanks to @Echo7659）；可切回既有 beta.3 镜像。
+
 ## v4.9.1-lee.1-beta.3
 
 2026-10-06。ThinkingStore 历史恢复与内存边界修复，仅发布到 beta，不更新 main 或 latest。

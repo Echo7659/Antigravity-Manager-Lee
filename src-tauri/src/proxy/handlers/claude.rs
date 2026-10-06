@@ -1027,25 +1027,28 @@ pub async fn handle_messages(
         let norm_start = std::time::Instant::now();
 
         // 2. 模型路由解析
-        let mapped_model = if configured_model.is_some() {
-            model_specs::resolve_opus_5_5_route(
-                &request_for_body.model,
-                routing_effort_hint.as_deref(),
-            )
-            .unwrap_or_else(|| request_for_body.model.clone())
-        } else {
-            let route_effort =
-                if model_specs::resolve_opus_5_5_route(&request_for_body.model, None).is_some() {
-                    routing_effort_hint.as_deref()
-                } else {
-                    effort_hint.as_deref()
-                };
-            crate::proxy::common::model_mapping::resolve_model_route_with_effort(
-                &request_for_body.model,
-                &*state.custom_mapping.read().await,
-                route_effort,
-            )
-        };
+        let mapped_model =
+            if configured_model.is_some() {
+                model_specs::resolve_claude_tier_route(
+                    &request_for_body.model,
+                    routing_effort_hint.as_deref(),
+                )
+                .unwrap_or_else(|| request_for_body.model.clone())
+            } else {
+                let route_effort =
+                    if model_specs::resolve_claude_tier_route(&request_for_body.model, None)
+                        .is_some()
+                    {
+                        routing_effort_hint.as_deref()
+                    } else {
+                        effort_hint.as_deref()
+                    };
+                crate::proxy::common::model_mapping::resolve_model_route_with_effort(
+                    &request_for_body.model,
+                    &*state.custom_mapping.read().await,
+                    route_effort,
+                )
+            };
         last_mapped_model = Some(mapped_model.clone());
         let tool_config = request_for_body
             .tool_choice
