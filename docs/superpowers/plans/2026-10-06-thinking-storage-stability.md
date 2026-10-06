@@ -14,11 +14,11 @@ Rust edition 2024，中文工程注释。仅修复本次存储维护/自动重�
 1. 保留共享 THINKING_DB 连接，统一 with_thinking_db 闭包入口包住路径查找、锁等待、首次连接和 SQL。MultiThread runtime 使用 block_in_place，普通线程/CurrentThread 直接执行；guard/statement 不逃逸，不嵌套取得相同锁。覆盖所有生产用 thinking_db 调用。不能只包清理，前台同步锁等待才是 runtime 耗尽传播路径。
 2. 前台入口在锁等待前用 RAII AtomicUsize 统计 pending 请求。维护每批 try_lock，失败立即退让；取得锁后再检查 pending。循环在 guard 外，每批释放锁，不持锁 sleep，不自旋。
 3. 新增 idx_thinking_sessions_accessed(last_accessed, session_key)，DDL 失败传播。首次初始化不受短清理 deadline 限制，不构建扫描 thinking_records 全表的新索引。
-4. 每批至多 128 条 thinking_records、至多 128 个空过期 sessions。过期会话选择及其记录选择使用索引；单大 session 分批删，只有记录清空后才删 session。严格沿用 cutoff 的小于语义。
-5. 孤儿清理先按 id keyset 读取最多 512 条元数据，再过滤 session 不存在且 COALESCE(last_accessed,created_at) < cutoff；只删除窗口中最多 128 条符合记录。游标持久化 thinking_meta，成功事务才推进；窗口内剩余待删记录不可被游标跳过；无符合行也应推进，末尾回绕。每轮过期 session 清理不能饿死 orphan 扫描，两者均有限进展。
-6. rusqlite 添加 hooks feature。单批 SQLite VM 时间预算 100ms（每 1000 VM ops 检查，允许因 pending 请求提前中断），整轮时间预算 2 秒、最多 16 个批次。handler 在所有路径清除，Interrupted 先恢复 handler 再完成 rollback，不能污染正常请求。busy/Interrupted 明确表示延期，其他错误返回。不宣称硬实时保证。测试可注入较小限制与确定性中断条件，避免 sleep 驱动脆弱测试。
-7. tool_signatures 使用现有 created_at 索引按相同记录上限清理，不能无界删除或每次扫描全表；错误不再静默成功。保留 cleanup_old_thinking_records 原调用者兼容或同步更新全部调用者。增加简洁维护统计（deleted/scanned/batches/deferred/elapsed 等有用字段），正常零删除也可验证维护已执行。
-8. monitor 启动清理和后续每小时清理合并为一个串行 async loop，等待 spawn_blocking 完成；interval 使用 Skip，不改变每小时频率。各维护错误均记录。保留 log retention 和内部错误日志原职责，不引入 VACUUM。维护执行需可从日志确认。
+4. session/tool 单元初始最多 128 条记录；session 批次初始最多 128 个空过期 sessions。仅预算中断使受影响类别的单元跨轮减半至 1，pending/busy 不缩小。过期会话选择及其记录选择使用索引；单大 session 分批删，只有记录清空后才删 session。严格沿用 cutoff 的小于语义。
+5. 孤儿清理先按 id keyset 读取初始最多 16 条元数据，再过滤 session 不存在且 COALESCE(last_accessed,created_at) < cutoff；仅删除本窗口内符合条件的记录。游标持久化 thinking_meta，成功事务才推进；窗口内剩余待删记录不可被游标跳过；无符合行也应推进，末尾回绕。按类别公平轮转，预算中断后保存下一类别和缩小单元。已完成类别停止参与 60 秒重试；整个遍历完成后的新一遍或日志维护小时点重新开放已完成类别。每轮采用当前 cutoff，进行中的 orphan cursor 和缩小单元继续保留。
+6. rusqlite 添加 hooks feature。单批名义预算 100ms（每 1000 VM ops 与 Rust 循环/COMMIT 前检查同一 deadline），整轮名义预算 2 秒、最多 256 次尝试。最小单元 1 的预算为软墙钟时间片：已开始单元可超时提交，pending 和 SQL 错误仍回滚，包括 COMMIT 前检查；更大单元不得放宽。整轮耗尽后不开始下一单元。handler 在所有路径清除，Interrupted 先恢复 handler 再完成 rollback，不能污染正常请求。区分预算、pending、共享锁忙、SQLite busy、其他 Interrupted 和整轮时间延期，其他 SQL 错误返回。不宣称硬实时保证。测试可注入较小限制与确定性中断条件，避免 sleep 驱动脆弱测试。
+7. tool_signatures 使用现有 created_at 索引按相同记录上限清理，不能无界删除或每次扫描全表；错误不再静默成功。保留 cleanup_old_thinking_records 原调用者兼容或同步更新全部调用者。增加简洁维护统计（deleted、已提交 scanned/批次、尝试批次、延期原因、cursor、单元和 unfinished/elapsed），正常零删除也可验证维护已执行。
+8. monitor 保持一个串行 async loop，持有自适应与类别进度状态并等待 spawn_blocking 完成。Thinking 未完成、延期或错误时 60 秒后重试；全部完成后 3600 秒开始新遍历，日志维护小时点也触发 thinking 并重新开放已完成类别。proxy log retention 和内部错误日志仍在启动及每 3600 秒执行，按完成时刻计算各自下次截止点，不补跑错过周期，不随 thinking 重试提频。各错误和零删除维护均可从日志确认，不引入 VACUUM。
 9. 不引入第二个 thinking 连接，保留 save + session touch 原本的锁内连续性。检查 ThinkingStore/DashMap 调用点不持 guard 跨 blocking 边界；如发现实际同类问题则精确修复并报告。不要扩大为全面存储重构。
 
 ### 必需测试
@@ -27,7 +27,7 @@ Rust edition 2024，中文工程注释。仅修复本次存储维护/自动重�
 - cleanup 锁忙立即退让；已排队请求阻止后续维护批次抢锁；save/touch 期间 maintenance 无法插入。
 - TTL 矩阵：活跃 session 旧记录保留，过期 session 新旧记录删除，孤儿新旧/NULL 回落/non-NULL 优先/恰等 cutoff，空 expired session。
 - 大 session 超过 batch cap，第一批不超过 cap，session 仍存在；后续完成再删 session。
-- 大量健康记录前缀后有孤儿，跨轮持久化 cursor 能到达；窗口内超过 cap 的 orphan 不漏删。
+- 大量健康记录前缀后有孤儿，跨轮持久化 cursor 能到达；窗口内超过 cap 的 orphan 不漏删。确定性冷窗口到期后跨轮缩小，实际 cursor/删除可以提交；缩至 1 后超时仍提交，但 pending 回滚当前单元且保留此前提交。验证已完成类别不重扫和 60 秒/每小时调度隔离。
 - progress interrupt 事务回滚且 cursor 不推进，后续 facade 查询成功；SQL 真错误不能吞掉。
 - EXPLAIN 过期 session 查询、按 session 选 records、orphan 窗口不作整表扫描。
 运行受影响 proxy_db/monitor/runtime/thinking_store 测试，保存测试结果。先实现能揭露既有回归的核心测试并证明旧路径失败，再修复。不执行全仓测试。提交一份可独立回滚的修复。

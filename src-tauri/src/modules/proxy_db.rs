@@ -7,7 +7,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -256,8 +256,6 @@ fn thinking_db() -> Result<ThinkingDbGuard, String> {
 }
 
 static THINKING_PENDING: AtomicUsize = AtomicUsize::new(0);
-// 保存下一类别，单类重复中断不能让后续维护轮次一直从同一类别开始。
-static CLEANUP_NEXT_BATCH: AtomicUsize = AtomicUsize::new(0);
 
 /// 前台请求计数覆盖路径查找、连接初始化、锁等待和 SQL 执行。
 struct ThinkingRequest;
@@ -1325,16 +1323,118 @@ pub fn get_thinking_records_count() -> Result<usize, String> {
     })
 }
 
-/// 一轮维护的已提交工作量；deferred 表示锁竞争、SQLite 忙或执行预算要求后续重试。
+/// 一轮维护的已提交工作量；unfinished 与 deferred 分别表示剩余工作和本轮退让。
 #[derive(Debug, Default)]
 pub struct ThinkingCleanupStats {
     pub deleted_records: usize,
     pub deleted_sessions: usize,
     pub deleted_tools: usize,
+    /// 成功提交批次读取的 session/orphan 元数据行数。
     pub scanned: usize,
+    /// 尝试次数，包括最终回滚或退让的批次。
     pub batches: usize,
+    pub committed_batches: usize,
     pub deferred: bool,
+    pub defer_reason: Option<CleanupDeferReason>,
+    pub unfinished: bool,
+    pub orphan_cursor: Option<i64>,
+    pub orphan_sweep_complete: bool,
+    /// 当前单元上限，依次对应 session 记录、orphan 元数据、tool 签名。
+    pub units: [usize; 3],
     pub elapsed: Duration,
+    category_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupDeferReason {
+    Pending,
+    LockBusy,
+    SqliteBusy,
+    Budget,
+    Interrupted,
+    RoundBudget,
+}
+
+impl ThinkingCleanupStats {
+    fn deferred(reason: CleanupDeferReason) -> Self {
+        Self {
+            deferred: true,
+            defer_reason: Some(reason),
+            ..Default::default()
+        }
+    }
+}
+
+/// 串行维护循环持有的跨轮状态；完成一遍后重置完成标记，保留自适应单元。
+pub struct ThinkingMaintenance {
+    units: [usize; 3],
+    complete: [bool; 3],
+    next: usize,
+    retention_days: Option<i64>,
+}
+
+impl Default for ThinkingMaintenance {
+    fn default() -> Self {
+        Self::with_limits(CleanupLimits::default())
+    }
+}
+
+impl ThinkingMaintenance {
+    /// 小时维护重新检查各类别；进行中的 orphan cursor 和自适应单元保持不变。
+    pub fn reopen_completed_categories(&mut self) {
+        self.complete = [false; 3];
+    }
+
+    fn with_limits(limits: CleanupLimits) -> Self {
+        Self {
+            units: [limits.rows, limits.window, limits.rows],
+            complete: [false; 3],
+            next: 0,
+            retention_days: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CleanupError {
+    Deferred(CleanupDeferReason),
+    Sqlite(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for CleanupError {
+    fn from(error: rusqlite::Error) -> Self {
+        match error.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                Self::Deferred(CleanupDeferReason::SqliteBusy)
+            }
+            Some(rusqlite::ErrorCode::OperationInterrupted) => {
+                Self::Deferred(CleanupDeferReason::Interrupted)
+            }
+            _ => Self::Sqlite(error),
+        }
+    }
+}
+
+impl std::fmt::Display for CleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Deferred(reason) => write!(formatter, "maintenance deferred: {reason:?}"),
+            Self::Sqlite(error) => error.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(test)]
+impl CleanupError {
+    fn sqlite_error_code(&self) -> Option<rusqlite::ErrorCode> {
+        match self {
+            Self::Deferred(CleanupDeferReason::SqliteBusy) => {
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            }
+            Self::Deferred(_) => Some(rusqlite::ErrorCode::OperationInterrupted),
+            Self::Sqlite(error) => error.sqlite_error_code(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1345,25 +1445,31 @@ struct CleanupLimits {
     batch_budget: Duration,
     round_budget: Duration,
     vm_steps: i32,
+    soft_budget: bool,
     #[cfg(test)]
     interrupt_after_checks: Option<usize>,
     #[cfg(test)]
     checkpoint_clock: Option<fn(usize, Instant) -> Instant>,
+    #[cfg(test)]
+    round_clock: Option<fn(usize) -> Duration>,
 }
 
 impl Default for CleanupLimits {
     fn default() -> Self {
         Self {
             rows: 128,
-            window: 512,
-            batches: 16,
+            window: 16,
+            batches: 256,
             batch_budget: Duration::from_millis(100),
             round_budget: Duration::from_secs(2),
             vm_steps: 1000,
+            soft_budget: false,
             #[cfg(test)]
             interrupt_after_checks: None,
             #[cfg(test)]
             checkpoint_clock: None,
+            #[cfg(test)]
+            round_clock: None,
         }
     }
 }
@@ -1382,6 +1488,8 @@ const ORPHAN_WINDOW_SQL: &str = "SELECT id, session_key, COALESCE(last_accessed,
 struct CleanupProgress<'a> {
     conn: &'a Connection,
     deadline: Instant,
+    soft_budget: bool,
+    interruption: Arc<AtomicUsize>,
     #[cfg(test)]
     checkpoints: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -1390,27 +1498,41 @@ struct CleanupProgress<'a> {
 
 impl<'a> CleanupProgress<'a> {
     fn install(conn: &'a Connection, limits: CleanupLimits, deadline: Instant) -> Self {
+        let interruption = Arc::new(AtomicUsize::new(0));
+        let signal = interruption.clone();
         #[cfg(test)]
         let mut checks = 0;
         conn.progress_handler(
             limits.vm_steps,
             Some(move || {
+                if THINKING_PENDING.load(Ordering::SeqCst) > 0 {
+                    signal.store(1, Ordering::Relaxed);
+                    return true;
+                }
                 #[cfg(test)]
                 {
                     checks += 1;
-                    if limits
-                        .interrupt_after_checks
-                        .is_some_and(|limit| checks >= limit)
+                    if !limits.soft_budget
+                        && limits
+                            .interrupt_after_checks
+                            .is_some_and(|limit| checks >= limit)
                     {
+                        signal.store(2, Ordering::Relaxed);
                         return true;
                     }
                 }
-                Instant::now() >= deadline || THINKING_PENDING.load(Ordering::SeqCst) > 0
+                let expired = !limits.soft_budget && Instant::now() >= deadline;
+                if expired {
+                    signal.store(2, Ordering::Relaxed);
+                }
+                expired
             }),
         );
         Self {
             conn,
             deadline,
+            soft_budget: limits.soft_budget,
+            interruption,
             #[cfg(test)]
             checkpoints: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -1429,7 +1551,15 @@ impl<'a> CleanupProgress<'a> {
                 .checkpoint_clock
                 .map_or(now, |clock| clock(checks, self.deadline))
         };
-        if now >= self.deadline || THINKING_PENDING.load(Ordering::SeqCst) > 0 {
+        let reason = if THINKING_PENDING.load(Ordering::SeqCst) > 0 {
+            1
+        } else if !self.soft_budget && now >= self.deadline {
+            2
+        } else {
+            0
+        };
+        if reason != 0 {
+            self.interruption.store(reason, Ordering::Relaxed);
             Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
                 Some("maintenance budget exhausted or request pending".into()),
@@ -1450,7 +1580,7 @@ fn cleanup_transaction<T>(
     conn: &Connection,
     limits: CleanupLimits,
     operation: impl FnOnce(&Connection, &CleanupProgress<'_>) -> rusqlite::Result<T>,
-) -> rusqlite::Result<T> {
+) -> Result<T, CleanupError> {
     let deadline = Instant::now() + limits.batch_budget;
     let tx = conn.unchecked_transaction()?;
     // 声明顺序保证 panic 时先清除回调，再由 transaction 回滚。
@@ -1463,29 +1593,32 @@ fn cleanup_transaction<T>(
             tx.execute_batch("COMMIT")?;
             Ok(value)
         });
+    let interruption = progress.interruption.load(Ordering::Relaxed);
     drop(progress);
     // Interrupted 可能已自动回滚；finish 会检查 autocommit，且不再受过期回调影响。
     tx.finish()?;
-    result
+    result.map_err(|error| match interruption {
+        1 => CleanupError::Deferred(CleanupDeferReason::Pending),
+        2 => CleanupError::Deferred(CleanupDeferReason::Budget),
+        _ => CleanupError::from(error),
+    })
 }
 
-fn cleanup_is_deferred(error: &rusqlite::Error) -> bool {
-    matches!(
-        error.sqlite_error_code(),
-        Some(
-            rusqlite::ErrorCode::DatabaseBusy
-                | rusqlite::ErrorCode::DatabaseLocked
-                | rusqlite::ErrorCode::OperationInterrupted
-        )
-    )
+#[cfg(test)]
+fn cleanup_is_deferred(error: &CleanupError) -> bool {
+    matches!(error, CleanupError::Deferred(_))
 }
 
 fn cleanup_thinking_batch(
     conn: &Connection,
     cutoff: i64,
     kind: ThinkingBatch,
-    limits: CleanupLimits,
-) -> rusqlite::Result<ThinkingCleanupStats> {
+    mut limits: CleanupLimits,
+) -> Result<ThinkingCleanupStats, CleanupError> {
+    limits.soft_budget = match kind {
+        ThinkingBatch::Sessions => limits.rows == 1,
+        ThinkingBatch::Orphans => limits.window == 1,
+    };
     cleanup_transaction(conn, limits, |conn, budget| {
         let mut stats = ThinkingCleanupStats::default();
         match kind {
@@ -1499,6 +1632,7 @@ fn cleanup_thinking_batch(
                     })
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 stats.scanned = sessions.len();
+                stats.category_complete = sessions.is_empty();
                 for session in sessions {
                     budget.checkpoint()?;
                     let ids = conn
@@ -1566,12 +1700,14 @@ fn cleanup_thinking_batch(
                 // 未处理的窗口尾部留给下一批，只有完整走到尾部才回绕。
                 if processed == rows.len() && rows.len() < limits.window {
                     next = 0;
+                    stats.category_complete = true;
                 }
                 budget.checkpoint()?;
                 conn.execute(
                     "INSERT INTO thinking_meta (k, v) VALUES ('cleanup_orphan_cursor', ?1) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
                     [next.to_string()],
                 )?;
+                stats.orphan_cursor = Some(next);
             }
         }
         Ok(stats)
@@ -1587,18 +1723,12 @@ fn try_cleanup_thinking_batch(
     let mut guard = match slot.try_lock() {
         Ok(guard) => guard,
         Err(TryLockError::WouldBlock) => {
-            return Ok(ThinkingCleanupStats {
-                deferred: true,
-                ..Default::default()
-            })
+            return Ok(ThinkingCleanupStats::deferred(CleanupDeferReason::LockBusy))
         }
         Err(error) => return Err(format!("thinking db lock: {error}")),
     };
     if THINKING_PENDING.load(Ordering::SeqCst) > 0 {
-        return Ok(ThinkingCleanupStats {
-            deferred: true,
-            ..Default::default()
-        });
+        return Ok(ThinkingCleanupStats::deferred(CleanupDeferReason::Pending));
     }
     let db_path = get_thinking_db_path()?;
     if guard.as_ref().map(|(path, _)| path) != Some(&db_path) {
@@ -1608,10 +1738,7 @@ fn try_cleanup_thinking_batch(
     let conn = &guard.as_ref().expect("thinking db connection").1;
     match cleanup_thinking_batch(conn, cutoff, kind, limits) {
         Ok(stats) => Ok(stats),
-        Err(error) if cleanup_is_deferred(&error) => Ok(ThinkingCleanupStats {
-            deferred: true,
-            ..Default::default()
-        }),
+        Err(CleanupError::Deferred(reason)) => Ok(ThinkingCleanupStats::deferred(reason)),
         Err(error) => Err(format!("thinking cleanup: {error}")),
     }
 }
@@ -1619,8 +1746,9 @@ fn try_cleanup_thinking_batch(
 fn cleanup_tools_batch(
     conn: &Connection,
     cutoff: i64,
-    limits: CleanupLimits,
-) -> rusqlite::Result<usize> {
+    mut limits: CleanupLimits,
+) -> Result<usize, CleanupError> {
+    limits.soft_budget = limits.rows == 1;
     cleanup_transaction(conn, limits, |conn, _budget| {
         conn.execute(
         "DELETE FROM tool_signatures WHERE tool_id IN (SELECT tool_id FROM tool_signatures INDEXED BY idx_tool_sig_created WHERE created_at < ?1 ORDER BY created_at LIMIT ?2)",
@@ -1629,58 +1757,108 @@ fn cleanup_tools_batch(
     })
 }
 
-/// 串行轮转 session、orphan 和旧签名批次，释放共享锁后才开始下一批。
-pub fn cleanup_thinking_storage(days: i64) -> Result<ThinkingCleanupStats, String> {
+/// 每轮使用当前截止时间；已完成类别等待下一遍或小时维护重新开放。
+pub fn cleanup_thinking_storage(
+    days: i64,
+    state: &mut ThinkingMaintenance,
+) -> Result<ThinkingCleanupStats, String> {
+    if state.retention_days != Some(days) {
+        state.complete = [false; 3];
+        state.retention_days = Some(days);
+    }
     let cutoff = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
-    cleanup_thinking_storage_with_limits(cutoff, CleanupLimits::default())
+    cleanup_thinking_storage_with_limits(cutoff, CleanupLimits::default(), state)
 }
 
 fn cleanup_thinking_storage_with_limits(
     cutoff: i64,
     limits: CleanupLimits,
+    state: &mut ThinkingMaintenance,
 ) -> Result<ThinkingCleanupStats, String> {
+    if state.complete.iter().all(|complete| *complete) {
+        state.complete = [false; 3];
+    }
     let started = Instant::now();
     let mut total = ThinkingCleanupStats::default();
     let mut tools = None;
-    let start = CLEANUP_NEXT_BATCH.load(Ordering::Relaxed);
-    for batch in 0..limits.batches {
-        if started.elapsed() >= limits.round_budget || THINKING_PENDING.load(Ordering::SeqCst) > 0 {
+    for _ in 0..limits.batches {
+        let Some(kind) = (0..3)
+            .map(|offset| (state.next + offset) % 3)
+            .find(|kind| !state.complete[*kind])
+        else {
+            break;
+        };
+        if THINKING_PENDING.load(Ordering::SeqCst) > 0 {
             total.deferred = true;
+            total.defer_reason = Some(CleanupDeferReason::Pending);
             break;
         }
-        let kind = (start + batch) % 3;
-        CLEANUP_NEXT_BATCH.store((kind + 1) % 3, Ordering::Relaxed);
-        let stats = match kind {
-            0 => try_cleanup_thinking_batch(cutoff, ThinkingBatch::Sessions, limits)?,
-            1 => try_cleanup_thinking_batch(cutoff, ThinkingBatch::Orphans, limits)?,
+        let elapsed = started.elapsed();
+        #[cfg(test)]
+        let elapsed = limits
+            .round_clock
+            .map_or(elapsed, |clock| clock(total.batches));
+        if elapsed >= limits.round_budget {
+            total.deferred = true;
+            total.defer_reason = Some(CleanupDeferReason::RoundBudget);
+            break;
+        }
+        state.next = (kind + 1) % 3;
+        total.batches += 1;
+        let mut unit_limits = limits;
+        if kind == 1 {
+            unit_limits.window = state.units[kind];
+        } else {
+            unit_limits.rows = state.units[kind];
+        }
+        let result = match kind {
+            0 => try_cleanup_thinking_batch(cutoff, ThinkingBatch::Sessions, unit_limits),
+            1 => try_cleanup_thinking_batch(cutoff, ThinkingBatch::Orphans, unit_limits),
             _ => {
                 let conn = match tools.as_ref() {
                     Some(conn) => conn,
                     None => tools.insert(connect_db()?),
                 };
-                match cleanup_tools_batch(conn, cutoff, limits) {
-                    Ok(deleted_tools) => ThinkingCleanupStats {
+                match cleanup_tools_batch(conn, cutoff, unit_limits) {
+                    Ok(deleted_tools) => Ok(ThinkingCleanupStats {
                         deleted_tools,
+                        category_complete: deleted_tools < unit_limits.rows,
                         ..Default::default()
-                    },
-                    Err(error) if cleanup_is_deferred(&error) => ThinkingCleanupStats {
-                        deferred: true,
-                        ..Default::default()
-                    },
-                    Err(error) => return Err(format!("tool signature cleanup: {error}")),
+                    }),
+                    Err(CleanupError::Deferred(reason)) => {
+                        Ok(ThinkingCleanupStats::deferred(reason))
+                    }
+                    Err(error) => Err(format!("tool signature cleanup: {error}")),
                 }
             }
         };
-        total.batches += 1;
+        let stats = result.map_err(|error| {
+            format!(
+                "{error}; committed_batches={}, scanned={}, deleted_records={}, deleted_tools={}, orphan_cursor={:?}",
+                total.committed_batches, total.scanned, total.deleted_records, total.deleted_tools, total.orphan_cursor
+            )
+        })?;
         total.deleted_records += stats.deleted_records;
         total.deleted_sessions += stats.deleted_sessions;
         total.deleted_tools += stats.deleted_tools;
         total.scanned += stats.scanned;
         if stats.deferred {
+            if stats.defer_reason == Some(CleanupDeferReason::Budget) {
+                state.units[kind] = (state.units[kind] / 2).max(1);
+            }
             total.deferred = true;
+            total.defer_reason = stats.defer_reason;
             break;
         }
+        total.committed_batches += 1;
+        state.complete[kind] = stats.category_complete;
+        if stats.orphan_cursor.is_some() {
+            total.orphan_cursor = stats.orphan_cursor;
+        }
     }
+    total.unfinished = state.complete.iter().any(|complete| !complete);
+    total.orphan_sweep_complete = state.complete[1];
+    total.units = state.units;
     total.elapsed = started.elapsed();
     Ok(total)
 }
@@ -3097,7 +3275,10 @@ mod thinking_maintenance_tests {
                 record(&conn, "orphan", 1, None);
             }
         }
-        let limits = CleanupLimits::default();
+        let limits = CleanupLimits {
+            window: 512,
+            ..Default::default()
+        };
         let mut deleted = 0;
         let mut cursors = Vec::new();
         // 每批重新打开数据库，证明游标不依赖进程内状态。
@@ -3356,9 +3537,11 @@ mod thinking_maintenance_tests {
         }
         let limits = CleanupLimits {
             batches: 3,
+            window: 512,
             ..Default::default()
         };
-        let stats = cleanup_thinking_storage_with_limits(100, limits).unwrap();
+        let mut state = ThinkingMaintenance::with_limits(limits);
+        let stats = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
         assert_eq!(
             (stats.batches, stats.deleted_records, stats.deleted_tools),
             (3, 129, 128)
@@ -3371,14 +3554,17 @@ mod thinking_maintenance_tests {
                 round_budget: Duration::ZERO,
                 ..limits
             },
+            &mut state,
         )
         .unwrap();
         assert_eq!(zero.batches, 0);
         assert!(zero.deferred);
         conn.execute("DROP TABLE tool_signatures", []).unwrap();
-        assert!(cleanup_thinking_storage_with_limits(100, limits)
-            .unwrap_err()
-            .contains("tool_signatures"));
+        assert!(
+            cleanup_thinking_storage_with_limits(100, limits, &mut state)
+                .unwrap_err()
+                .contains("tool_signatures")
+        );
     }
     #[test]
     fn thinking_review_short_statements_observe_pending_before_commit() {
@@ -3432,9 +3618,10 @@ mod thinking_maintenance_tests {
             interrupt_after_checks: Some(1),
             ..Default::default()
         };
+        let mut state = ThinkingMaintenance::with_limits(limits);
         let mut deleted = 0;
         for _ in 0..3 {
-            let stats = cleanup_thinking_storage_with_limits(100, limits).unwrap();
+            let stats = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
             assert!(stats.deferred);
             deleted += stats.deleted_records;
         }
@@ -3495,6 +3682,7 @@ mod thinking_maintenance_tests {
                     kind,
                     CleanupLimits {
                         vm_steps: i32::MAX,
+                        window: 128,
                         checkpoint_clock: Some(clock),
                         ..Default::default()
                     },
@@ -3568,5 +3756,423 @@ mod thinking_maintenance_tests {
                 .unwrap(),
             0
         );
+    }
+    fn expire_large_cold_window(checks: usize, deadline: Instant) -> Instant {
+        if checks >= 20 {
+            deadline
+        } else {
+            deadline - Duration::from_secs(1)
+        }
+    }
+
+    #[test]
+    fn cold_cleanup_shrinks_across_rounds_and_commits_every_tail_row() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        with_thinking_db(|conn| {
+            for _ in 0..25 {
+                record(conn, "orphan", 1, None);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let limits = CleanupLimits {
+            batches: 1,
+            vm_steps: i32::MAX,
+            checkpoint_clock: Some(expire_large_cold_window),
+            ..Default::default()
+        };
+        let mut state = ThinkingMaintenance::with_limits(limits);
+        state.complete = [true, false, true];
+        state.next = 1;
+        let failed = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+        assert_eq!(failed.defer_reason, Some(CleanupDeferReason::Budget));
+        assert_eq!(
+            (
+                failed.committed_batches,
+                failed.scanned,
+                failed.orphan_cursor
+            ),
+            (0, 0, None)
+        );
+        assert_eq!(state.units, [128, 8, 128]);
+        assert_eq!(get_thinking_records_count().unwrap(), 25);
+        let mut deleted = 0;
+        let mut cursors = Vec::new();
+        for _ in 0..4 {
+            let stats = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+            assert!(!stats.deferred);
+            assert_eq!(stats.committed_batches, 1);
+            deleted += stats.deleted_records;
+            cursors.push(stats.orphan_cursor.unwrap());
+        }
+        assert_eq!(deleted, 25);
+        assert_eq!(cursors, [8, 16, 24, 0]);
+        assert!(state.complete.iter().all(|done| *done));
+        assert_eq!(get_thinking_records_count().unwrap(), 0);
+        // 新一遍遍历保留缩小单元，并且不会重复扫描已经完成的空类别。
+        let next = cleanup_thinking_storage_with_limits(200, CleanupLimits::default(), &mut state)
+            .unwrap();
+        assert_eq!(next.units, [128, 8, 128]);
+        assert_eq!(next.committed_batches, 3);
+        assert!(!next.unfinished);
+    }
+
+    #[test]
+    fn cold_cleanup_minimum_units_commit_after_budget_expiry() {
+        let conn = local_db();
+        session(&conn, "expired", 1);
+        record(&conn, "expired", 1, None);
+        record(&conn, "expired", 1, None);
+        let orphan = record(&conn, "orphan", 1, None);
+        let limits = CleanupLimits {
+            rows: 1,
+            window: 1,
+            batch_budget: Duration::ZERO,
+            vm_steps: 1,
+            ..Default::default()
+        };
+        let first = cleanup_thinking_batch(&conn, 100, ThinkingBatch::Sessions, limits).unwrap();
+        assert_eq!((first.deleted_records, first.deleted_sessions), (1, 0));
+        let second = cleanup_thinking_batch(&conn, 100, ThinkingBatch::Sessions, limits).unwrap();
+        assert_eq!((second.deleted_records, second.deleted_sessions), (1, 1));
+        let stats = cleanup_thinking_batch(&conn, 100, ThinkingBatch::Orphans, limits).unwrap();
+        assert_eq!(stats.deleted_records, 1);
+        assert_eq!(stats.orphan_cursor, Some(orphan));
+        assert!(!stats.category_complete);
+        assert!(
+            cleanup_thinking_batch(&conn, 100, ThinkingBatch::Orphans, limits)
+                .unwrap()
+                .category_complete
+        );
+        conn.execute_batch("CREATE TABLE tool_signatures (tool_id TEXT PRIMARY KEY, signature TEXT, created_at INTEGER); CREATE INDEX idx_tool_sig_created ON tool_signatures(created_at); INSERT INTO tool_signatures VALUES ('a', 'sig', 1), ('b', 'sig', 1);").unwrap();
+        assert_eq!(cleanup_tools_batch(&conn, 100, limits).unwrap(), 1);
+        assert_eq!(cleanup_tools_batch(&conn, 100, limits).unwrap(), 1);
+        assert_eq!(cleanup_tools_batch(&conn, 100, limits).unwrap(), 0);
+    }
+
+    fn pending_at_minimum_commit(checks: usize, deadline: Instant) -> Instant {
+        if checks >= 5 {
+            THINKING_PENDING.store(1, Ordering::SeqCst);
+        }
+        deadline
+    }
+
+    #[test]
+    fn cold_cleanup_pending_rolls_back_minimum_unit_but_preserves_prior_commits() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        with_thinking_db(|conn| {
+            for _ in 0..3 {
+                record(conn, "orphan", 1, None);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let limits = CleanupLimits {
+            window: 1,
+            batches: 1,
+            batch_budget: Duration::ZERO,
+            vm_steps: i32::MAX,
+            ..Default::default()
+        };
+        let mut state = ThinkingMaintenance::with_limits(limits);
+        state.complete = [true, false, true];
+        state.next = 1;
+        let committed = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+        assert_eq!(committed.orphan_cursor, Some(1));
+        assert_eq!(committed.deleted_records, 1);
+        let result = cleanup_thinking_storage_with_limits(
+            100,
+            CleanupLimits {
+                checkpoint_clock: Some(pending_at_minimum_commit),
+                ..limits
+            },
+            &mut state,
+        );
+        THINKING_PENDING.store(0, Ordering::SeqCst);
+        let pending = result.unwrap();
+        assert_eq!(pending.defer_reason, Some(CleanupDeferReason::Pending));
+        assert_eq!((pending.committed_batches, pending.scanned), (0, 0));
+        assert_eq!(state.units, [128, 1, 128]);
+        with_thinking_db(|conn| {
+            assert!(!exists(conn, 1));
+            assert!(exists(conn, 2) && exists(conn, 3));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT v FROM thinking_meta WHERE k = 'cleanup_orphan_cursor'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "1"
+            );
+            Ok(())
+        })
+        .unwrap();
+        let resumed = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+        assert_eq!(resumed.orphan_cursor, Some(2));
+    }
+
+    #[test]
+    fn cold_cleanup_contention_does_not_shrink_and_completion_survives_rounds() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        let limits = CleanupLimits {
+            batches: 1,
+            ..Default::default()
+        };
+        let mut state = ThinkingMaintenance::with_limits(limits);
+        let pending = ThinkingRequest::enter();
+        let stats = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+        assert_eq!(stats.defer_reason, Some(CleanupDeferReason::Pending));
+        drop(pending);
+        let guard = hold_thinking_db_for_test();
+        let stats = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+        assert_eq!(stats.defer_reason, Some(CleanupDeferReason::LockBusy));
+        drop(guard);
+        assert_eq!(state.units, [128, 16, 128]);
+        // 结束空 orphan 类别后，后续调用只执行尚未完成的类别。
+        let orphan = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+        assert!(orphan.orphan_sweep_complete && orphan.unfinished);
+        let tools = cleanup_thinking_storage_with_limits(200, limits, &mut state).unwrap();
+        assert!(tools.orphan_sweep_complete && tools.unfinished);
+        let sessions = cleanup_thinking_storage_with_limits(300, limits, &mut state).unwrap();
+        assert!(!sessions.unfinished);
+        with_thinking_db(|conn| {
+            record(conn, "next-pass", 250, None);
+            Ok(())
+        })
+        .unwrap();
+        let next = cleanup_thinking_storage_with_limits(300, CleanupLimits::default(), &mut state)
+            .unwrap();
+        assert_eq!(next.deleted_records, 1);
+        assert!(!next.unfinished);
+    }
+
+    #[test]
+    fn cold_cleanup_budget_shrink_stops_at_one_and_allows_progress() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        with_thinking_db(|conn| {
+            record(conn, "orphan", 1, None);
+            Ok(())
+        })
+        .unwrap();
+        let limits = CleanupLimits {
+            batches: 1,
+            batch_budget: Duration::ZERO,
+            ..Default::default()
+        };
+        let mut state = ThinkingMaintenance::with_limits(limits);
+        state.complete = [true, false, true];
+        state.next = 1;
+        for expected in [8, 4, 2, 1] {
+            let stats = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+            assert_eq!(stats.defer_reason, Some(CleanupDeferReason::Budget));
+            assert_eq!(stats.units[1], expected);
+            assert_eq!(get_thinking_records_count().unwrap(), 1);
+        }
+        let minimum = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+        assert_eq!(minimum.deleted_records, 1);
+        assert!(!minimum.deferred);
+        assert_eq!(minimum.units[1], 1);
+    }
+
+    #[test]
+    fn cold_cleanup_attempt_limit_reports_unfinished_without_repeating_completed_categories() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        with_thinking_db(|conn| {
+            session(conn, "active", 101);
+            for _ in 0..4100 {
+                record(conn, "active", 1, None);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let mut state = ThinkingMaintenance {
+            complete: [true, false, true],
+            next: 1,
+            ..Default::default()
+        };
+        let stats = cleanup_thinking_storage_with_limits(100, CleanupLimits::default(), &mut state)
+            .unwrap();
+        assert_eq!(
+            (stats.batches, stats.committed_batches, stats.scanned),
+            (256, 256, 4096)
+        );
+        assert!(stats.unfinished && !stats.deferred);
+        assert_eq!(stats.orphan_cursor, Some(4096));
+        let last = cleanup_thinking_storage_with_limits(100, CleanupLimits::default(), &mut state)
+            .unwrap();
+        assert_eq!(
+            (last.batches, last.scanned, last.orphan_cursor),
+            (1, 4, Some(0))
+        );
+        assert!(!last.unfinished);
+    }
+    #[test]
+    fn cold_cleanup_sqlite_busy_preserves_adaptive_units() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        with_thinking_db(|conn| {
+            record(conn, "orphan", 1, None);
+            conn.busy_timeout(Duration::ZERO).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let writer = Connection::open(get_thinking_db_path().unwrap()).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut state = ThinkingMaintenance {
+            complete: [true, false, true],
+            next: 1,
+            ..Default::default()
+        };
+        let result =
+            cleanup_thinking_storage_with_limits(100, CleanupLimits::default(), &mut state);
+        writer.execute_batch("ROLLBACK").unwrap();
+        with_thinking_db(|conn| {
+            conn.busy_timeout(Duration::from_secs(5))
+                .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        let stats = result.unwrap();
+        assert_eq!(stats.defer_reason, Some(CleanupDeferReason::SqliteBusy));
+        assert_eq!(state.units, [128, 16, 128]);
+        assert_eq!(get_thinking_records_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn cold_cleanup_retention_change_restarts_cutoff_without_resetting_units() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let day = 24 * 3600 * 1000;
+        with_thinking_db(|conn| {
+            record(conn, "orphan", now - 20 * day, None);
+            Ok(())
+        })
+        .unwrap();
+        let mut state = ThinkingMaintenance {
+            units: [1, 1, 1],
+            complete: [true, false, true],
+            retention_days: Some(15),
+            ..Default::default()
+        };
+        assert!(!cleanup_thinking_storage(30, &mut state).unwrap().unfinished);
+        assert_eq!(get_thinking_records_count().unwrap(), 1);
+        assert_eq!(state.units, [1, 1, 1]);
+        assert_eq!(
+            cleanup_thinking_storage(10, &mut state)
+                .unwrap()
+                .deleted_records,
+            1
+        );
+    }
+    #[test]
+    fn cold_cleanup_hourly_reopens_expiry_categories_without_restarting_orphan_cursor() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        with_thinking_db(|conn| {
+            session(conn, "active", 300);
+            record(conn, "active", 1, None);
+            session(conn, "newly-expired", 150);
+            record(conn, "newly-expired", 250, None);
+            record(conn, "orphan", 1, None);
+            conn.execute(
+                "INSERT INTO thinking_meta VALUES ('cleanup_orphan_cursor', '1')",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let tools = connect_db().unwrap();
+        tools
+            .execute(
+                "INSERT INTO tool_signatures VALUES ('newly-expired', 'sig', 150)",
+                [],
+            )
+            .unwrap();
+        let limits = CleanupLimits {
+            rows: 1,
+            window: 1,
+            batches: 1,
+            ..Default::default()
+        };
+        let mut state = ThinkingMaintenance::with_limits(limits);
+        // 上一轮截止时间 100 时 session/tool 已完成，orphan 从 id=1 之后继续。
+        state.complete = [true, false, true];
+        state.reopen_completed_categories();
+        let sessions = cleanup_thinking_storage_with_limits(200, limits, &mut state).unwrap();
+        assert_eq!(sessions.deleted_records, 1);
+        with_thinking_db(|conn| {
+            assert!(!exists(conn, 2));
+            assert!(exists(conn, 1) && exists(conn, 3));
+            assert_eq!(
+                conn.query_row(
+                    "SELECT v FROM thinking_meta WHERE k = 'cleanup_orphan_cursor'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                "1"
+            );
+            Ok(())
+        })
+        .unwrap();
+        let rest = cleanup_thinking_storage_with_limits(
+            200,
+            CleanupLimits {
+                batches: 256,
+                ..limits
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(rest.deleted_tools, 1);
+        assert_eq!(rest.deleted_records, 1);
+        assert!(!rest.unfinished);
+        assert_eq!(get_thinking_records_count().unwrap(), 1);
+    }
+    #[test]
+    fn cold_cleanup_slow_minimum_commit_does_not_start_work_after_round_expiry() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        with_thinking_db(|conn| {
+            for _ in 0..3 {
+                record(conn, "orphan", 1, None);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let limits = CleanupLimits {
+            window: 1,
+            batch_budget: Duration::ZERO,
+            round_clock: Some(|attempts| {
+                if attempts == 0 {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(3)
+                }
+            }),
+            ..Default::default()
+        };
+        let mut state = ThinkingMaintenance::with_limits(limits);
+        state.complete = [true, false, true];
+        state.next = 1;
+        let stats = cleanup_thinking_storage_with_limits(100, limits, &mut state).unwrap();
+        assert_eq!(
+            (
+                stats.batches,
+                stats.committed_batches,
+                stats.deleted_records
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(stats.defer_reason, Some(CleanupDeferReason::RoundBudget));
+        assert_eq!(stats.orphan_cursor, Some(1));
+        assert_eq!(get_thinking_records_count().unwrap(), 2);
     }
 }
