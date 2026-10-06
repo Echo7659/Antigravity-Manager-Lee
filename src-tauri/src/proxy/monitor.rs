@@ -312,48 +312,9 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
-        let retention = crate::modules::config::load_app_config()
-            .map(|config| config.proxy.log_retention)
-            .unwrap_or_default();
-        tokio::task::spawn_blocking(move || {
-            match crate::modules::proxy_db::apply_retention(&retention) {
-                Ok((cleared, deleted)) => {
-                    if cleared > 0 || deleted > 0 {
-                        tracing::info!(
-                            "Proxy log retention: cleared {} bodies, deleted {} rows",
-                            cleared,
-                            deleted
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to cleanup old logs: {}", e);
-                }
-            }
-            match crate::modules::proxy_db::cleanup_old_thinking_records(thinking_days) {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        tracing::info!(
-                            "Auto cleanup: removed {} old thinking/signature records (>{} days)",
-                            deleted,
-                            thinking_days
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to cleanup thinking records: {}", e);
-                }
-            }
-            crate::modules::logger::sync_internal_error_log_budget_from_config();
-            if let Err(e) = crate::modules::logger::apply_internal_error_log_retention() {
-                tracing::error!("Failed to apply internal error log retention: {}", e);
-            }
-        });
-
         tokio::spawn(async {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            interval.tick().await;
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
                 let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
@@ -363,7 +324,7 @@ impl ProxyMonitor {
                 let result = tokio::task::spawn_blocking(move || {
                     let retention_res = crate::modules::proxy_db::apply_retention(&retention);
                     let thinking_res =
-                        crate::modules::proxy_db::cleanup_old_thinking_records(thinking_days);
+                        crate::modules::proxy_db::cleanup_thinking_storage(thinking_days);
                     crate::modules::logger::sync_internal_error_log_budget_from_config();
                     let error_log_res =
                         crate::modules::logger::apply_internal_error_log_retention();
@@ -386,15 +347,20 @@ impl ProxyMonitor {
                                 tracing::error!("Failed to apply proxy log retention: {}", error)
                             }
                         }
-                        if let Ok(deleted) = thinking_res {
-                            if deleted > 0 {
-                                tracing::info!(
-                                    "Auto cleanup: removed {} old thinking/signature records",
-                                    deleted
-                                );
+                        match thinking_res {
+                            Ok(stats) => tracing::info!(
+                                deleted_records = stats.deleted_records,
+                                deleted_sessions = stats.deleted_sessions,
+                                deleted_tools = stats.deleted_tools,
+                                scanned = stats.scanned,
+                                batches = stats.batches,
+                                deferred = stats.deferred,
+                                elapsed_ms = stats.elapsed.as_millis(),
+                                "Thinking storage maintenance completed"
+                            ),
+                            Err(error) => {
+                                tracing::error!("Failed to cleanup thinking records: {}", error)
                             }
-                        } else if let Err(e) = thinking_res {
-                            tracing::error!("Failed to cleanup thinking records: {}", e);
                         }
                         if let Err(e) = error_log_res {
                             tracing::error!("Failed to apply internal error log retention: {}", e);

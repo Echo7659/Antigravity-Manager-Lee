@@ -24,7 +24,7 @@ dirs = "5.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "socks", "rustls-tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 base64 = "0.22"
 sys-locale = "0.3.2"

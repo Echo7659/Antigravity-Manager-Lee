@@ -3,10 +3,12 @@ use crate::proxy::monitor::ProxyRequestLog;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, TryLockError};
+use std::time::{Duration, Instant};
 
 static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static TOOL_SIGNATURE_DB: OnceLock<Mutex<Option<(PathBuf, Connection)>>> = OnceLock::new();
@@ -190,6 +192,11 @@ fn init_thinking_schema(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_thinking_sessions_accessed ON thinking_sessions (last_accessed, session_key)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS thinking_meta (
             k TEXT PRIMARY KEY,
             v TEXT NOT NULL
@@ -248,6 +255,46 @@ fn thinking_db() -> Result<ThinkingDbGuard, String> {
     Ok(ThinkingDbGuard(guard))
 }
 
+static THINKING_PENDING: AtomicUsize = AtomicUsize::new(0);
+// 保存下一类别，单类重复中断不能让后续维护轮次一直从同一类别开始。
+static CLEANUP_NEXT_BATCH: AtomicUsize = AtomicUsize::new(0);
+
+/// 前台请求计数覆盖路径查找、连接初始化、锁等待和 SQL 执行。
+struct ThinkingRequest;
+
+impl ThinkingRequest {
+    fn enter() -> Self {
+        THINKING_PENDING.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ThinkingRequest {
+    fn drop(&mut self) {
+        THINKING_PENDING.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 同步数据库边界在 MultiThread runtime 上释放 worker；CurrentThread 保留同步语义。
+fn with_thinking_db<T>(
+    operation: impl FnOnce(&Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    let _pending = ThinkingRequest::enter();
+    let run = || {
+        #[cfg(test)]
+        thinking_maintenance_tests::run_hook(&thinking_maintenance_tests::BEFORE_LOCK);
+        let conn = thinking_db()?;
+        operation(&conn)
+    };
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(run)
+    } else {
+        run()
+    }
+}
+
 fn mark_thinking_imported(conn: &Connection) {
     let _ = conn.execute(
         "INSERT OR REPLACE INTO thinking_meta (k, v) VALUES ('imported_from_proxy_logs', '1')",
@@ -258,36 +305,36 @@ fn mark_thinking_imported(conn: &Connection) {
 /// Copy old thinking rows out of proxy_logs.db into thinking_store.db.
 /// Never deletes the log DB. Old uncompressed rows stay readable via unpack_thought.
 fn migrate_thinking_from_logs() -> Result<(), String> {
-    let conn = thinking_db()?;
-    let imported: Option<String> = conn
-        .query_row(
-            "SELECT v FROM thinking_meta WHERE k = 'imported_from_proxy_logs'",
-            [],
-            |r| r.get(0),
-        )
-        .ok();
-    if imported.as_deref() == Some("1") {
-        return Ok(());
-    }
+    with_thinking_db(|conn| {
+        let imported: Option<String> = conn
+            .query_row(
+                "SELECT v FROM thinking_meta WHERE k = 'imported_from_proxy_logs'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        if imported.as_deref() == Some("1") {
+            return Ok(());
+        }
 
-    let logs_path = get_proxy_db_path()?;
-    if !logs_path.exists() {
-        mark_thinking_imported(&conn);
-        return Ok(());
-    }
+        let logs_path = get_proxy_db_path()?;
+        if !logs_path.exists() {
+            mark_thinking_imported(conn);
+            return Ok(());
+        }
 
-    let escaped = logs_path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .replace('\'', "''");
-    if conn
-        .execute(&format!("ATTACH DATABASE '{}' AS logs", escaped), [])
-        .is_err()
-    {
-        return Ok(());
-    }
+        let escaped = logs_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace('\'', "''");
+        if conn
+            .execute(&format!("ATTACH DATABASE '{}' AS logs", escaped), [])
+            .is_err()
+        {
+            return Ok(());
+        }
 
-    let has_table: i64 = conn
+        let has_table: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM logs.sqlite_master WHERE type='table' AND name='thinking_records'",
             [],
@@ -295,15 +342,15 @@ fn migrate_thinking_from_logs() -> Result<(), String> {
         )
         .unwrap_or(0);
 
-    if has_table == 0 {
-        let _ = conn.execute("DETACH DATABASE logs", []);
-        mark_thinking_imported(&conn);
-        return Ok(());
-    }
+        if has_table == 0 {
+            let _ = conn.execute("DETACH DATABASE logs", []);
+            mark_thinking_imported(conn);
+            return Ok(());
+        }
 
-    // Copy only rows not already present. Do not gzip/rewrite on import — that
-    // would stall HDD by touching every old thought blob at startup.
-    let copy_with_accessed = "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, last_accessed)
+        // Copy only rows not already present. Do not gzip/rewrite on import — that
+        // would stall HDD by touching every old thought blob at startup.
+        let copy_with_accessed = "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, last_accessed)
              SELECT src.session_key, src.fingerprint, src.thought, src.signature, src.tool_ids, src.tool_names, src.visible, src.created_at,
                     COALESCE(src.last_accessed, src.created_at)
              FROM logs.thinking_records src
@@ -313,7 +360,7 @@ fn migrate_thinking_from_logs() -> Result<(), String> {
                   AND t.fingerprint = src.fingerprint
                   AND t.created_at = src.created_at
              )";
-    let copy_basic = "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, last_accessed)
+        let copy_basic = "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, last_accessed)
              SELECT src.session_key, src.fingerprint, src.thought, src.signature, src.tool_ids, src.tool_names, src.visible, src.created_at, src.created_at
              FROM logs.thinking_records src
              WHERE NOT EXISTS (
@@ -322,33 +369,32 @@ fn migrate_thinking_from_logs() -> Result<(), String> {
                   AND t.fingerprint = src.fingerprint
                   AND t.created_at = src.created_at
              )";
-    let copied = match conn.execute(copy_with_accessed, []) {
-        Ok(n) => n,
-        Err(_) => {
-            match conn.execute(copy_basic, []) {
+        let copied = match conn.execute(copy_with_accessed, []) {
+            Ok(n) => n,
+            Err(_) => match conn.execute(copy_basic, []) {
                 Ok(n) => n,
                 Err(e) => {
                     let _ = conn.execute("DETACH DATABASE logs", []);
                     tracing::warn!("[ThinkingStore] Import from proxy_logs.db failed (will retry next start): {e}");
                     return Ok(());
                 }
-            }
-        }
-    };
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO thinking_sessions (session_key, last_accessed)
+            },
+        };
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO thinking_sessions (session_key, last_accessed)
          SELECT session_key, MAX(created_at) FROM thinking_records GROUP BY session_key",
-        [],
-    );
-    let _ = conn.execute("DETACH DATABASE logs", []);
-    mark_thinking_imported(&conn);
-    if copied > 0 {
-        tracing::info!(
+            [],
+        );
+        let _ = conn.execute("DETACH DATABASE logs", []);
+        mark_thinking_imported(conn);
+        if copied > 0 {
+            tracing::info!(
             "[ThinkingStore] Imported {} thinking row(s) from proxy_logs.db (old file kept as backup)",
             copied
         );
-    }
-    Ok(())
+        }
+        Ok(())
+    })
 }
 
 pub fn init_db() -> Result<(), String> {
@@ -631,28 +677,28 @@ pub fn save_thinking_record(
     if session_key.is_empty() {
         return Ok(());
     }
-    let conn = thinking_db()?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let normalized_tool_ids: Vec<String> = tool_ids
-        .iter()
-        .map(|id| crate::proxy::common::utils::normalize_tool_id(id).into_owned())
-        .collect();
-    let tool_ids_json =
-        serde_json::to_string(&normalized_tool_ids).unwrap_or_else(|_| "[]".to_string());
-    let causal_tool_id = normalized_tool_ids
-        .iter()
-        .find(|id| is_synthetic_tool_id(id))
-        .map(|s| s.as_str());
-    let primary_tool_id = normalized_tool_ids.first().map(|s| s.as_str());
-    // tool_names / full visible for tool turns are reconstructable from the next
-    // request JSON at fill time. Do not write them.
-    let visible_persist = persist_visible(&normalized_tool_ids, visible);
-    let packed_thought = pack_thought(thought);
-    let signature = persist_signature(signature);
+    with_thinking_db(|conn| {
+        let now = chrono::Utc::now().timestamp_millis();
+        let normalized_tool_ids: Vec<String> = tool_ids
+            .iter()
+            .map(|id| crate::proxy::common::utils::normalize_tool_id(id).into_owned())
+            .collect();
+        let tool_ids_json =
+            serde_json::to_string(&normalized_tool_ids).unwrap_or_else(|_| "[]".to_string());
+        let causal_tool_id = normalized_tool_ids
+            .iter()
+            .find(|id| is_synthetic_tool_id(id))
+            .map(|s| s.as_str());
+        let primary_tool_id = normalized_tool_ids.first().map(|s| s.as_str());
+        // tool_names / full visible for tool turns are reconstructable from the next
+        // request JSON at fill time. Do not write them.
+        let visible_persist = persist_visible(&normalized_tool_ids, visible);
+        let packed_thought = pack_thought(thought);
+        let signature = persist_signature(signature);
 
-    // 智能防叠加与幂等查重：只允许合并/更新当前会话中的【最新一条】活跃轮次（流式碎片拼接或更长思考补齐）
-    // 绝不能回溯更新历史早期轮次！
-    let latest_row: Option<(
+        // 智能防叠加与幂等查重：只允许合并/更新当前会话中的【最新一条】活跃轮次（流式碎片拼接或更长思考补齐）
+        // 绝不能回溯更新历史早期轮次！
+        let latest_row: Option<(
         i64,
         usize,
         Option<String>,
@@ -679,166 +725,173 @@ pub fn save_thinking_record(
         )
         .ok();
 
-    let existing_id: Option<(i64, usize, Option<String>)> = match latest_row {
-        Some((id, len, sig, ref last_fp, ref last_tool_id, ref last_causal_id)) => {
-            let is_match = if let Some(c_id) = causal_tool_id {
-                last_causal_id.as_deref() == Some(c_id)
-                    || last_tool_id.as_deref() == Some(c_id)
-                    || last_causal_id
-                        .as_deref()
-                        .map(|s| crate::proxy::common::utils::normalize_tool_id(s))
-                        .as_deref()
-                        == Some(c_id)
-                    || last_tool_id
-                        .as_deref()
-                        .map(|s| crate::proxy::common::utils::normalize_tool_id(s))
-                        .as_deref()
-                        == Some(c_id)
-            } else if let Some(p_id) = primary_tool_id {
-                last_tool_id.as_deref() == Some(p_id)
-                    || last_tool_id
-                        .as_deref()
-                        .map(|s| crate::proxy::common::utils::normalize_tool_id(s))
-                        .as_deref()
-                        == Some(p_id)
-            } else {
-                last_fp == fingerprint && last_tool_id.is_none() && last_causal_id.is_none()
-            };
-            if is_match {
-                Some((id, len, sig))
-            } else {
-                None
+        let existing_id: Option<(i64, usize, Option<String>)> = match latest_row {
+            Some((id, len, sig, ref last_fp, ref last_tool_id, ref last_causal_id)) => {
+                let is_match = if let Some(c_id) = causal_tool_id {
+                    last_causal_id.as_deref() == Some(c_id)
+                        || last_tool_id.as_deref() == Some(c_id)
+                        || last_causal_id
+                            .as_deref()
+                            .map(|s| crate::proxy::common::utils::normalize_tool_id(s))
+                            .as_deref()
+                            == Some(c_id)
+                        || last_tool_id
+                            .as_deref()
+                            .map(|s| crate::proxy::common::utils::normalize_tool_id(s))
+                            .as_deref()
+                            == Some(c_id)
+                } else if let Some(p_id) = primary_tool_id {
+                    last_tool_id.as_deref() == Some(p_id)
+                        || last_tool_id
+                            .as_deref()
+                            .map(|s| crate::proxy::common::utils::normalize_tool_id(s))
+                            .as_deref()
+                            == Some(p_id)
+                } else {
+                    last_fp == fingerprint && last_tool_id.is_none() && last_causal_id.is_none()
+                };
+                if is_match {
+                    Some((id, len, sig))
+                } else {
+                    None
+                }
             }
-        }
-        None => None,
-    };
+            None => None,
+        };
 
-    if let Some((id, old_thought_len, old_sig)) = existing_id {
-        // 已存在记录：检查是否需要更新（防止将已有实质思考覆盖为占位符，但允许补全更长思考或有效签名）
-        let incoming_has_meaningful_thought =
-            !crate::proxy::thinking_store::is_placeholder_thought(thought)
-                && !thought.trim().is_empty();
-        let old_is_dummy = old_thought_len <= 10; // "RAW1..." 或占位符非常短
+        if let Some((id, old_thought_len, old_sig)) = existing_id {
+            // 已存在记录：检查是否需要更新（防止将已有实质思考覆盖为占位符，但允许补全更长思考或有效签名）
+            let incoming_has_meaningful_thought =
+                !crate::proxy::thinking_store::is_placeholder_thought(thought)
+                    && !thought.trim().is_empty();
+            let old_is_dummy = old_thought_len <= 10; // "RAW1..." 或占位符非常短
 
-        let should_update_thought = incoming_has_meaningful_thought || old_is_dummy;
-        let healed_old_sig = old_sig.as_deref().and_then(normalize_and_heal_signature);
-        let effective_sig = signature.as_deref().or(healed_old_sig.as_deref());
+            let should_update_thought = incoming_has_meaningful_thought || old_is_dummy;
+            let healed_old_sig = old_sig.as_deref().and_then(normalize_and_heal_signature);
+            let effective_sig = signature.as_deref().or(healed_old_sig.as_deref());
 
-        if should_update_thought {
-            let mut stmt = conn
+            if should_update_thought {
+                let mut stmt = conn
                 .prepare_cached(
                     "UPDATE thinking_records
                      SET thought = ?1, signature = ?2, tool_ids = ?3, visible = ?4, created_at = ?5, primary_tool_id = ?6, causal_tool_id = ?7
                      WHERE id = ?8",
                 )
                 .map_err(|e| e.to_string())?;
-            stmt.execute(params![
-                packed_thought.as_slice(),
-                effective_sig,
-                &tool_ids_json,
-                visible_persist,
-                now,
-                primary_tool_id,
-                causal_tool_id,
-                id,
-            ])
-            .map_err(|e| e.to_string())?;
-        } else if (signature.is_some() && signature.as_deref() != old_sig.as_deref())
-            || (healed_old_sig.as_deref() != old_sig.as_deref())
-        {
-            // 仅更新签名，保留已有的高质量实质思考（同时修复旧签名的脏数据）
-            let mut stmt = conn
-                .prepare_cached(
-                    "UPDATE thinking_records
+                stmt.execute(params![
+                    packed_thought.as_slice(),
+                    effective_sig,
+                    &tool_ids_json,
+                    visible_persist,
+                    now,
+                    primary_tool_id,
+                    causal_tool_id,
+                    id,
+                ])
+                .map_err(|e| e.to_string())?;
+            } else if (signature.is_some() && signature.as_deref() != old_sig.as_deref())
+                || (healed_old_sig.as_deref() != old_sig.as_deref())
+            {
+                // 仅更新签名，保留已有的高质量实质思考（同时修复旧签名的脏数据）
+                let mut stmt = conn
+                    .prepare_cached(
+                        "UPDATE thinking_records
                      SET signature = ?1, created_at = ?2
                      WHERE id = ?3",
-                )
-                .map_err(|e| e.to_string())?;
-            stmt.execute(params![effective_sig, now, id])
-                .map_err(|e| e.to_string())?;
-        }
-    } else {
-        // 全新轮次：插入新记录（同时写入 primary_tool_id 与 causal_tool_id 列）
-        let mut stmt = conn
+                    )
+                    .map_err(|e| e.to_string())?;
+                stmt.execute(params![effective_sig, now, id])
+                    .map_err(|e| e.to_string())?;
+            }
+        } else {
+            // 全新轮次：插入新记录（同时写入 primary_tool_id 与 causal_tool_id 列）
+            let mut stmt = conn
             .prepare_cached(
                 "INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, primary_tool_id, causal_tool_id)
                  VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7, ?8, ?9)",
             )
             .map_err(|e| e.to_string())?;
-        stmt.execute(params![
-            session_key,
-            fingerprint,
-            packed_thought.as_slice(),
-            signature.as_deref(),
-            &tool_ids_json,
-            visible_persist,
-            now,
-            primary_tool_id,
-            causal_tool_id,
-        ])
-        .map_err(|e| e.to_string())?;
-    }
+            stmt.execute(params![
+                session_key,
+                fingerprint,
+                packed_thought.as_slice(),
+                signature.as_deref(),
+                &tool_ids_json,
+                visible_persist,
+                now,
+                primary_tool_id,
+                causal_tool_id,
+            ])
+            .map_err(|e| e.to_string())?;
+        }
 
-    let mut session_stmt = conn
-        .prepare_cached(
-            "INSERT INTO thinking_sessions (session_key, last_accessed) VALUES (?1, ?2)
+        #[cfg(test)]
+        thinking_maintenance_tests::run_hook(&thinking_maintenance_tests::BEFORE_TOUCH);
+        let mut session_stmt = conn
+            .prepare_cached(
+                "INSERT INTO thinking_sessions (session_key, last_accessed) VALUES (?1, ?2)
              ON CONFLICT(session_key) DO UPDATE SET last_accessed = excluded.last_accessed",
-        )
-        .map_err(|e| e.to_string())?;
-    let _ = session_stmt.execute(params![session_key, now]);
+            )
+            .map_err(|e| e.to_string())?;
+        session_stmt
+            .execute(params![session_key, now])
+            .map_err(|e| e.to_string())?;
 
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn load_thinking_records(session_key: &str) -> Result<Vec<PersistedThinkingRecord>, String> {
     if session_key.is_empty() {
         return Ok(Vec::new());
     }
-    let conn = thinking_db()?;
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT fingerprint, thought, signature, tool_ids, tool_names, visible
+    with_thinking_db(|conn| {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT fingerprint, thought, signature, tool_ids, tool_names, visible
              FROM thinking_records
              WHERE session_key = ?1
              ORDER BY id ASC",
-        )
-        .map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
 
-    let rows = stmt
-        .query_map(params![session_key], |row| {
-            let fp: String = row.get(0)?;
-            let thought_raw: Vec<u8> = row.get(1)?;
-            let signature: Option<String> = row.get(2)?;
-            let tool_ids_str: String = row.get(3)?;
-            let tool_names_str: String = row.get(4)?;
-            let visible: String = row.get(5)?;
-            Ok((
-                fp,
-                thought_raw,
-                signature,
-                tool_ids_str,
-                tool_names_str,
-                visible,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                let fp: String = row.get(0)?;
+                let thought_raw: Vec<u8> = row.get(1)?;
+                let signature: Option<String> = row.get(2)?;
+                let tool_ids_str: String = row.get(3)?;
+                let tool_names_str: String = row.get(4)?;
+                let visible: String = row.get(5)?;
+                Ok((
+                    fp,
+                    thought_raw,
+                    signature,
+                    tool_ids_str,
+                    tool_names_str,
+                    visible,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
 
-    let mut result = Vec::new();
-    for row in rows {
-        if let Ok((fp, thought_raw, signature, tool_ids_str, tool_names_str, visible)) = row {
-            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
-            result.push(PersistedThinkingRecord {
-                fingerprint: fp,
-                thought: unpack_thought(&thought_raw),
-                signature: persist_signature(signature.as_deref()),
-                tool_ids,
-                tool_names,
-                visible,
-            });
+        let mut result = Vec::new();
+        for row in rows {
+            if let Ok((fp, thought_raw, signature, tool_ids_str, tool_names_str, visible)) = row {
+                let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
+                let tool_names: Vec<String> =
+                    serde_json::from_str(&tool_names_str).unwrap_or_default();
+                result.push(PersistedThinkingRecord {
+                    fingerprint: fp,
+                    thought: unpack_thought(&thought_raw),
+                    signature: persist_signature(signature.as_deref()),
+                    tool_ids,
+                    tool_names,
+                    visible,
+                });
+            }
         }
-    }
-    Ok(result)
+        Ok(result)
+    })
 }
 
 /// 根据 tool_id (因果伪哈希 ID 或原生 ID) 精准穿透点查历史思考
@@ -856,161 +909,164 @@ pub fn load_thinking_by_tool_id(
         candidate_ids.push(tool_id);
     }
 
-    let conn = thinking_db()?;
-
-    for candidate in candidate_ids {
-        // 1. Track 1 (Fastest Path): 优先按因果伪哈希 ID 走 idx_thinking_rec_causal 专属局部索引 (0.02ms 纳秒级命中)
-        let mut causal_stmt = conn
-            .prepare_cached(
-                "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
+    with_thinking_db(|conn| {
+        for candidate in candidate_ids {
+            // 1. Track 1 (Fastest Path): 优先按因果伪哈希 ID 走 idx_thinking_rec_causal 专属局部索引 (0.02ms 纳秒级命中)
+            let mut causal_stmt = conn
+                .prepare_cached(
+                    "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
                  FROM thinking_records
                  WHERE session_key = ?1 AND causal_tool_id = ?2
                  ORDER BY id DESC LIMIT 1",
-            )
-            .map_err(|e| e.to_string())?;
+                )
+                .map_err(|e| e.to_string())?;
 
-        let mut causal_rows = causal_stmt
-            .query(params![session_key, candidate])
-            .map_err(|e| e.to_string())?;
+            let mut causal_rows = causal_stmt
+                .query(params![session_key, candidate])
+                .map_err(|e| e.to_string())?;
 
-        if let Some(row) = causal_rows.next().map_err(|e| e.to_string())? {
-            let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let fp: String = row.get(1).map_err(|e| e.to_string())?;
-            let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-            let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-            let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-            let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-            let visible: String = row.get(6).map_err(|e| e.to_string())?;
-            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
-            let healed_sig = persist_signature(raw_signature.as_deref());
+            if let Some(row) = causal_rows.next().map_err(|e| e.to_string())? {
+                let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                let fp: String = row.get(1).map_err(|e| e.to_string())?;
+                let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
+                let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
+                let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
+                let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
+                let visible: String = row.get(6).map_err(|e| e.to_string())?;
+                let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
+                let tool_names: Vec<String> =
+                    serde_json::from_str(&tool_names_str).unwrap_or_default();
+                let healed_sig = persist_signature(raw_signature.as_deref());
 
-            // 反向写回优化：若数据库中存储了损坏/非标准签名，命中后自愈并写回更新 SQLite
-            if let Some(ref h_sig) = healed_sig {
-                if raw_signature.as_ref() != Some(h_sig) {
-                    let _ = conn.execute(
-                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                        params![h_sig, rec_id],
-                    );
+                // 反向写回优化：若数据库中存储了损坏/非标准签名，命中后自愈并写回更新 SQLite
+                if let Some(ref h_sig) = healed_sig {
+                    if raw_signature.as_ref() != Some(h_sig) {
+                        let _ = conn.execute(
+                            "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                            params![h_sig, rec_id],
+                        );
+                    }
                 }
+
+                return Ok(Some(PersistedThinkingRecord {
+                    fingerprint: fp,
+                    thought: unpack_thought(&thought_raw),
+                    signature: healed_sig,
+                    tool_ids,
+                    tool_names,
+                    visible,
+                }));
             }
 
-            return Ok(Some(PersistedThinkingRecord {
-                fingerprint: fp,
-                thought: unpack_thought(&thought_raw),
-                signature: healed_sig,
-                tool_ids,
-                tool_names,
-                visible,
-            }));
-        }
-
-        // 2. Track 2 (Legacy Path): 兼容旧版 primary_tool_id (走 idx_thinking_rec_tool 索引点查)
-        let mut primary_stmt = conn
-            .prepare_cached(
-                "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
+            // 2. Track 2 (Legacy Path): 兼容旧版 primary_tool_id (走 idx_thinking_rec_tool 索引点查)
+            let mut primary_stmt = conn
+                .prepare_cached(
+                    "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
                  FROM thinking_records
                  WHERE session_key = ?1 AND primary_tool_id = ?2
                  ORDER BY id DESC LIMIT 1",
-            )
-            .map_err(|e| e.to_string())?;
+                )
+                .map_err(|e| e.to_string())?;
 
-        let mut primary_rows = primary_stmt
-            .query(params![session_key, candidate])
-            .map_err(|e| e.to_string())?;
+            let mut primary_rows = primary_stmt
+                .query(params![session_key, candidate])
+                .map_err(|e| e.to_string())?;
 
-        if let Some(row) = primary_rows.next().map_err(|e| e.to_string())? {
-            let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let fp: String = row.get(1).map_err(|e| e.to_string())?;
-            let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-            let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-            let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-            let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-            let visible: String = row.get(6).map_err(|e| e.to_string())?;
-            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
-            let healed_sig = persist_signature(raw_signature.as_deref());
+            if let Some(row) = primary_rows.next().map_err(|e| e.to_string())? {
+                let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                let fp: String = row.get(1).map_err(|e| e.to_string())?;
+                let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
+                let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
+                let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
+                let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
+                let visible: String = row.get(6).map_err(|e| e.to_string())?;
+                let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
+                let tool_names: Vec<String> =
+                    serde_json::from_str(&tool_names_str).unwrap_or_default();
+                let healed_sig = persist_signature(raw_signature.as_deref());
 
-            // 3. Track 3 (In-Place Self-Healing): 若当前请求使用的是因果伪哈希 ID，顺手静默修复老数据
-            if is_synthetic_tool_id(candidate) {
-                let _ = conn.execute(
+                // 3. Track 3 (In-Place Self-Healing): 若当前请求使用的是因果伪哈希 ID，顺手静默修复老数据
+                if is_synthetic_tool_id(candidate) {
+                    let _ = conn.execute(
                     "UPDATE thinking_records SET causal_tool_id = ?1 WHERE id = ?2 AND causal_tool_id IS NULL",
                     params![candidate, rec_id],
                 );
-            }
-            if let Some(ref h_sig) = healed_sig {
-                if raw_signature.as_ref() != Some(h_sig) {
-                    let _ = conn.execute(
-                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                        params![h_sig, rec_id],
-                    );
                 }
+                if let Some(ref h_sig) = healed_sig {
+                    if raw_signature.as_ref() != Some(h_sig) {
+                        let _ = conn.execute(
+                            "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                            params![h_sig, rec_id],
+                        );
+                    }
+                }
+
+                return Ok(Some(PersistedThinkingRecord {
+                    fingerprint: fp,
+                    thought: unpack_thought(&thought_raw),
+                    signature: healed_sig,
+                    tool_ids,
+                    tool_names,
+                    visible,
+                }));
             }
 
-            return Ok(Some(PersistedThinkingRecord {
-                fingerprint: fp,
-                thought: unpack_thought(&thought_raw),
-                signature: healed_sig,
-                tool_ids,
-                tool_names,
-                visible,
-            }));
-        }
-
-        // 4. Track 4 (Fallback Path): 极端情况兼容最古老旧记录 (tool_ids 列表内模糊包含)
-        let pattern = format!("%\"{}\"%", candidate);
-        let mut fallback_stmt = conn
-            .prepare_cached(
-                "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
+            // 4. Track 4 (Fallback Path): 极端情况兼容最古老旧记录 (tool_ids 列表内模糊包含)
+            let pattern = format!("%\"{}\"%", candidate);
+            let mut fallback_stmt = conn
+                .prepare_cached(
+                    "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
                  FROM thinking_records
                  WHERE session_key = ?1 AND tool_ids LIKE ?2
                  ORDER BY id DESC LIMIT 1",
-            )
-            .map_err(|e| e.to_string())?;
+                )
+                .map_err(|e| e.to_string())?;
 
-        let mut fallback_rows = fallback_stmt
-            .query(params![session_key, pattern])
-            .map_err(|e| e.to_string())?;
+            let mut fallback_rows = fallback_stmt
+                .query(params![session_key, pattern])
+                .map_err(|e| e.to_string())?;
 
-        if let Some(row) = fallback_rows.next().map_err(|e| e.to_string())? {
-            let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let fp: String = row.get(1).map_err(|e| e.to_string())?;
-            let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-            let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-            let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-            let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-            let visible: String = row.get(6).map_err(|e| e.to_string())?;
-            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
-            let healed_sig = persist_signature(raw_signature.as_deref());
+            if let Some(row) = fallback_rows.next().map_err(|e| e.to_string())? {
+                let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
+                let fp: String = row.get(1).map_err(|e| e.to_string())?;
+                let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
+                let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
+                let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
+                let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
+                let visible: String = row.get(6).map_err(|e| e.to_string())?;
+                let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
+                let tool_names: Vec<String> =
+                    serde_json::from_str(&tool_names_str).unwrap_or_default();
+                let healed_sig = persist_signature(raw_signature.as_deref());
 
-            if is_synthetic_tool_id(candidate) {
-                let _ = conn.execute(
+                if is_synthetic_tool_id(candidate) {
+                    let _ = conn.execute(
                     "UPDATE thinking_records SET causal_tool_id = ?1 WHERE id = ?2 AND causal_tool_id IS NULL",
                     params![candidate, rec_id],
                 );
-            }
-            if let Some(ref h_sig) = healed_sig {
-                if raw_signature.as_ref() != Some(h_sig) {
-                    let _ = conn.execute(
-                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                        params![h_sig, rec_id],
-                    );
                 }
+                if let Some(ref h_sig) = healed_sig {
+                    if raw_signature.as_ref() != Some(h_sig) {
+                        let _ = conn.execute(
+                            "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                            params![h_sig, rec_id],
+                        );
+                    }
+                }
+
+                return Ok(Some(PersistedThinkingRecord {
+                    fingerprint: fp,
+                    thought: unpack_thought(&thought_raw),
+                    signature: healed_sig,
+                    tool_ids,
+                    tool_names,
+                    visible,
+                }));
             }
-
-            return Ok(Some(PersistedThinkingRecord {
-                fingerprint: fp,
-                thought: unpack_thought(&thought_raw),
-                signature: healed_sig,
-                tool_ids,
-                tool_names,
-                visible,
-            }));
         }
-    }
 
-    Ok(None)
+        Ok(None)
+    })
 }
 
 /// 根据 signature 精准穿透点查历史思考（利用 idx_thinking_rec_sig 索引）
@@ -1021,52 +1077,53 @@ pub fn load_thinking_by_signature(
     if session_key.is_empty() || signature.is_empty() {
         return Ok(None);
     }
-    let conn = thinking_db()?;
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
+    with_thinking_db(|conn| {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
              FROM thinking_records
              WHERE session_key = ?1 AND signature = ?2
              ORDER BY id DESC LIMIT 1",
-        )
-        .map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
 
-    let mut rows = stmt
-        .query(params![session_key, signature])
-        .map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query(params![session_key, signature])
+            .map_err(|e| e.to_string())?;
 
-    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-        let fp: String = row.get(1).map_err(|e| e.to_string())?;
-        let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-        let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-        let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-        let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-        let visible: String = row.get(6).map_err(|e| e.to_string())?;
-        let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-        let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
-        let healed_sig = persist_signature(raw_signature.as_deref());
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
+            let fp: String = row.get(1).map_err(|e| e.to_string())?;
+            let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
+            let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
+            let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
+            let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
+            let visible: String = row.get(6).map_err(|e| e.to_string())?;
+            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
+            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
+            let healed_sig = persist_signature(raw_signature.as_deref());
 
-        if let Some(ref h_sig) = healed_sig {
-            if raw_signature.as_ref() != Some(h_sig) {
-                let _ = conn.execute(
-                    "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                    params![h_sig, rec_id],
-                );
+            if let Some(ref h_sig) = healed_sig {
+                if raw_signature.as_ref() != Some(h_sig) {
+                    let _ = conn.execute(
+                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                        params![h_sig, rec_id],
+                    );
+                }
             }
-        }
 
-        Ok(Some(PersistedThinkingRecord {
-            fingerprint: fp,
-            thought: unpack_thought(&thought_raw),
-            signature: healed_sig,
-            tool_ids,
-            tool_names,
-            visible,
-        }))
-    } else {
-        Ok(None)
-    }
+            Ok(Some(PersistedThinkingRecord {
+                fingerprint: fp,
+                thought: unpack_thought(&thought_raw),
+                signature: healed_sig,
+                tool_ids,
+                tool_names,
+                visible,
+            }))
+        } else {
+            Ok(None)
+        }
+    })
 }
 
 /// 根据 fingerprint 精准穿透点查纯文本历史思考（利用 idx_thinking_rec_fp 索引）
@@ -1077,68 +1134,70 @@ pub fn load_thinking_by_fingerprint(
     if session_key.is_empty() || fingerprint.is_empty() {
         return Ok(None);
     }
-    let conn = thinking_db()?;
-    let mut stmt = conn
-        .prepare_cached(
-            "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
+    with_thinking_db(|conn| {
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
              FROM thinking_records
              WHERE session_key = ?1 AND fingerprint = ?2
              ORDER BY id DESC LIMIT 1",
-        )
-        .map_err(|e| e.to_string())?;
+            )
+            .map_err(|e| e.to_string())?;
 
-    let mut rows = stmt
-        .query(params![session_key, fingerprint])
-        .map_err(|e| e.to_string())?;
+        let mut rows = stmt
+            .query(params![session_key, fingerprint])
+            .map_err(|e| e.to_string())?;
 
-    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-        let fp: String = row.get(1).map_err(|e| e.to_string())?;
-        let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-        let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-        let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-        let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-        let visible: String = row.get(6).map_err(|e| e.to_string())?;
-        let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-        let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
-        let healed_sig = persist_signature(raw_signature.as_deref());
+        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
+            let fp: String = row.get(1).map_err(|e| e.to_string())?;
+            let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
+            let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
+            let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
+            let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
+            let visible: String = row.get(6).map_err(|e| e.to_string())?;
+            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
+            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
+            let healed_sig = persist_signature(raw_signature.as_deref());
 
-        if let Some(ref h_sig) = healed_sig {
-            if raw_signature.as_ref() != Some(h_sig) {
-                let _ = conn.execute(
-                    "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                    params![h_sig, rec_id],
-                );
+            if let Some(ref h_sig) = healed_sig {
+                if raw_signature.as_ref() != Some(h_sig) {
+                    let _ = conn.execute(
+                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                        params![h_sig, rec_id],
+                    );
+                }
             }
-        }
 
-        Ok(Some(PersistedThinkingRecord {
-            fingerprint: fp,
-            thought: unpack_thought(&thought_raw),
-            signature: healed_sig,
-            tool_ids,
-            tool_names,
-            visible,
-        }))
-    } else {
-        Ok(None)
-    }
+            Ok(Some(PersistedThinkingRecord {
+                fingerprint: fp,
+                thought: unpack_thought(&thought_raw),
+                signature: healed_sig,
+                tool_ids,
+                tool_names,
+                visible,
+            }))
+        } else {
+            Ok(None)
+        }
+    })
 }
 
 pub fn touch_thinking_session(session_key: &str) -> Result<usize, String> {
     if session_key.is_empty() {
         return Ok(0);
     }
-    let conn = thinking_db()?;
-    let now = chrono::Utc::now().timestamp_millis();
-    // Touch a 1-row session table. Never UPDATE thinking_records here — that
-    // rewrites every thought/visible TEXT blob for the session.
-    conn.execute(
-        "INSERT INTO thinking_sessions (session_key, last_accessed) VALUES (?1, ?2)
+    with_thinking_db(|conn| {
+        let now = chrono::Utc::now().timestamp_millis();
+        // Touch a 1-row session table. Never UPDATE thinking_records here — that
+        // rewrites every thought/visible TEXT blob for the session.
+        conn.execute(
+            "INSERT INTO thinking_sessions (session_key, last_accessed) VALUES (?1, ?2)
          ON CONFLICT(session_key) DO UPDATE SET last_accessed = excluded.last_accessed",
-        params![session_key, now],
-    )
-    .map_err(|e| e.to_string())
+            params![session_key, now],
+        )
+        .map_err(|e| e.to_string())
+    })
 }
 
 pub fn delete_thinking_records_except_fingerprints(
@@ -1148,28 +1207,30 @@ pub fn delete_thinking_records_except_fingerprints(
     if session_key.is_empty() || keep_fps.is_empty() {
         return Ok(0);
     }
-    let conn = thinking_db()?;
-    let fps_json = serde_json::to_string(keep_fps).unwrap_or_else(|_| "[]".to_string());
-    conn.execute(
-        "DELETE FROM thinking_records
+    with_thinking_db(|conn| {
+        let fps_json = serde_json::to_string(keep_fps).unwrap_or_else(|_| "[]".to_string());
+        conn.execute(
+            "DELETE FROM thinking_records
          WHERE session_key = ?1
          AND fingerprint NOT IN (SELECT value FROM json_each(?2))",
-        params![session_key, fps_json],
-    )
-    .map_err(|e| e.to_string())
+            params![session_key, fps_json],
+        )
+        .map_err(|e| e.to_string())
+    })
 }
 
 pub fn delete_thinking_records_for_session(session_key: &str) -> Result<usize, String> {
-    let conn = thinking_db()?;
-    let _ = conn.execute(
-        "DELETE FROM thinking_sessions WHERE session_key = ?1",
-        params![session_key],
-    );
-    conn.execute(
-        "DELETE FROM thinking_records WHERE session_key = ?1",
-        params![session_key],
-    )
-    .map_err(|e| e.to_string())
+    with_thinking_db(|conn| {
+        let _ = conn.execute(
+            "DELETE FROM thinking_sessions WHERE session_key = ?1",
+            params![session_key],
+        );
+        conn.execute(
+            "DELETE FROM thinking_records WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(|e| e.to_string())
+    })
 }
 
 /// 精准净化思考记录表中的非法异构签名（保留思考文本与其它健康签名）
@@ -1183,47 +1244,48 @@ pub fn purge_foreign_signatures_for_session_with_model(
         return Ok(0);
     }
 
-    let conn = thinking_db()?;
-    let mut stmt = conn
+    with_thinking_db(|conn| {
+        let mut stmt = conn
         .prepare_cached("SELECT id, signature FROM thinking_records WHERE session_key = ?1 AND signature IS NOT NULL")
         .map_err(|e| e.to_string())?;
 
-    let rows = stmt
-        .query_map(params![session_key], |row| {
-            let id: i64 = row.get(0)?;
-            let sig: String = row.get(1)?;
-            Ok((id, sig))
-        })
-        .map_err(|e| e.to_string())?;
-
-    let mut ids_to_null = Vec::new();
-    for row in rows.flatten() {
-        let (id, sig) = row;
-        let is_foreign = if is_gemini {
-            !crate::proxy::thinking_store::is_likely_gemini_signature(&sig)
-        } else if is_claude {
-            !crate::proxy::thinking_store::is_claude_signature(&sig)
-        } else {
-            false
-        };
-        if is_foreign {
-            ids_to_null.push(id);
-        }
-    }
-
-    let mut total_updated = 0;
-    if !ids_to_null.is_empty() {
-        let mut update_stmt = conn
-            .prepare_cached("UPDATE thinking_records SET signature = NULL WHERE id = ?1")
+        let rows = stmt
+            .query_map(params![session_key], |row| {
+                let id: i64 = row.get(0)?;
+                let sig: String = row.get(1)?;
+                Ok((id, sig))
+            })
             .map_err(|e| e.to_string())?;
-        for id in ids_to_null {
-            if let Ok(n) = update_stmt.execute(params![id]) {
-                total_updated += n;
+
+        let mut ids_to_null = Vec::new();
+        for row in rows.flatten() {
+            let (id, sig) = row;
+            let is_foreign = if is_gemini {
+                !crate::proxy::thinking_store::is_likely_gemini_signature(&sig)
+            } else if is_claude {
+                !crate::proxy::thinking_store::is_claude_signature(&sig)
+            } else {
+                false
+            };
+            if is_foreign {
+                ids_to_null.push(id);
             }
         }
-    }
 
-    Ok(total_updated)
+        let mut total_updated = 0;
+        if !ids_to_null.is_empty() {
+            let mut update_stmt = conn
+                .prepare_cached("UPDATE thinking_records SET signature = NULL WHERE id = ?1")
+                .map_err(|e| e.to_string())?;
+            for id in ids_to_null {
+                if let Ok(n) = update_stmt.execute(params![id]) {
+                    total_updated += n;
+                }
+            }
+        }
+
+        Ok(total_updated)
+    })
 }
 
 /// 兼容旧接口：默认按 Gemini 清洗
@@ -1235,63 +1297,392 @@ pub fn purge_foreign_signatures_for_session(session_key: &str) -> Result<usize, 
 pub fn clear_all_thinking_data() -> Result<usize, String> {
     let mut total_deleted = 0;
     // 1. 清空 thinking_store.db 中的记录与会话
-    let conn = thinking_db()?;
-    let deleted = conn
-        .execute("DELETE FROM thinking_records", [])
-        .map_err(|e| e.to_string())?;
-    total_deleted += deleted;
-    let _ = conn.execute("DELETE FROM thinking_sessions", []);
-    let _ = conn.execute("VACUUM", []);
+    with_thinking_db(|conn| {
+        let deleted = conn
+            .execute("DELETE FROM thinking_records", [])
+            .map_err(|e| e.to_string())?;
+        total_deleted += deleted;
+        let _ = conn.execute("DELETE FROM thinking_sessions", []);
+        let _ = conn.execute("VACUUM", []);
 
-    // 2. 清空 proxy_logs.db 中残留的历史工具签名表与陈旧思考表 (绝不触碰 request_logs)
-    if let Ok(log_conn) = connect_db() {
-        let _ = log_conn.execute("DELETE FROM tool_signatures", []);
-        let _ = log_conn.execute("DELETE FROM thinking_records", []);
-        let _ = log_conn.execute("DELETE FROM thinking_sessions", []);
-    }
+        // 2. 清空 proxy_logs.db 中残留的历史工具签名表与陈旧思考表 (绝不触碰 request_logs)
+        if let Ok(log_conn) = connect_db() {
+            let _ = log_conn.execute("DELETE FROM tool_signatures", []);
+            let _ = log_conn.execute("DELETE FROM thinking_records", []);
+            let _ = log_conn.execute("DELETE FROM thinking_sessions", []);
+        }
 
-    Ok(total_deleted)
+        Ok(total_deleted)
+    })
 }
 
 pub fn get_thinking_records_count() -> Result<usize, String> {
-    let conn = thinking_db()?;
-    let count: usize = conn
-        .query_row("SELECT COUNT(*) FROM thinking_records", [], |row| {
+    with_thinking_db(|conn| {
+        conn.query_row("SELECT COUNT(*) FROM thinking_records", [], |row| {
             row.get(0)
         })
-        .unwrap_or(0);
-    Ok(count)
+        .map_err(|error| error.to_string())
+    })
 }
 
-pub fn cleanup_old_thinking_records(days: i64) -> Result<usize, String> {
-    let cutoff = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
-    let deleted_tools = connect_db()
-        .ok()
-        .and_then(|conn| {
-            conn.execute(
-                "DELETE FROM tool_signatures WHERE created_at < ?1",
-                params![cutoff],
-            )
-            .ok()
-        })
-        .unwrap_or(0);
-    let conn = thinking_db()?;
-    let deleted_records = conn
-        .execute(
-            "DELETE FROM thinking_records WHERE session_key IN (
-                SELECT session_key FROM thinking_sessions WHERE last_accessed < ?1
-             ) OR (
-                session_key NOT IN (SELECT session_key FROM thinking_sessions)
-                AND COALESCE(last_accessed, created_at) < ?1
-             )",
-            params![cutoff],
+/// 一轮维护的已提交工作量；deferred 表示锁竞争、SQLite 忙或执行预算要求后续重试。
+#[derive(Debug, Default)]
+pub struct ThinkingCleanupStats {
+    pub deleted_records: usize,
+    pub deleted_sessions: usize,
+    pub deleted_tools: usize,
+    pub scanned: usize,
+    pub batches: usize,
+    pub deferred: bool,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct CleanupLimits {
+    rows: usize,
+    window: usize,
+    batches: usize,
+    batch_budget: Duration,
+    round_budget: Duration,
+    vm_steps: i32,
+    #[cfg(test)]
+    interrupt_after_checks: Option<usize>,
+    #[cfg(test)]
+    checkpoint_clock: Option<fn(usize, Instant) -> Instant>,
+}
+
+impl Default for CleanupLimits {
+    fn default() -> Self {
+        Self {
+            rows: 128,
+            window: 512,
+            batches: 16,
+            batch_budget: Duration::from_millis(100),
+            round_budget: Duration::from_secs(2),
+            vm_steps: 1000,
+            #[cfg(test)]
+            interrupt_after_checks: None,
+            #[cfg(test)]
+            checkpoint_clock: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ThinkingBatch {
+    Sessions,
+    Orphans,
+}
+
+const EXPIRED_SESSIONS_SQL: &str = "SELECT session_key FROM thinking_sessions INDEXED BY idx_thinking_sessions_accessed WHERE last_accessed < ?1 ORDER BY last_accessed, session_key LIMIT ?2";
+const SESSION_RECORDS_SQL: &str = "SELECT id FROM thinking_records INDEXED BY idx_thinking_rec_seq WHERE session_key = ?1 ORDER BY id LIMIT ?2";
+const ORPHAN_WINDOW_SQL: &str = "SELECT id, session_key, COALESCE(last_accessed, created_at) FROM thinking_records WHERE id > ?1 ORDER BY id LIMIT ?2";
+
+/// 批次预算覆盖 Rust 循环和 SQLite VM，不能中断磁盘系统调用或 busy 等待。
+struct CleanupProgress<'a> {
+    conn: &'a Connection,
+    deadline: Instant,
+    #[cfg(test)]
+    checkpoints: std::cell::Cell<usize>,
+    #[cfg(test)]
+    limits: CleanupLimits,
+}
+
+impl<'a> CleanupProgress<'a> {
+    fn install(conn: &'a Connection, limits: CleanupLimits, deadline: Instant) -> Self {
+        #[cfg(test)]
+        let mut checks = 0;
+        conn.progress_handler(
+            limits.vm_steps,
+            Some(move || {
+                #[cfg(test)]
+                {
+                    checks += 1;
+                    if limits
+                        .interrupt_after_checks
+                        .is_some_and(|limit| checks >= limit)
+                    {
+                        return true;
+                    }
+                }
+                Instant::now() >= deadline || THINKING_PENDING.load(Ordering::SeqCst) > 0
+            }),
+        );
+        Self {
+            conn,
+            deadline,
+            #[cfg(test)]
+            checkpoints: std::cell::Cell::new(0),
+            #[cfg(test)]
+            limits,
+        }
+    }
+
+    /// 短 statement 之间显式检查同一预算，不依赖 SQLite 的 VM 指令计数跨语句累计。
+    fn checkpoint(&self) -> rusqlite::Result<()> {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = {
+            let checks = self.checkpoints.get() + 1;
+            self.checkpoints.set(checks);
+            self.limits
+                .checkpoint_clock
+                .map_or(now, |clock| clock(checks, self.deadline))
+        };
+        if now >= self.deadline || THINKING_PENDING.load(Ordering::SeqCst) > 0 {
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT),
+                Some("maintenance budget exhausted or request pending".into()),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for CleanupProgress<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+fn cleanup_transaction<T>(
+    conn: &Connection,
+    limits: CleanupLimits,
+    operation: impl FnOnce(&Connection, &CleanupProgress<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let deadline = Instant::now() + limits.batch_budget;
+    let tx = conn.unchecked_transaction()?;
+    // 声明顺序保证 panic 时先清除回调，再由 transaction 回滚。
+    let progress = CleanupProgress::install(&tx, limits, deadline);
+    let result = progress
+        .checkpoint()
+        .and_then(|()| operation(&tx, &progress))
+        .and_then(|value| {
+            progress.checkpoint()?;
+            tx.execute_batch("COMMIT")?;
+            Ok(value)
+        });
+    drop(progress);
+    // Interrupted 可能已自动回滚；finish 会检查 autocommit，且不再受过期回调影响。
+    tx.finish()?;
+    result
+}
+
+fn cleanup_is_deferred(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(
+            rusqlite::ErrorCode::DatabaseBusy
+                | rusqlite::ErrorCode::DatabaseLocked
+                | rusqlite::ErrorCode::OperationInterrupted
         )
-        .unwrap_or(0);
-    let _ = conn.execute(
-        "DELETE FROM thinking_sessions WHERE last_accessed < ?1",
-        params![cutoff],
-    );
-    Ok(deleted_tools + deleted_records)
+    )
+}
+
+fn cleanup_thinking_batch(
+    conn: &Connection,
+    cutoff: i64,
+    kind: ThinkingBatch,
+    limits: CleanupLimits,
+) -> rusqlite::Result<ThinkingCleanupStats> {
+    cleanup_transaction(conn, limits, |conn, budget| {
+        let mut stats = ThinkingCleanupStats::default();
+        match kind {
+            ThinkingBatch::Sessions => {
+                let sessions = conn
+                    .prepare_cached(EXPIRED_SESSIONS_SQL)?
+                    .query_map(params![cutoff, limits.rows], |row| row.get::<_, String>(0))?
+                    .map(|row| {
+                        budget.checkpoint()?;
+                        row
+                    })
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                stats.scanned = sessions.len();
+                for session in sessions {
+                    budget.checkpoint()?;
+                    let ids = conn
+                        .prepare_cached(SESSION_RECORDS_SQL)?
+                        .query_map(
+                            params![session, limits.rows - stats.deleted_records],
+                            |row| row.get::<_, i64>(0),
+                        )?
+                        .map(|row| {
+                            budget.checkpoint()?;
+                            row
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for id in ids {
+                        budget.checkpoint()?;
+                        stats.deleted_records +=
+                            conn.execute("DELETE FROM thinking_records WHERE id = ?1", [id])?;
+                    }
+                    budget.checkpoint()?;
+                    stats.deleted_sessions += conn.execute(
+                        "DELETE FROM thinking_sessions WHERE session_key = ?1 AND last_accessed < ?2 AND NOT EXISTS (SELECT 1 FROM thinking_records WHERE session_key = ?1)",
+                        params![session, cutoff],
+                    )?;
+                    if stats.deleted_records == limits.rows {
+                        break;
+                    }
+                }
+            }
+            ThinkingBatch::Orphans => {
+                let cursor = conn.query_row(
+                    "SELECT CAST(v AS INTEGER) FROM thinking_meta WHERE k = 'cleanup_orphan_cursor'", [], |row| row.get::<_, i64>(0),
+                ).optional()?.unwrap_or(0);
+                // 先限定主键窗口，再查询所属 session；健康前缀也只能读取 window 条元数据。
+                let rows = conn
+                    .prepare_cached(ORPHAN_WINDOW_SQL)?
+                    .query_map(params![cursor, limits.window], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .map(|row| {
+                        budget.checkpoint()?;
+                        row
+                    })
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                stats.scanned = rows.len();
+                let mut next = 0;
+                let mut processed = 0;
+                for (id, session, accessed) in &rows {
+                    budget.checkpoint()?;
+                    next = *id;
+                    processed += 1;
+                    if *accessed < cutoff {
+                        stats.deleted_records += conn.execute(
+                            "DELETE FROM thinking_records WHERE id = ?1 AND COALESCE(last_accessed, created_at) < ?2 AND NOT EXISTS (SELECT 1 FROM thinking_sessions WHERE session_key = ?3)",
+                            params![id, cutoff, session],
+                        )?;
+                    }
+                    if stats.deleted_records == limits.rows {
+                        break;
+                    }
+                }
+                // 未处理的窗口尾部留给下一批，只有完整走到尾部才回绕。
+                if processed == rows.len() && rows.len() < limits.window {
+                    next = 0;
+                }
+                budget.checkpoint()?;
+                conn.execute(
+                    "INSERT INTO thinking_meta (k, v) VALUES ('cleanup_orphan_cursor', ?1) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                    [next.to_string()],
+                )?;
+            }
+        }
+        Ok(stats)
+    })
+}
+
+fn try_cleanup_thinking_batch(
+    cutoff: i64,
+    kind: ThinkingBatch,
+    limits: CleanupLimits,
+) -> Result<ThinkingCleanupStats, String> {
+    let slot = THINKING_DB.get_or_init(|| Mutex::new(None));
+    let mut guard = match slot.try_lock() {
+        Ok(guard) => guard,
+        Err(TryLockError::WouldBlock) => {
+            return Ok(ThinkingCleanupStats {
+                deferred: true,
+                ..Default::default()
+            })
+        }
+        Err(error) => return Err(format!("thinking db lock: {error}")),
+    };
+    if THINKING_PENDING.load(Ordering::SeqCst) > 0 {
+        return Ok(ThinkingCleanupStats {
+            deferred: true,
+            ..Default::default()
+        });
+    }
+    let db_path = get_thinking_db_path()?;
+    if guard.as_ref().map(|(path, _)| path) != Some(&db_path) {
+        // 首次 schema 初始化不受维护批次的短 deadline 限制。
+        *guard = Some((db_path.clone(), open_thinking_db_at(&db_path)?));
+    }
+    let conn = &guard.as_ref().expect("thinking db connection").1;
+    match cleanup_thinking_batch(conn, cutoff, kind, limits) {
+        Ok(stats) => Ok(stats),
+        Err(error) if cleanup_is_deferred(&error) => Ok(ThinkingCleanupStats {
+            deferred: true,
+            ..Default::default()
+        }),
+        Err(error) => Err(format!("thinking cleanup: {error}")),
+    }
+}
+
+fn cleanup_tools_batch(
+    conn: &Connection,
+    cutoff: i64,
+    limits: CleanupLimits,
+) -> rusqlite::Result<usize> {
+    cleanup_transaction(conn, limits, |conn, _budget| {
+        conn.execute(
+        "DELETE FROM tool_signatures WHERE tool_id IN (SELECT tool_id FROM tool_signatures INDEXED BY idx_tool_sig_created WHERE created_at < ?1 ORDER BY created_at LIMIT ?2)",
+        params![cutoff, limits.rows],
+    )
+    })
+}
+
+/// 串行轮转 session、orphan 和旧签名批次，释放共享锁后才开始下一批。
+pub fn cleanup_thinking_storage(days: i64) -> Result<ThinkingCleanupStats, String> {
+    let cutoff = chrono::Utc::now().timestamp_millis() - (days * 24 * 3600 * 1000);
+    cleanup_thinking_storage_with_limits(cutoff, CleanupLimits::default())
+}
+
+fn cleanup_thinking_storage_with_limits(
+    cutoff: i64,
+    limits: CleanupLimits,
+) -> Result<ThinkingCleanupStats, String> {
+    let started = Instant::now();
+    let mut total = ThinkingCleanupStats::default();
+    let mut tools = None;
+    let start = CLEANUP_NEXT_BATCH.load(Ordering::Relaxed);
+    for batch in 0..limits.batches {
+        if started.elapsed() >= limits.round_budget || THINKING_PENDING.load(Ordering::SeqCst) > 0 {
+            total.deferred = true;
+            break;
+        }
+        let kind = (start + batch) % 3;
+        CLEANUP_NEXT_BATCH.store((kind + 1) % 3, Ordering::Relaxed);
+        let stats = match kind {
+            0 => try_cleanup_thinking_batch(cutoff, ThinkingBatch::Sessions, limits)?,
+            1 => try_cleanup_thinking_batch(cutoff, ThinkingBatch::Orphans, limits)?,
+            _ => {
+                let conn = match tools.as_ref() {
+                    Some(conn) => conn,
+                    None => tools.insert(connect_db()?),
+                };
+                match cleanup_tools_batch(conn, cutoff, limits) {
+                    Ok(deleted_tools) => ThinkingCleanupStats {
+                        deleted_tools,
+                        ..Default::default()
+                    },
+                    Err(error) if cleanup_is_deferred(&error) => ThinkingCleanupStats {
+                        deferred: true,
+                        ..Default::default()
+                    },
+                    Err(error) => return Err(format!("tool signature cleanup: {error}")),
+                }
+            }
+        };
+        total.batches += 1;
+        total.deleted_records += stats.deleted_records;
+        total.deleted_sessions += stats.deleted_sessions;
+        total.deleted_tools += stats.deleted_tools;
+        total.scanned += stats.scanned;
+        if stats.deferred {
+            total.deferred = true;
+            break;
+        }
+    }
+    total.elapsed = started.elapsed();
+    Ok(total)
 }
 
 pub fn apply_retention(policy: &LogRetentionConfig) -> Result<(usize, usize), String> {
@@ -2460,4 +2851,722 @@ pub fn get_token_usage_by_ip(limit: usize, hours: i64) -> Result<Vec<IpTokenStat
     }
 
     Ok(stats)
+}
+
+#[cfg(test)]
+mod thinking_maintenance_tests {
+    use super::*;
+    use crate::proxy::monitor::prompt_log_tests::TestDataDir;
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::time::Duration;
+
+    #[test]
+    fn thinking_facade_waiters_do_not_starve_http_health() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let address = runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().route("/health", axum::routing::get(|| async { "ok" })),
+                )
+                .await
+                .unwrap();
+            });
+            address
+        });
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let owner = std::thread::spawn(move || {
+            let _guard = hold_thinking_db_for_test();
+            locked_tx.send(()).unwrap();
+            // 独立线程负责兜底解锁，旧阻塞路径也不会挂死测试。
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+        locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let entered = Arc::new(Barrier::new(3));
+        let requests: Vec<_> = (0..2)
+            .map(|_| {
+                let entered = entered.clone();
+                runtime.spawn(async move {
+                    entered.wait();
+                    get_thinking_records_count()
+                })
+            })
+            .collect();
+        entered.wait();
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        client
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        let health = client.read_to_string(&mut response);
+        release_tx.send(()).unwrap();
+        owner.join().unwrap();
+        runtime.block_on(async {
+            for request in requests {
+                request.await.unwrap().unwrap();
+            }
+        });
+        assert!(
+            health.is_ok(),
+            "HTTP health stalled behind thinking DB waiters: {health:?}"
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+    pub(super) static BEFORE_LOCK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+    pub(super) static BEFORE_TOUCH: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
+    pub(super) fn run_hook(slot: &Mutex<Option<Box<dyn FnOnce() + Send>>>) {
+        let hook = slot.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn record(conn: &Connection, session: &str, created: i64, accessed: Option<i64>) -> i64 {
+        conn.execute("INSERT INTO thinking_records (session_key, fingerprint, thought, tool_ids, tool_names, visible, created_at, last_accessed) VALUES (?1, 'fp', X'5241573178', '[]', '[]', '', ?2, ?3)", params![session, created, accessed]).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn session(conn: &Connection, key: &str, accessed: i64) {
+        conn.execute(
+            "INSERT INTO thinking_sessions VALUES (?1, ?2)",
+            params![key, accessed],
+        )
+        .unwrap();
+    }
+
+    fn exists(conn: &Connection, id: i64) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thinking_records WHERE id = ?1)",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn local_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_thinking_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn thinking_facade_supports_all_runtime_contexts_and_propagates_errors() {
+        let _dir = TestDataDir::new();
+        let check = || {
+            assert_eq!(
+                with_thinking_db(|conn| conn
+                    .query_row("SELECT 7", [], |row| row.get::<_, i64>(0))
+                    .map_err(|e| e.to_string()))
+                .unwrap(),
+                7
+            );
+            assert!(with_thinking_db(|conn| conn
+                .execute("SELECT missing_column", [])
+                .map_err(|e| e.to_string()))
+            .unwrap_err()
+            .contains("missing_column"));
+        };
+        check();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                check();
+            });
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            check();
+            tokio::task::spawn_blocking(check).await.unwrap();
+        });
+        assert_eq!(THINKING_PENDING.load(Ordering::SeqCst), 0);
+        with_thinking_db(|conn| {
+            conn.execute("DROP TABLE thinking_records", [])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert!(get_thinking_records_count()
+            .unwrap_err()
+            .contains("thinking_records"));
+    }
+
+    #[test]
+    fn thinking_cleanup_ttl_matrix_and_empty_sessions() {
+        let conn = local_db();
+        session(&conn, "active", 101);
+        session(&conn, "expired", 99);
+        session(&conn, "equal", 100);
+        session(&conn, "empty", 99);
+        let active = record(&conn, "active", 1, None);
+        let expired_old = record(&conn, "expired", 1, None);
+        let expired_new = record(&conn, "expired", 101, None);
+        let equal_session = record(&conn, "equal", 1, None);
+        let orphan_old = record(&conn, "old", 99, None);
+        let orphan_new = record(&conn, "new", 101, None);
+        let orphan_equal = record(&conn, "equal-orphan", 100, None);
+        let accessed_new = record(&conn, "accessed-new", 1, Some(101));
+        let accessed_old = record(&conn, "accessed-old", 101, Some(99));
+        let accessed_equal = record(&conn, "accessed-equal", 1, Some(100));
+        let sessions = cleanup_thinking_batch(
+            &conn,
+            100,
+            ThinkingBatch::Sessions,
+            CleanupLimits::default(),
+        )
+        .unwrap();
+        let orphans =
+            cleanup_thinking_batch(&conn, 100, ThinkingBatch::Orphans, CleanupLimits::default())
+                .unwrap();
+        assert_eq!(
+            (
+                sessions.deleted_records,
+                sessions.deleted_sessions,
+                orphans.deleted_records
+            ),
+            (2, 2, 2)
+        );
+        for id in [
+            active,
+            equal_session,
+            orphan_new,
+            orphan_equal,
+            accessed_new,
+            accessed_equal,
+        ] {
+            assert!(exists(&conn, id), "lost {id}");
+        }
+        for id in [expired_old, expired_new, orphan_old, accessed_old] {
+            assert!(!exists(&conn, id), "retained {id}");
+        }
+    }
+
+    #[test]
+    fn thinking_cleanup_large_session_and_empty_session_caps() {
+        let conn = local_db();
+        session(&conn, "large", 1);
+        for _ in 0..257 {
+            record(&conn, "large", 1, None);
+        }
+        let limits = CleanupLimits::default();
+        let first = cleanup_thinking_batch(&conn, 100, ThinkingBatch::Sessions, limits).unwrap();
+        assert_eq!((first.deleted_records, first.deleted_sessions), (128, 0));
+        let second = cleanup_thinking_batch(&conn, 100, ThinkingBatch::Sessions, limits).unwrap();
+        assert_eq!((second.deleted_records, second.deleted_sessions), (128, 0));
+        let third = cleanup_thinking_batch(&conn, 100, ThinkingBatch::Sessions, limits).unwrap();
+        assert_eq!((third.deleted_records, third.deleted_sessions), (1, 1));
+        for i in 0..257 {
+            session(&conn, &format!("empty-{i}"), 1);
+        }
+        assert_eq!(
+            cleanup_thinking_batch(&conn, 100, ThinkingBatch::Sessions, limits)
+                .unwrap()
+                .deleted_sessions,
+            128
+        );
+    }
+
+    #[test]
+    fn thinking_cleanup_cursor_reaches_orphans_and_does_not_skip_window_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.db");
+        {
+            let conn = open_thinking_db_at(&path).unwrap();
+            session(&conn, "healthy", 101);
+            for _ in 0..1100 {
+                record(&conn, "healthy", 1, None);
+            }
+            for _ in 0..300 {
+                record(&conn, "orphan", 1, None);
+            }
+        }
+        let limits = CleanupLimits::default();
+        let mut deleted = 0;
+        let mut cursors = Vec::new();
+        // 每批重新打开数据库，证明游标不依赖进程内状态。
+        for _ in 0..6 {
+            let conn = open_thinking_db_at(&path).unwrap();
+            let stats = cleanup_thinking_batch(&conn, 100, ThinkingBatch::Orphans, limits).unwrap();
+            assert!(stats.scanned <= 512 && stats.deleted_records <= 128);
+            deleted += stats.deleted_records;
+            cursors.push(conn.query_row("SELECT CAST(v AS INTEGER) FROM thinking_meta WHERE k = 'cleanup_orphan_cursor'", [], |row| row.get::<_, i64>(0)).unwrap());
+        }
+        assert_eq!(deleted, 300);
+        assert_eq!(&cursors[..4], &[512, 1024, 1228, 1356]);
+        assert_eq!(cursors[4], 0);
+    }
+
+    #[test]
+    fn thinking_cleanup_interrupt_rolls_back_cursor_and_clears_handler() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        with_thinking_db(|conn| {
+            record(conn, "orphan", 1, None);
+            conn.execute(
+                "INSERT INTO thinking_meta VALUES ('cleanup_orphan_cursor', '0')",
+                [],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        // 直接使用共享连接执行维护；前台计数不能包含维护本身。
+        let conn = thinking_db().unwrap();
+        let limits = CleanupLimits {
+            vm_steps: 1,
+            interrupt_after_checks: Some(150),
+            ..Default::default()
+        };
+        let error = cleanup_transaction(&conn, limits, |conn, _budget| {
+            conn.execute("DELETE FROM thinking_records", [])?;
+            conn.execute("UPDATE thinking_meta SET v = '99' WHERE k = 'cleanup_orphan_cursor'", [])?;
+            conn.query_row("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n", [], |row| row.get::<_, i64>(0))
+        }).unwrap_err();
+        assert!(cleanup_is_deferred(&error), "{error}");
+        assert_eq!(
+            conn.query_row(
+                "SELECT v FROM thinking_meta WHERE k = 'cleanup_orphan_cursor'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "0"
+        );
+        drop(conn);
+        assert_eq!(get_thinking_records_count().unwrap(), 1);
+        let deferred = try_cleanup_thinking_batch(
+            100,
+            ThinkingBatch::Orphans,
+            CleanupLimits {
+                vm_steps: 1,
+                interrupt_after_checks: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(deferred.deferred);
+        assert_eq!(get_thinking_records_count().unwrap(), 1);
+        with_thinking_db(|conn| {
+            conn.execute("DROP TABLE thinking_meta", [])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert!(
+            try_cleanup_thinking_batch(100, ThinkingBatch::Orphans, CleanupLimits::default())
+                .unwrap_err()
+                .contains("thinking_meta")
+        );
+    }
+
+    #[test]
+    fn thinking_cleanup_busy_writer_defers_without_poisoning_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.db");
+        let conn = open_thinking_db_at(&path).unwrap();
+        session(&conn, "expired", 1);
+        record(&conn, "expired", 1, None);
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        let error = cleanup_thinking_batch(
+            &conn,
+            100,
+            ThinkingBatch::Sessions,
+            CleanupLimits::default(),
+        )
+        .unwrap_err();
+        assert!(cleanup_is_deferred(&error));
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            cleanup_thinking_batch(
+                &conn,
+                100,
+                ThinkingBatch::Sessions,
+                CleanupLimits::default()
+            )
+            .unwrap()
+            .deleted_records,
+            1
+        );
+    }
+
+    #[test]
+    fn thinking_cleanup_lock_busy_and_pending_requests_defer() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        let held = hold_thinking_db_for_test();
+        let (tx, rx) = mpsc::channel();
+        let task = std::thread::spawn(move || {
+            tx.send(try_cleanup_thinking_batch(
+                100,
+                ThinkingBatch::Sessions,
+                CleanupLimits::default(),
+            ))
+            .unwrap()
+        });
+        let result = rx.recv_timeout(Duration::from_millis(500));
+        drop(held);
+        task.join().unwrap();
+        assert!(result.unwrap().unwrap().deferred);
+
+        let (queued_tx, queued_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *BEFORE_LOCK.lock().unwrap() = Some(Box::new(move || {
+            queued_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        }));
+        let request = std::thread::spawn(get_thinking_records_count);
+        queued_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(THINKING_PENDING.load(Ordering::SeqCst), 1);
+        let deferred =
+            try_cleanup_thinking_batch(100, ThinkingBatch::Sessions, CleanupLimits::default())
+                .unwrap()
+                .deferred;
+        release_tx.send(()).unwrap();
+        assert_eq!(request.join().unwrap().unwrap(), 0);
+        assert!(deferred);
+        assert!(
+            !try_cleanup_thinking_batch(100, ThinkingBatch::Sessions, CleanupLimits::default())
+                .unwrap()
+                .deferred
+        );
+    }
+
+    #[test]
+    fn thinking_cleanup_cannot_interleave_save_and_session_touch() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        for existing in [false, true] {
+            if existing {
+                with_thinking_db(|conn| {
+                    session(conn, "save-existing", 1);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let key = if existing {
+                "save-existing"
+            } else {
+                "save-new"
+            };
+            let (written_tx, written_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            *BEFORE_TOUCH.lock().unwrap() = Some(Box::new(move || {
+                written_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            }));
+            let request = std::thread::spawn(move || {
+                save_thinking_record(key, "fp", "reasoning", None, &[], &[], "visible")
+            });
+            written_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let deferred =
+                try_cleanup_thinking_batch(100, ThinkingBatch::Sessions, CleanupLimits::default())
+                    .unwrap()
+                    .deferred;
+            release_tx.send(()).unwrap();
+            request.join().unwrap().unwrap();
+            assert!(deferred);
+            assert_eq!(load_thinking_records(key).unwrap().len(), 1);
+            with_thinking_db(|conn| {
+                assert!(
+                    conn.query_row(
+                        "SELECT last_accessed FROM thinking_sessions WHERE session_key = ?1",
+                        [key],
+                        |row| row.get::<_, i64>(0)
+                    )
+                    .unwrap()
+                        > 100
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn thinking_cleanup_queries_use_bounded_index_windows() {
+        let conn = local_db();
+        for (sql, expected) in [
+            (EXPIRED_SESSIONS_SQL, "idx_thinking_sessions_accessed"),
+            (SESSION_RECORDS_SQL, "idx_thinking_rec_seq"),
+            (ORPHAN_WINDOW_SQL, "INTEGER PRIMARY KEY"),
+        ] {
+            let details = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(params![100, 128], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("; ");
+            assert!(
+                details.contains("SEARCH") && details.contains(expected),
+                "{details}"
+            );
+            assert!(!details.contains("SCAN "), "{details}");
+        }
+        conn.execute("DROP INDEX idx_thinking_sessions_accessed", [])
+            .unwrap();
+        conn.execute(
+            "CREATE TABLE idx_thinking_sessions_accessed (invalid INTEGER)",
+            [],
+        )
+        .unwrap();
+        assert!(init_thinking_schema(&conn).is_err());
+    }
+
+    #[test]
+    fn thinking_cleanup_round_bounds_tools_and_gives_orphans_progress() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        with_thinking_db(|conn| {
+            session(conn, "large", 1);
+            for _ in 0..400 {
+                record(conn, "large", 1, None);
+            }
+            record(conn, "orphan", 1, None);
+            Ok(())
+        })
+        .unwrap();
+        let conn = connect_db().unwrap();
+        for i in 0..300 {
+            conn.execute(
+                "INSERT INTO tool_signatures VALUES (?1, 'sig', 1)",
+                [format!("tool-{i}")],
+            )
+            .unwrap();
+        }
+        let limits = CleanupLimits {
+            batches: 3,
+            ..Default::default()
+        };
+        let stats = cleanup_thinking_storage_with_limits(100, limits).unwrap();
+        assert_eq!(
+            (stats.batches, stats.deleted_records, stats.deleted_tools),
+            (3, 129, 128)
+        );
+        assert!(!stats.deferred);
+        assert_eq!(get_thinking_records_count().unwrap(), 272);
+        let zero = cleanup_thinking_storage_with_limits(
+            100,
+            CleanupLimits {
+                round_budget: Duration::ZERO,
+                ..limits
+            },
+        )
+        .unwrap();
+        assert_eq!(zero.batches, 0);
+        assert!(zero.deferred);
+        conn.execute("DROP TABLE tool_signatures", []).unwrap();
+        assert!(cleanup_thinking_storage_with_limits(100, limits)
+            .unwrap_err()
+            .contains("tool_signatures"));
+    }
+    #[test]
+    fn thinking_review_short_statements_observe_pending_before_commit() {
+        let conn = local_db();
+        let mut pending = None;
+        let result = cleanup_transaction(
+            &conn,
+            CleanupLimits {
+                vm_steps: i32::MAX,
+                ..Default::default()
+            },
+            |conn, _budget| {
+                for i in 0..20 {
+                    conn.execute(
+                        "INSERT INTO thinking_meta VALUES (?1, 'value')",
+                        [i.to_string()],
+                    )?;
+                    if i == 8 {
+                        pending = Some(ThinkingRequest::enter());
+                    }
+                }
+                Ok(())
+            },
+        );
+        drop(pending);
+        assert!(
+            result.is_err(),
+            "short statements bypassed the pending gate"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM thinking_meta", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn thinking_review_repeated_session_interrupts_do_not_starve_orphans() {
+        let _dir = TestDataDir::new();
+        init_db().unwrap();
+        let orphan = with_thinking_db(|conn| {
+            session(conn, "large", 1);
+            record(conn, "large", 1, None);
+            let orphan = record(conn, "orphan", 1, None);
+            conn.execute_batch("CREATE TRIGGER expensive_session_delete BEFORE DELETE ON thinking_records WHEN OLD.session_key = 'large' BEGIN SELECT (WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n); END;").unwrap();
+            Ok(orphan)
+        }).unwrap();
+        let limits = CleanupLimits {
+            batches: 3,
+            interrupt_after_checks: Some(1),
+            ..Default::default()
+        };
+        let mut deleted = 0;
+        for _ in 0..3 {
+            let stats = cleanup_thinking_storage_with_limits(100, limits).unwrap();
+            assert!(stats.deferred);
+            deleted += stats.deleted_records;
+        }
+        assert_eq!(
+            deleted, 1,
+            "every round restarted the interrupted session category"
+        );
+        with_thinking_db(|conn| {
+            assert!(!exists(conn, orphan));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(get_thinking_records_count().unwrap(), 1);
+    }
+    static SHORT_SQL_CHECKPOINTS: AtomicUsize = AtomicUsize::new(0);
+
+    fn expire_during_short_sql_loop(checks: usize, deadline: Instant) -> Instant {
+        SHORT_SQL_CHECKPOINTS.store(checks, Ordering::SeqCst);
+        if checks >= 45 {
+            deadline
+        } else {
+            deadline - Duration::from_secs(1)
+        }
+    }
+
+    fn enqueue_during_short_sql_loop(checks: usize, deadline: Instant) -> Instant {
+        SHORT_SQL_CHECKPOINTS.store(checks, Ordering::SeqCst);
+        if checks >= 45 {
+            THINKING_PENDING.store(1, Ordering::SeqCst);
+        }
+        deadline - Duration::from_secs(1)
+    }
+
+    #[test]
+    fn thinking_review_short_statement_loops_observe_budget_and_pending() {
+        for kind in [ThinkingBatch::Sessions, ThinkingBatch::Orphans] {
+            for clock in [
+                expire_during_short_sql_loop as fn(usize, Instant) -> Instant,
+                enqueue_during_short_sql_loop,
+            ] {
+                let conn = local_db();
+                if matches!(kind, ThinkingBatch::Sessions) {
+                    session(&conn, "expired", 1);
+                }
+                for _ in 0..30 {
+                    record(&conn, "expired", 1, None);
+                }
+                conn.execute(
+                    "INSERT INTO thinking_meta VALUES ('cleanup_orphan_cursor', '0')",
+                    [],
+                )
+                .unwrap();
+                let changes_before = conn.total_changes();
+                SHORT_SQL_CHECKPOINTS.store(0, Ordering::SeqCst);
+                let result = cleanup_thinking_batch(
+                    &conn,
+                    100,
+                    kind,
+                    CleanupLimits {
+                        vm_steps: i32::MAX,
+                        checkpoint_clock: Some(clock),
+                        ..Default::default()
+                    },
+                );
+                THINKING_PENDING.store(0, Ordering::SeqCst);
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::OperationInterrupted)
+                );
+                assert_eq!(SHORT_SQL_CHECKPOINTS.load(Ordering::SeqCst), 45);
+                assert!(
+                    conn.total_changes() > changes_before,
+                    "interrupt must follow actual row mutations"
+                );
+                assert_eq!(
+                    conn.query_row("SELECT count(*) FROM thinking_records", [], |row| row
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    30
+                );
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT v FROM thinking_meta WHERE k = 'cleanup_orphan_cursor'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                    "0"
+                );
+                // 卸载中断回调后，同一连接上的正常请求不受影响。
+                conn.execute("INSERT INTO thinking_meta VALUES ('normal', 'ok')", [])
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_review_commit_observes_shared_deadline() {
+        let conn = local_db();
+        let result = cleanup_transaction(
+            &conn,
+            CleanupLimits {
+                vm_steps: i32::MAX,
+                checkpoint_clock: Some(|checks, deadline| {
+                    if checks == 2 {
+                        deadline
+                    } else {
+                        deadline - Duration::from_secs(1)
+                    }
+                }),
+                ..Default::default()
+            },
+            |conn, _budget| {
+                for i in 0..20 {
+                    conn.execute(
+                        "INSERT INTO thinking_meta VALUES (?1, 'value')",
+                        [i.to_string()],
+                    )?;
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result.unwrap_err().sqlite_error_code(),
+            Some(rusqlite::ErrorCode::OperationInterrupted)
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM thinking_meta", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 }
