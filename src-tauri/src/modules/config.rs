@@ -6,6 +6,14 @@ use crate::models::AppConfig;
 
 const CONFIG_FILE: &str = "gui_config.json";
 
+/// 读取配置快照并在内存中迁移，不创建目录或写回配置。
+pub fn load_app_config_read_only() -> Result<AppConfig, String> {
+    let config_path = super::account::resolve_data_dir_read_only()?.join(CONFIG_FILE);
+    let content = fs::read_to_string(config_path)
+        .map_err(|e| format!("failed_to_read_config_file: {}", e))?;
+    parse_and_migrate_config(&content).map(|(config, _)| config)
+}
+
 /// Load application configuration
 pub fn load_app_config() -> Result<AppConfig, String> {
     let data_dir = get_data_dir()?;
@@ -234,5 +242,95 @@ mod tests {
         let (valid_cfg, _) =
             parse_and_migrate_config(&default_json).expect("valid config should parse");
         assert!(!valid_cfg.proxy.api_key.is_empty());
+    }
+
+    #[test]
+    fn readonly_config_preserves_legacy_bytes_and_metadata() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let dir = super::super::account::resolve_data_dir_read_only().unwrap();
+        let path = dir.join(CONFIG_FILE);
+        let mut legacy = serde_json::to_value(AppConfig::new()).unwrap();
+        legacy["proxy"]["custom_mapping"] = serde_json::json!({});
+        legacy["proxy"]["thinking_budget"]["flash_high"] = serde_json::json!(16384);
+        legacy["proxy"]["thinking_budget"]["flash_high_legacy_migrated"] = serde_json::json!(false);
+        let bytes = format!("{} \n", serde_json::to_string_pretty(&legacy).unwrap()).into_bytes();
+        fs::write(&path, &bytes).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let dir_modified = fs::metadata(&dir).unwrap().modified().unwrap();
+        let config = load_app_config_read_only().unwrap();
+        assert_eq!(config.proxy.thinking_budget.flash_high, -1);
+        assert!(config.proxy.thinking_budget.flash_high_legacy_migrated);
+        assert_eq!(
+            config
+                .proxy
+                .custom_mapping
+                .get("gemini-3.x-flash")
+                .map(String::as_str),
+            Some("3.x-flash-tiered")
+        );
+        assert!(
+            fs::read(&path).unwrap() == bytes,
+            "readonly load changed legacy config bytes"
+        );
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_eq!(before.created().ok(), after.created().ok());
+        assert_eq!(
+            before.permissions().readonly(),
+            after.permissions().readonly()
+        );
+        assert_eq!(
+            dir_modified,
+            fs::metadata(&dir).unwrap().modified().unwrap()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                (
+                    before.ino(),
+                    before.mode(),
+                    before.ctime(),
+                    before.ctime_nsec()
+                ),
+                (after.ino(), after.mode(), after.ctime(), after.ctime_nsec())
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_config_does_not_create_missing_file_or_directory() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let dir = super::super::account::resolve_data_dir_read_only().unwrap();
+        let before = fs::metadata(&dir).unwrap().modified().unwrap();
+        assert!(
+            load_app_config_read_only().is_err(),
+            "missing config must return an error"
+        );
+        assert!(!dir.join(CONFIG_FILE).exists());
+        assert_eq!(before, fs::metadata(&dir).unwrap().modified().unwrap());
+        let missing = dir.join("absent").join("nested");
+        unsafe {
+            std::env::set_var("ABV_DATA_DIR", &missing);
+        }
+        assert!(load_app_config_read_only().is_err());
+        assert!(!missing.exists());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn readonly_config_returns_read_and_parse_errors_without_rewriting() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let path = super::super::account::resolve_data_dir_read_only()
+            .unwrap()
+            .join(CONFIG_FILE);
+        for bytes in [b"{ invalid_json".as_slice(), &[0xff]] {
+            fs::write(&path, bytes).unwrap();
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            assert!(load_app_config_read_only().is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(modified, fs::metadata(&path).unwrap().modified().unwrap());
+        }
     }
 }

@@ -305,6 +305,108 @@ pub struct ProxyMonitor {
     pub capture_health_logs: Arc<AtomicBool>,
 }
 
+/// 两类维护独立计时；截止点从完成时刻计算，错过的周期不补跑。
+struct MaintenanceSchedule {
+    thinking: std::time::Instant,
+    logs: std::time::Instant,
+}
+
+impl MaintenanceSchedule {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            thinking: now,
+            logs: now,
+        }
+    }
+
+    fn next(&self) -> std::time::Instant {
+        self.thinking.min(self.logs)
+    }
+
+    fn due(&self, now: std::time::Instant) -> (bool, bool) {
+        let logs_due = now >= self.logs;
+        (now >= self.thinking || logs_due, logs_due)
+    }
+
+    fn completed(&mut self, now: std::time::Instant, thinking_retry: Option<bool>, logs_ran: bool) {
+        if let Some(retry) = thinking_retry {
+            self.thinking = now + std::time::Duration::from_secs(if retry { 60 } else { 3600 });
+        }
+        if logs_ran {
+            self.logs = now + std::time::Duration::from_secs(3600);
+        }
+    }
+}
+
+/// 两种日志保留策略来自同一只读快照；读取失败时沿用各自默认值。
+fn load_maintenance_retention() -> (crate::proxy::config::LogRetentionConfig, u64) {
+    crate::modules::config::load_app_config_read_only()
+        .map(|config| {
+            (
+                config.proxy.log_retention,
+                config.proxy.internal_error_log_retention.budget_bytes(),
+            )
+        })
+        // 0 由内部错误日志的 setter 解释为默认预算。
+        .unwrap_or_else(|_| (Default::default(), 0))
+}
+
+#[cfg(test)]
+mod maintenance_schedule_tests {
+    use super::MaintenanceSchedule;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn monitor_retention_policies_share_one_readonly_snapshot() {
+        let _dir = super::prompt_log_tests::TestDataDir::new();
+        let path = crate::modules::account::resolve_data_dir_read_only()
+            .unwrap()
+            .join("gui_config.json");
+        let mut config = crate::models::AppConfig::new();
+        config.proxy.log_retention.max_rows = 4321;
+        config.proxy.internal_error_log_retention.max_storage_mb = 1234;
+        let expected_budget = config.proxy.internal_error_log_retention.budget_bytes();
+        let bytes = serde_json::to_vec(&config).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let snapshot = super::load_maintenance_retention();
+        assert!(std::fs::read(&path).unwrap() == bytes);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(snapshot.0.max_rows, 4321);
+        assert_eq!(snapshot.1, expected_budget);
+
+        let fallback = super::load_maintenance_retention();
+        assert_eq!(
+            fallback.0.max_rows,
+            crate::proxy::config::LogRetentionConfig::default().max_rows
+        );
+        assert_eq!(fallback.1, 0);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn monitor_thinking_retries_do_not_accelerate_hourly_log_retention() {
+        let now = Instant::now();
+        let mut schedule = MaintenanceSchedule::new(now);
+        assert_eq!(schedule.due(now), (true, true));
+        let completed = now + Duration::from_secs(3);
+        schedule.completed(completed, Some(true), true);
+        assert_eq!(schedule.next(), completed + Duration::from_secs(60));
+        let retry = schedule.next();
+        assert_eq!(schedule.due(retry), (true, false));
+        // 未完成、延期和错误均保持 60 秒；日志截止点保持不变。
+        schedule.completed(retry, Some(true), false);
+        assert_eq!(schedule.next(), retry + Duration::from_secs(60));
+        let finished = schedule.next();
+        schedule.completed(finished, Some(false), false);
+        let logs = completed + Duration::from_secs(3600);
+        assert_eq!(schedule.next(), logs);
+        assert_eq!(schedule.due(logs), (true, true));
+        schedule.completed(logs, Some(false), true);
+        assert_eq!(schedule.next(), logs + Duration::from_secs(3600));
+    }
+}
+
 impl ProxyMonitor {
     pub fn new(max_logs: usize) -> Self {
         // Initialize DB
@@ -312,96 +414,89 @@ impl ProxyMonitor {
             tracing::error!("Failed to initialize proxy DB: {}", e);
         }
 
-        let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
-        let retention = crate::modules::config::load_app_config()
-            .map(|config| config.proxy.log_retention)
-            .unwrap_or_default();
-        tokio::task::spawn_blocking(move || {
-            match crate::modules::proxy_db::apply_retention(&retention) {
-                Ok((cleared, deleted)) => {
-                    if cleared > 0 || deleted > 0 {
-                        tracing::info!(
-                            "Proxy log retention: cleared {} bodies, deleted {} rows",
-                            cleared,
-                            deleted
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to cleanup old logs: {}", e);
-                }
-            }
-            match crate::modules::proxy_db::cleanup_old_thinking_records(thinking_days) {
-                Ok(deleted) => {
-                    if deleted > 0 {
-                        tracing::info!(
-                            "Auto cleanup: removed {} old thinking/signature records (>{} days)",
-                            deleted,
-                            thinking_days
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to cleanup thinking records: {}", e);
-                }
-            }
-            crate::modules::logger::sync_internal_error_log_budget_from_config();
-            if let Err(e) = crate::modules::logger::apply_internal_error_log_retention() {
-                tracing::error!("Failed to apply internal error log retention: {}", e);
-            }
-        });
-
         tokio::spawn(async {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            interval.tick().await;
+            let mut schedule = MaintenanceSchedule::new(std::time::Instant::now());
+            let mut thinking_state = crate::modules::proxy_db::ThinkingMaintenance::default();
             loop {
-                interval.tick().await;
-                let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
-                let retention = crate::modules::config::load_app_config()
-                    .map(|config| config.proxy.log_retention)
-                    .unwrap_or_default();
+                tokio::time::sleep_until(schedule.next().into()).await;
+                let (thinking_due, logs_due) = schedule.due(std::time::Instant::now());
+                let mut state = std::mem::take(&mut thinking_state);
                 let result = tokio::task::spawn_blocking(move || {
-                    let retention_res = crate::modules::proxy_db::apply_retention(&retention);
-                    let thinking_res =
-                        crate::modules::proxy_db::cleanup_old_thinking_records(thinking_days);
-                    crate::modules::logger::sync_internal_error_log_budget_from_config();
-                    let error_log_res =
-                        crate::modules::logger::apply_internal_error_log_retention();
-                    (retention_res, thinking_res, error_log_res)
+                    let retention = logs_due.then(load_maintenance_retention);
+                    let retention_res = retention
+                        .as_ref()
+                        .map(|(proxy, _)| crate::modules::proxy_db::apply_retention(proxy));
+                    let thinking_res = thinking_due.then(|| {
+                        if logs_due {
+                            state.reopen_completed_categories();
+                        }
+                        let days = crate::proxy::config::get_thinking_retention_days() as i64;
+                        crate::modules::proxy_db::cleanup_thinking_storage(days, &mut state)
+                    });
+                    let error_log_res = retention.as_ref().map(|(_, error_budget)| {
+                        crate::modules::logger::set_internal_error_log_budget_bytes(*error_budget);
+                        crate::modules::logger::apply_internal_error_log_retention()
+                    });
+                    (state, retention_res, thinking_res, error_log_res)
                 })
                 .await;
+                let mut thinking_retry = true;
                 match result {
-                    Ok((retention_res, thinking_res, error_log_res)) => {
-                        match retention_res {
-                            Ok((cleared, deleted)) => {
-                                if cleared > 0 || deleted > 0 {
+                    Ok((state, retention_res, thinking_res, error_log_res)) => {
+                        thinking_state = state;
+                        if let Some(result) = retention_res {
+                            match result {
+                                Ok((cleared, deleted)) => {
+                                    if cleared > 0 || deleted > 0 {
+                                        tracing::info!("Proxy log retention: cleared {} bodies, deleted {} rows", cleared, deleted);
+                                    }
+                                }
+                                Err(error) => tracing::error!(
+                                    "Failed to apply proxy log retention: {}",
+                                    error
+                                ),
+                            }
+                        }
+                        if let Some(result) = thinking_res {
+                            match result {
+                                Ok(stats) => {
+                                    thinking_retry = stats.deferred || stats.unfinished;
                                     tracing::info!(
-                                        "Proxy log retention: cleared {} bodies, deleted {} rows",
-                                        cleared,
-                                        deleted
+                                        deleted_records = stats.deleted_records,
+                                        deleted_sessions = stats.deleted_sessions,
+                                        deleted_tools = stats.deleted_tools,
+                                        scanned = stats.scanned,
+                                        batches = stats.batches,
+                                        committed_batches = stats.committed_batches,
+                                        deferred = stats.deferred,
+                                        defer_reason = ?stats.defer_reason,
+                                        unfinished = stats.unfinished,
+                                        orphan_cursor = ?stats.orphan_cursor,
+                                        orphan_sweep_complete = stats.orphan_sweep_complete,
+                                        units = ?stats.units,
+                                        elapsed_ms = stats.elapsed.as_millis(),
+                                        "Thinking storage maintenance completed"
                                     );
                                 }
-                            }
-                            Err(error) => {
-                                tracing::error!("Failed to apply proxy log retention: {}", error)
+                                Err(error) => {
+                                    tracing::error!("Failed to cleanup thinking records: {}", error)
+                                }
                             }
                         }
-                        if let Ok(deleted) = thinking_res {
-                            if deleted > 0 {
-                                tracing::info!(
-                                    "Auto cleanup: removed {} old thinking/signature records",
-                                    deleted
-                                );
-                            }
-                        } else if let Err(e) = thinking_res {
-                            tracing::error!("Failed to cleanup thinking records: {}", e);
-                        }
-                        if let Err(e) = error_log_res {
-                            tracing::error!("Failed to apply internal error log retention: {}", e);
+                        if let Some(Err(error)) = error_log_res {
+                            tracing::error!(
+                                "Failed to apply internal error log retention: {}",
+                                error
+                            );
                         }
                     }
-                    Err(error) => tracing::error!("Proxy log retention task failed: {}", error),
+                    Err(error) => tracing::error!("Proxy maintenance task failed: {}", error),
                 }
+                schedule.completed(
+                    std::time::Instant::now(),
+                    thinking_due.then_some(thinking_retry),
+                    logs_due,
+                );
             }
         });
 

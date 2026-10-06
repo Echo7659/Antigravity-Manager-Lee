@@ -597,6 +597,75 @@ mod tests {
             .to_rfc3339();
         assert!(protected_quota_refresh_due(&account, now));
     }
+
+    #[test]
+    fn quota_refresh_selection_preserves_protected_and_manual_boundaries() {
+        let now = chrono::Utc::now().timestamp();
+        let mut account = Account::new(
+            "protected".to_string(),
+            "protected@example.test".to_string(),
+            TokenData::new(
+                "access".to_string(),
+                "refresh".to_string(),
+                3600,
+                None,
+                None,
+                None,
+                true,
+                None,
+            ),
+        );
+        account
+            .protected_models
+            .insert("gemini-3-flash".to_string());
+
+        assert!(should_refresh_quota(&account, true, now));
+        account.disabled = true;
+        assert!(!should_refresh_quota(&account, true, now));
+        assert!(should_refresh_quota(&account, false, now));
+
+        account.disabled = false;
+        account.quota = Some(serde_json::from_value(serde_json::json!({
+            "last_updated": now,
+            "models": [],
+            "quota_groups": [{"display_name":"Gemini Models","buckets":[{
+                "bucket_id":"gemini-weekly","window":"weekly","remaining_fraction":0.10,
+                "reset_time":chrono::DateTime::from_timestamp(now + 3600, 0).unwrap().to_rfc3339()
+            }]}]
+        })).unwrap());
+        assert!(!should_refresh_quota(&account, true, now));
+
+        account
+            .quota
+            .as_mut()
+            .unwrap()
+            .quota_groups
+            .as_mut()
+            .unwrap()[0]
+            .buckets[0]
+            .reset_time = chrono::DateTime::from_timestamp(now - 1, 0)
+            .unwrap()
+            .to_rfc3339();
+        assert!(should_refresh_quota(&account, true, now));
+        account.disabled = true;
+        assert!(!should_refresh_quota(&account, true, now));
+        assert!(should_refresh_quota(&account, false, now));
+        account.disabled = false;
+        account.proxy_disabled = true;
+        assert!(should_refresh_quota(&account, true, now));
+        account.proxy_disabled = false;
+
+        account.protected_models.clear();
+        assert!(!should_refresh_quota(&account, true, now));
+        assert!(should_refresh_quota(&account, false, now));
+
+        account
+            .protected_models
+            .insert("gemini-3-flash".to_string());
+        account.quota.as_mut().unwrap().is_forbidden = true;
+        assert!(!should_refresh_quota(&account, true, now));
+        assert!(!should_refresh_quota(&account, false, now));
+    }
 }
 
 /// Global account write lock to prevent corruption during concurrent operations
@@ -2141,6 +2210,23 @@ fn protected_quota_refresh_due(account: &Account, now: i64) -> bool {
     })
 }
 
+fn should_refresh_quota(account: &Account, protected_only: bool, now: i64) -> bool {
+    if protected_only && account.disabled {
+        return false;
+    }
+    if protected_only && !protected_quota_refresh_due(account, now) {
+        return false;
+    }
+    if account
+        .quota
+        .as_ref()
+        .is_some_and(|quota| quota.is_forbidden)
+    {
+        return false;
+    }
+    true
+}
+
 async fn refresh_quotas_logic(protected_only: bool) -> Result<RefreshStats, String> {
     use futures::future::join_all;
     use std::sync::Arc;
@@ -2173,25 +2259,7 @@ async fn refresh_quotas_logic(protected_only: bool) -> Result<RefreshStats, Stri
 
     let tasks: Vec<_> = accounts
         .into_iter()
-        .filter(|account| {
-            if protected_only && !protected_quota_refresh_due(account, now) {
-                return false;
-            }
-            // [MOD] Now we allow refreshing disabled and proxy_disabled accounts
-            // to support forced re-sync from UI.
-            // Only strictly skip forbidden accounts if necessary, but even those
-            // might want a retry to see if they are unbanned.
-            if let Some(ref q) = account.quota {
-                if q.is_forbidden {
-                    crate::modules::logger::log_info(&format!(
-                        "  - Skipping {} (Forbidden)",
-                        account.email
-                    ));
-                    return false;
-                }
-            }
-            true
-        })
+        .filter(|account| should_refresh_quota(account, protected_only, now))
         .map(|mut account| {
             let email = account.email.clone();
             let account_id = account.id.clone();

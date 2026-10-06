@@ -1,3 +1,17 @@
+## v4.9.1-lee.1-beta.2
+
+2026-10-06. Stability fixes for ThinkingStore maintenance and automatic quota refresh, using only the beta channel without updating main or latest.
+
+- Move synchronous ThinkingStore database waits behind one Tokio MultiThread blocking boundary so database lock contention cannot starve independent HTTP health requests. Preserve synchronous behavior outside that runtime and on CurrentThread.
+- Select expired sessions through a time index and delete bounded record batches. Scan orphan candidates through primary-key windows before applying retention rules; persist the scan cursor in the same transaction as deletion. Preserve active sessions, user retention settings and signature semantics.
+- Start session/tool deletion units at 128 records and orphan metadata windows at 16. Halve only the category interrupted by its budget, across rounds down to one; cap each round at 256 attempts. SQLite callbacks and loop checkpoints share a nominal 100ms budget within a nominal 2s round. A minimum unit may finish and commit after budget expiry, while pending requests and SQL errors still roll back. Preserve atomic cursor commits, category fairness and completed-category progress so cold I/O cannot repeatedly roll back the same fixed window.
+- Retry unfinished, deferred or failed thinking maintenance after 60 seconds; start a new sweep hourly after completion. Proxy log retention and internal error logs retain startup and hourly execution in the same serial loop. Report committed batches/scans, deletions, deferral reasons, cursor progress and unfinished work. Budgets are not hard I/O or SQLite busy deadlines; production throughput and backlog drain time remain unverified, and the watchdog stays enabled.
+- Load one read-only configuration snapshot per log-maintenance round for both proxy and internal error log retention. Apply compatibility migrations only in memory, without creating directories, initializing or rewriting configuration, preventing background maintenance from overwriting concurrent configuration updates. Missing, unreadable or invalid configuration retains the per-round default policies; CI executes the read-only regressions.
+- Exclude disabled accounts from automatic protected quota refresh while preserving manual full refresh and existing forbidden, reset-time and proxy-disabled behavior. Run the account regressions in CI.
+- Regression coverage includes real database contention with responsive HTTP, TTL boundaries, large-session batches, cursor continuation, interruption rollback, short-statement budgets and maintenance fairness, alongside ThinkingStore, monitor, runtime, account, Rust fmt/clippy and Web build checks.
+- First startup creates an index on thinking_sessions. Historical backlogs drain over multiple rounds; deletion reuses pages without immediately shrinking database files. Migration time, real upstream generation and the hourly maintenance window require separate acceptance on the deployed image.
+- This increment is maintained by @Echo7659 (Thanks to @Echo7659, PR #1). Attribution and linked PRs for previously integrated upstream work remain in the historical entries below.
+
 ## v4.9.1-lee.1-beta.1
 
 2026-10-06. Beta stability update based on Lee release 4.9.1-lee.1. It uses the beta preview channel and does not update `latest`.
