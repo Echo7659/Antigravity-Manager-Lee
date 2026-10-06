@@ -535,7 +535,10 @@ pub fn wrap_request_v2(
                 .or(req_max_tokens);
 
             if is_adaptive {
-                if current_max.map_or(true, |m| m < 131072) {
+                // 官方自适应模型没有固定思考预算，不需要抬高客户端输出上限。
+                if !crate::proxy::model_specs::is_adaptive_thinking_model(final_model_name)
+                    && current_max.map_or(true, |m| m < 131072)
+                {
                     gen_config.insert("maxOutputTokens".to_string(), json!(131072));
                 }
             } else if let Some(budget_i64) = budget_opt {

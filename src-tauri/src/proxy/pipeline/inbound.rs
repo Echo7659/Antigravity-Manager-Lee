@@ -1593,7 +1593,16 @@ impl InboundThinkingPipeline {
         if let Some(official_max_output) = official_model.max_output_tokens {
             if !gc_obj.contains_key("maxOutputTokens")
                 || (is_claude
+                    && official_model.supports_adaptive_thinking != Some(true)
                     && gc_obj.get("maxOutputTokens").and_then(Value::as_i64) == Some(65536))
+            {
+                gc_obj.insert("maxOutputTokens".to_string(), json!(official_max_output));
+            }
+            if official_model.supports_adaptive_thinking == Some(true)
+                && gc_obj
+                    .get("maxOutputTokens")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|limit| limit > official_max_output)
             {
                 gc_obj.insert("maxOutputTokens".to_string(), json!(official_max_output));
             }

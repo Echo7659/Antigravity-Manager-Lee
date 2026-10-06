@@ -5,29 +5,71 @@ use std::collections::HashMap;
 
 /// 标识只接受自适应思考的模型，不修改路由 ID。
 pub fn is_adaptive_thinking_model(model: &str) -> bool {
-    crate::proxy::common::model_mapping::canonicalize_upstream_model_id(model)
-        .starts_with("claude-opus-5-5")
+    crate::models::OfficialModelCatalog::get(model)
+        .is_some_and(|info| info.supports_adaptive_thinking == Some(true))
 }
 
-pub fn resolve_opus_5_5_route(model: &str, client_effort: Option<&str>) -> Option<String> {
+/// Claude 5 及以上版本需要账号提供精确模型能力证据，与思考模式无关。
+pub fn requires_exact_claude_quota(model: &str) -> bool {
     let canonical = crate::proxy::common::model_mapping::canonicalize_upstream_model_id(model);
-    if canonical != "claude-opus-5-5" {
+    canonical.strip_prefix("claude-").is_some_and(|rest| {
+        rest.split('-')
+            .find_map(|part| part.parse::<u32>().ok())
+            .is_some_and(|major| (5..1000).contains(&major))
+    })
+}
+
+/// 仅在目录提供真实档位时解析 Claude 裸别名；具名档位及其他协议保持原路由。
+pub fn resolve_claude_tier_route(model: &str, client_effort: Option<&str>) -> Option<String> {
+    let canonical = crate::proxy::common::model_mapping::canonicalize_upstream_model_id(model);
+    if !canonical.starts_with("claude-") {
         return None;
     }
-    let normalized_effort = client_effort.map(|value| value.trim().to_ascii_lowercase());
-    let tier = match normalized_effort.as_deref() {
-        Some("low") => "low",
-        Some("medium") => "medium",
-        _ => "high",
-    };
-    Some(format!("claude-opus-5-5-{tier}"))
+    let tiers = crate::models::OfficialModelCatalog::collect_tiers_for_base(&canonical);
+    let desired = client_effort.and_then(normalize_client_thinking_level);
+    let tier = if let Some(desired) = desired {
+        tiers
+            .iter()
+            .min_by_key(|tier| (tier_weight(tier) - tier_weight(desired)).abs())
+    } else if canonical == "claude-opus-5-5" && tiers.iter().any(|tier| tier == "high") {
+        // 既有 Opus 裸别名默认 high，不能随上游默认策略改变。
+        tiers.iter().find(|tier| *tier == "high")
+    } else {
+        tiers.iter().min_by_key(|tier| match tier.as_str() {
+            "tiered" => (0, 0),
+            "medium" => (1, 0),
+            _ if tier_weight(tier) > 1 => (2, tier_weight(tier)),
+            "low" => (3, 0),
+            _ => (4, tier_weight(tier)),
+        })
+    }?;
+    Some(format!("{canonical}-{tier}"))
 }
 
-pub fn is_opus_5_5_physical_variant(model: &str) -> bool {
-    matches!(
-        model,
-        "claude-opus-5-5-low" | "claude-opus-5-5-medium" | "claude-opus-5-5-high"
-    )
+fn tier_weight(tier: &str) -> i32 {
+    match tier.to_ascii_lowercase().as_str() {
+        "lite" | "extra-low" | "minimal" => 0,
+        "low" => 1,
+        "high" => 4,
+        "xhigh" | "x-high" | "extreme" => 5,
+        "max" => 6,
+        _ => 3,
+    }
+}
+
+/// 从规范的 Claude 具名档位反查裸别名，目录之外的模型不派生别名。
+pub fn claude_tier_base(model: &str) -> Option<&str> {
+    if !model.starts_with("claude-") {
+        return None;
+    }
+    let (base, suffix) = model
+        .strip_suffix("-extra-low")
+        .map(|base| (base, "extra-low"))
+        .or_else(|| model.rsplit_once('-'))?;
+    crate::models::OfficialModelCatalog::collect_tiers_for_base(base)
+        .iter()
+        .any(|tier| tier == suffix)
+        .then_some(base)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +111,14 @@ pub fn get_max_output_tokens(model_id: &str, token: Option<&ProxyToken>) -> u64 
         // 如果原始 ID 没找到，尝试用归一化后的 ID 找
         if let Some(&limit) = t.model_limits.get(model_id) {
             return limit;
+        }
+    }
+
+    if let Some(info) = crate::models::OfficialModelCatalog::get(&std_id) {
+        if info.supports_adaptive_thinking == Some(true) {
+            if let Some(limit) = info.max_output_tokens.filter(|limit| *limit > 0) {
+                return limit as u64;
+            }
         }
     }
 
@@ -722,6 +772,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claude_5_5_routing_uses_live_catalog_tiers_without_inventing_variants() {
+        let base = "claude-routing-fixture-8-7";
+        let info: crate::models::OfficialModelInfo =
+            serde_json::from_value(serde_json::json!({"supportsAdaptiveThinking":true})).unwrap();
+        crate::models::OfficialModelCatalog::update(HashMap::from([
+            (format!("{base}-extra-low"), info.clone()),
+            (format!("{base}-high"), info),
+        ]));
+        assert_eq!(
+            resolve_claude_tier_route(base, None),
+            Some(format!("{base}-high"))
+        );
+        assert_eq!(
+            resolve_claude_tier_route(base, Some("low")),
+            Some(format!("{base}-extra-low"))
+        );
+        assert_eq!(
+            resolve_claude_tier_route(base, Some("medium")),
+            Some(format!("{base}-high"))
+        );
+        assert_eq!(claude_tier_base(&format!("{base}-extra-low")), Some(base));
+        assert!(is_adaptive_thinking_model(&format!("{base}-high")));
+    }
+
+    #[test]
+    fn claude_5_5_catalog_routes_aliases_without_changing_explicit_tiers() {
+        for (family, default) in [("opus", "high"), ("sonnet", "medium")] {
+            for prefix in ["", "models/anthropic/", "models/models/anthropic/"] {
+                let alias = format!("{prefix}claude-{family}-5.5");
+                assert_eq!(
+                    resolve_claude_tier_route(&alias, None),
+                    Some(format!("claude-{family}-5-5-{default}"))
+                );
+                for (effort, tier) in [
+                    (" LOW ", "low"),
+                    ("medium", "medium"),
+                    ("high", "high"),
+                    ("max", "high"),
+                ] {
+                    assert_eq!(
+                        resolve_claude_tier_route(&alias, Some(effort)),
+                        Some(format!("claude-{family}-5-5-{tier}"))
+                    );
+                }
+            }
+            for tier in ["low", "medium", "high"] {
+                let model = format!("claude-{family}-5-5-{tier}");
+                assert!(resolve_claude_tier_route(&model, Some("low")).is_none());
+                assert!(is_adaptive_thinking_model(&model));
+                assert_eq!(get_max_output_tokens(&model, None), 128_000);
+            }
+        }
+        for unknown in [
+            "claude-sonnet-5",
+            "claude-sonnet-6-1",
+            "gemini-3.8-flash",
+            "future-model-9",
+        ] {
+            assert!(resolve_claude_tier_route(unknown, None).is_none());
+        }
+        assert!(!is_adaptive_thinking_model("claude-sonnet-4-6"));
+    }
+
+    #[test]
     fn opus_5_5_alias_effort_routes_to_physical_tiers() {
         for (effort, expected) in [
             (None, "claude-opus-5-5-high"),
@@ -731,11 +845,11 @@ mod tests {
             (Some("unexpected"), "claude-opus-5-5-high"),
         ] {
             assert_eq!(
-                resolve_opus_5_5_route("claude-opus-5-5", effort).as_deref(),
+                resolve_claude_tier_route("claude-opus-5-5", effort).as_deref(),
                 Some(expected)
             );
         }
-        assert!(resolve_opus_5_5_route("claude-opus-5-5-high", Some("low")).is_none());
+        assert!(resolve_claude_tier_route("claude-opus-5-5-high", Some("low")).is_none());
     }
 
     #[test]
@@ -745,14 +859,12 @@ mod tests {
             "claude-opus-5-5-medium",
             "claude-opus-5-5-high",
         ] {
-            assert!(is_opus_5_5_physical_variant(model));
+            assert_eq!(claude_tier_base(model), Some("claude-opus-5-5"));
         }
-        assert!(!is_opus_5_5_physical_variant("claude-opus-5-5"));
-        assert!(!is_opus_5_5_physical_variant("claude-opus-5-5-preview"));
-        assert!(!is_opus_5_5_physical_variant(
-            "anthropic/claude-opus-5-5-high"
-        ));
-        assert!(!is_opus_5_5_physical_variant("claude-opus-5.5-high"));
+        assert!(claude_tier_base("claude-opus-5-5").is_none());
+        assert!(claude_tier_base("claude-opus-5-5-preview").is_none());
+        assert!(claude_tier_base("anthropic/claude-opus-5-5-high").is_none());
+        assert!(claude_tier_base("claude-opus-5.5-high").is_none());
     }
 
     #[test]

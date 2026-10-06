@@ -135,12 +135,23 @@ async fn opus_5_5_handlers_preserve_mapping_boundaries_and_physical_ids() {
     {
         let mut mapping = state.custom_mapping.write().await;
         mapping.insert("client-opus".into(), "claude-opus-5-5".into());
+        mapping.insert(
+            "client-sonnet".into(),
+            "models/anthropic/claude-sonnet-5.5".into(),
+        );
         mapping.insert("claude-opus-5-5".into(), "claude-opus-5-5-low".into());
     }
 
     for (model, effort, expected) in [
         ("client-opus", Some("medium"), "claude-opus-5-5-medium"),
         ("client-opus", None, "claude-opus-5-5-high"),
+        ("client-sonnet", None, "claude-sonnet-5-5-medium"),
+        ("client-sonnet", Some("low"), "claude-sonnet-5-5-low"),
+        (
+            "claude-sonnet-5-5-high",
+            Some("low"),
+            "claude-sonnet-5-5-high",
+        ),
         (retired, Some("medium"), "claude-opus-5-5-medium"),
         ("claude-opus-5-5-high", Some("low"), "claude-opus-5-5-high"),
     ] {
@@ -179,6 +190,8 @@ async fn opus_5_5_handlers_preserve_mapping_boundaries_and_physical_ids() {
     }
     for (model, effort, expected) in [
         ("client-opus", "medium", "claude-opus-5-5-medium"),
+        ("client-sonnet", "low", "claude-sonnet-5-5-low"),
+        ("claude-sonnet-5-5-high", "low", "claude-sonnet-5-5-high"),
         (retired, "medium", "claude-opus-5-5-medium"),
         ("claude-opus-5-5-high", "low", "claude-opus-5-5-high"),
     ] {

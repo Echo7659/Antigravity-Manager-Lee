@@ -26,6 +26,8 @@ pub struct OfficialModelInfo {
     #[serde(default)]
     pub supports_thinking: Option<bool>,
     #[serde(default)]
+    pub supports_adaptive_thinking: Option<bool>,
+    #[serde(default)]
     pub thinking_budget: Option<i64>,
     #[serde(default)]
     pub min_thinking_budget: Option<i64>,
@@ -172,6 +174,29 @@ where
 pub struct OfficialModelCatalog;
 
 impl OfficialModelCatalog {
+    /// 只枚举目录中真实存在的思考档位，不将日期或 preview 等发布后缀视为档位。
+    pub fn collect_tiers_for_base(base: &str) -> Vec<String> {
+        let prefix = format!("{}-", base.trim().to_ascii_lowercase());
+        let Ok(lock) = DYNAMIC_CATALOG.read() else {
+            return Vec::new();
+        };
+        let mut tiers: Vec<_> = lock
+            .keys()
+            .filter_map(|key| {
+                let lower = key.to_ascii_lowercase();
+                let tier = lower.strip_prefix(&prefix)?;
+                matches!(
+                    tier,
+                    "extra-low" | "low" | "medium" | "high" | "xhigh" | "max" | "tiered" | "lite"
+                )
+                .then(|| tier.to_string())
+            })
+            .collect();
+        tiers.sort();
+        tiers.dedup();
+        tiers
+    }
+
     /// 运行时动态更新官方模型目录 (由 fetchAvailableModels 接口返回数据触发)
     pub fn update(models: HashMap<String, OfficialModelInfo>) {
         if let Ok(mut lock) = DYNAMIC_CATALOG.write() {
@@ -184,7 +209,13 @@ impl OfficialModelCatalog {
     /// 根据用户传入的模型 ID（官方标准 ID、别名、路由结果，以及大小写不敏感的精确名）
     /// 获取对应的官方模型结构体。未命中时返回 None，由调用方使用 `default_model()`。
     pub fn get(model_id: &str) -> Option<OfficialModelInfo> {
+        // 路由目录扫描在读锁之外完成，避免递归获取目录锁。
+        let physical = crate::proxy::model_specs::resolve_claude_tier_route(model_id, None);
         let lock = DYNAMIC_CATALOG.read().ok()?;
+
+        if let Some(info) = physical.as_ref().and_then(|id| lock.get(id)) {
+            return Some(info.clone());
+        }
 
         // 1. 精确匹配原始 model_id
         if let Some(info) = lock.get(model_id) {
@@ -224,6 +255,7 @@ impl OfficialModelCatalog {
             max_output_tokens: Some(65536),
             max_tokens: Some(1048576),
             supports_thinking: Some(true),
+            supports_adaptive_thinking: None,
             thinking_budget: Some(-1),
             min_thinking_budget: Some(32),
             supports_images: Some(true),
@@ -253,6 +285,34 @@ impl OfficialModelCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_5_5_official_metadata_and_tier_boundaries() {
+        for (family, start) in [("opus", 400), ("sonnet", 403)] {
+            for (offset, tier) in ["low", "medium", "high"].iter().enumerate() {
+                let id = format!("claude-{family}-5-5-{tier}");
+                let info = OfficialModelCatalog::get(&id).unwrap();
+                assert_eq!(info.model, format!("MODEL_PLACEHOLDER_M{}", start + offset));
+                assert!(info.is_claude());
+                assert_eq!(info.max_tokens, Some(1_000_000));
+                assert_eq!(info.max_output_tokens, Some(128_000));
+                assert_eq!(info.supports_adaptive_thinking, Some(true));
+                assert_eq!(info.thinking_level, Some((offset + 1).to_string()));
+            }
+            let base = format!("claude-{family}-5-5");
+            assert_eq!(
+                OfficialModelCatalog::collect_tiers_for_base(&base),
+                ["high", "low", "medium"]
+            );
+            for invalid in [
+                format!("claude-{family}-5"),
+                format!("{base}-high"),
+                format!("{base}-preview"),
+            ] {
+                assert!(OfficialModelCatalog::collect_tiers_for_base(&invalid).is_empty());
+            }
+        }
+    }
 
     #[test]
     fn embedded_catalog_accepts_numeric_thinking_level() {

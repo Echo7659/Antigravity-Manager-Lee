@@ -316,12 +316,14 @@ pub fn model_ids_from_catalog(
         .filter(|id| is_public_snapshot_model_id(id))
         .collect();
 
-    let has_opus_5_5 = model_ids
-        .iter()
-        .any(|model| crate::proxy::model_specs::is_opus_5_5_physical_variant(model));
-
-    if !only_raw_quota_models && has_opus_5_5 {
-        model_ids.insert("claude-opus-5-5".to_string());
+    if !only_raw_quota_models {
+        let aliases: Vec<_> = model_ids
+            .iter()
+            .filter_map(|model| {
+                crate::proxy::model_specs::claude_tier_base(model).map(str::to_owned)
+            })
+            .collect();
+        model_ids.extend(aliases);
     }
 
     // 配置允许时追加用户自定义映射名称。
@@ -605,6 +607,36 @@ mod opus_route_tests {
     }
 
     #[test]
+    fn claude_5_5_catalog_alias_visibility_and_custom_routes() {
+        let custom = HashMap::from([(
+            "my-sonnet".into(),
+            "models/anthropic/claude-sonnet-5.5".into(),
+        )]);
+        assert_eq!(
+            resolve_model_route_with_effort("my-sonnet", &custom, Some("low")),
+            "claude-sonnet-5-5-low"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("my-sonnet", &custom, None),
+            "claude-sonnet-5-5-medium"
+        );
+        assert_eq!(
+            resolve_model_route_with_effort("claude-sonnet-5-5-high", &custom, Some("low")),
+            "claude-sonnet-5-5-high"
+        );
+        let collected = vec![
+            "claude-opus-5-5-low".into(),
+            "claude-sonnet-5-5-high".into(),
+        ];
+        let raw = model_ids_from_catalog(collected.clone(), &HashMap::new(), true);
+        assert_eq!(raw, collected);
+        let aliases = model_ids_from_catalog(collected, &HashMap::new(), false);
+        assert!(aliases.contains(&"claude-sonnet-5-5".into()));
+        assert!(aliases.contains(&"claude-opus-5-5".into()));
+        assert!(model_ids_from_catalog(Vec::new(), &HashMap::new(), false).is_empty());
+    }
+
+    #[test]
     fn opus_5_5_alias_routes_by_effort_and_preserves_physical_ids() {
         let empty = HashMap::new();
         for (effort, expected) in [
@@ -638,12 +670,12 @@ pub fn resolve_model_route_with_effort(
     client_effort: Option<&str>,
 ) -> String {
     if let Some(target) = resolve_configured_model_route(original_model, custom_mapping) {
-        return crate::proxy::model_specs::resolve_opus_5_5_route(&target, client_effort)
+        return crate::proxy::model_specs::resolve_claude_tier_route(&target, client_effort)
             .unwrap_or(target);
     }
 
     if let Some(target) =
-        crate::proxy::model_specs::resolve_opus_5_5_route(original_model, client_effort)
+        crate::proxy::model_specs::resolve_claude_tier_route(original_model, client_effort)
     {
         return target;
     }
@@ -919,7 +951,7 @@ mod tests {
         assert!(!raw.contains(&"claude-opus-5-5".to_string()));
         assert_eq!(
             model_ids_from_catalog(["claude-sonnet-5-5-high".to_string()], &mapping, false),
-            vec!["claude-sonnet-5-5-high"]
+            vec!["claude-sonnet-5-5", "claude-sonnet-5-5-high"]
         );
         assert_eq!(
             model_ids_from_catalog(

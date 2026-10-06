@@ -1,3 +1,14 @@
+## v4.9.1-lee.1-beta.4
+
+2026-10-06. Selectively port upstream v4.9.6 Claude 5.5 support while retaining beta.3 stability fixes. This is not a full v4.9.6 upgrade and does not update main/latest.
+
+- Import the six official Opus/Sonnet 5.5 low/medium/high specifications, adaptive thinking, 1M context and 128000 output limits from upstream af5b791, related to lbjlaq/Antigravity-Manager#3593 (Thanks to @lbjlaq).
+- Replace Opus-only routing with catalog-driven Claude tier selection, adapting the real-tier selection approach from fd9c30c/4e8487d (Thanks to @jeikl). Sonnet defaults to medium; existing Opus aliases retain high. Explicit tiers override effort and Gemini routes remain unchanged.
+- Require Ultra or explicitly paid Pro plus positive exact physical-model quota for Claude 5 and later. Other families, tiers, output-capability metadata or normalized Claude quota do not establish eligibility. Do not import capability-unknown account fallback.
+- Enforce adaptive thinking, forced-tool constraints and output ceilings in the shared pipeline. Remove legacy adapter 64K caps and Gemini output inflation for these models while preserving smaller client limits.
+- Add catalog, dual-family routing, account selection/reload/retry and four-protocol regressions to CI. Local/CI checks do not prove live account capability; deployment acceptance uses actually eligible accounts without concurrency tests.
+- Preserve accounts, passwords, API keys, ports and database schema. Compatibility integration maintained by @Echo7659 (Thanks to @Echo7659); the existing beta.3 image remains a rollback option.
+
 ## v4.9.1-lee.1-beta.3
 
 2026-10-06. Bound ThinkingStore history hydration and cache admission on beta only, without updating main or latest.
