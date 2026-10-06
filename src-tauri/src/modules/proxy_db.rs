@@ -71,18 +71,51 @@ fn pack_thought(s: &str) -> Vec<u8> {
     out
 }
 
-fn unpack_thought(bytes: &[u8]) -> String {
+fn read_thought_bytes(reader: impl Read, budget: usize) -> (Vec<u8>, std::io::Result<usize>) {
+    let mut decoded = Vec::new();
+    let result = reader
+        .take(budget.saturating_add(1) as u64)
+        .read_to_end(&mut decoded);
+    (decoded, result)
+}
+
+/// 解码至多预算加一个字节；超限记录整体拒收，不进入损坏数据回退。
+fn unpack_thought_bounded(bytes: &[u8], budget: usize) -> Option<String> {
+    fn lossy_bounded(bytes: &[u8], budget: usize) -> Option<String> {
+        let output_len = bytes.utf8_chunks().try_fold(0usize, |len, chunk| {
+            let next = len
+                .checked_add(chunk.valid().len())?
+                .checked_add(if chunk.invalid().is_empty() { 0 } else { 3 })?;
+            (next <= budget).then_some(next)
+        })?;
+        let mut result = String::with_capacity(output_len);
+        for chunk in bytes.utf8_chunks() {
+            result.push_str(chunk.valid());
+            if !chunk.invalid().is_empty() {
+                result.push('�');
+            }
+        }
+        Some(result)
+    }
     if let Some(rest) = bytes.strip_prefix(THOUGHT_GZIP_MAGIC) {
-        let mut decoder = GzDecoder::new(rest);
-        let mut s = String::new();
-        if decoder.read_to_string(&mut s).is_ok() {
-            return s;
+        let (decoded, result) = read_thought_bytes(GzDecoder::new(rest), budget);
+        if decoded.len() > budget {
+            return None;
+        }
+        if result.is_ok() {
+            return lossy_bounded(&decoded, budget);
         }
     }
-    if let Some(rest) = bytes.strip_prefix(THOUGHT_RAW_MAGIC) {
-        return String::from_utf8_lossy(rest).into_owned();
-    }
-    String::from_utf8_lossy(bytes).into_owned()
+    lossy_bounded(
+        bytes.strip_prefix(THOUGHT_RAW_MAGIC).unwrap_or(bytes),
+        budget,
+    )
+}
+
+#[cfg(test)]
+fn unpack_thought(bytes: &[u8]) -> String {
+    unpack_thought_bounded(bytes, crate::proxy::thinking_store::MAX_BYTES_PER_SESSION)
+        .unwrap_or_default()
 }
 
 pub fn get_proxy_db_path() -> Result<PathBuf, String> {
@@ -220,6 +253,29 @@ fn open_thinking_db() -> Result<Connection, String> {
 }
 
 static THINKING_DB: OnceLock<Mutex<Option<(PathBuf, Connection)>>> = OnceLock::new();
+static THINKING_DB_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// 快照同时识别连接重建、当前连接写入和其他连接提交。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ThinkingDbSnapshot {
+    generation: usize,
+    total_changes: u64,
+    data_version: i64,
+}
+
+fn thinking_db_snapshot_at(conn: &Connection) -> Result<ThinkingDbSnapshot, String> {
+    Ok(ThinkingDbSnapshot {
+        generation: THINKING_DB_GENERATION.load(Ordering::Relaxed),
+        total_changes: conn.total_changes(),
+        data_version: conn
+            .pragma_query_value(None, "data_version", |row| row.get(0))
+            .map_err(|e| e.to_string())?,
+    })
+}
+
+pub(crate) fn thinking_db_snapshot() -> Result<ThinkingDbSnapshot, String> {
+    with_thinking_db(thinking_db_snapshot_at)
+}
 
 pub struct ThinkingDbGuard(MutexGuard<'static, Option<(PathBuf, Connection)>>);
 
@@ -251,6 +307,7 @@ fn thinking_db() -> Result<ThinkingDbGuard, String> {
     if guard.as_ref().map(|(p, _)| p) != Some(&db_path) {
         let conn = open_thinking_db_at(&db_path)?;
         *guard = Some((db_path, conn));
+        THINKING_DB_GENERATION.fetch_add(1, Ordering::Relaxed);
     }
     Ok(ThinkingDbGuard(guard))
 }
@@ -655,6 +712,7 @@ pub fn load_tool_signature(tool_id: &str) -> Result<Option<String>, String> {
 
 #[derive(Debug, Clone)]
 pub struct PersistedThinkingRecord {
+    pub id: i64,
     pub fingerprint: String,
     pub thought: String,
     pub signature: Option<String>,
@@ -672,10 +730,169 @@ pub fn save_thinking_record(
     _tool_names: &[String],
     visible: &str,
 ) -> Result<(), String> {
+    save_thinking_record_inner(
+        session_key,
+        fingerprint,
+        thought,
+        signature,
+        tool_ids,
+        visible,
+        ThinkingSaveGuard::None,
+    )
+    .map(|_| ())
+}
+
+/// expected_latest 限定已有最新行的升级；None 沿用新 capture 的保存语义。
+pub(crate) fn save_thinking_record_with_id(
+    session_key: &str,
+    rec: &crate::proxy::thinking_store::ThinkingRecord,
+    expected_latest: Option<i64>,
+) -> Result<Option<i64>, String> {
+    save_thinking_record_inner(
+        session_key,
+        &rec.fingerprint,
+        &rec.thought,
+        rec.signature.as_deref(),
+        &rec.tool_ids,
+        &rec.visible,
+        expected_latest.map_or(ThinkingSaveGuard::None, ThinkingSaveGuard::LatestId),
+    )
+}
+
+enum ThinkingSaveGuard {
+    None,
+    LatestId(i64),
+    PreserveStrongerLatest,
+}
+
+/// 仅供 RAM 判为弱重复的 capture 使用，真实 latest 的抑制条件在保存事务内确认。
+pub(crate) fn save_thinking_capture_unless_weaker(
+    session_key: &str,
+    rec: &crate::proxy::thinking_store::ThinkingRecord,
+) -> Result<Option<i64>, String> {
+    save_thinking_record_inner(
+        session_key,
+        &rec.fingerprint,
+        &rec.thought,
+        rec.signature.as_deref(),
+        &rec.tool_ids,
+        &rec.visible,
+        ThinkingSaveGuard::PreserveStrongerLatest,
+    )
+}
+
+/// 只读取到比较阈值；超预算保守保留 latest，不证明尚未读取的 gzip 尾部有效。
+fn thought_exceeds_capture_length(raw: &[u8], threshold: usize) -> bool {
+    let lossy_exceeds = |bytes: &[u8]| {
+        if bytes.len() > threshold {
+            return true;
+        }
+        let mut length = 0usize;
+        for chunk in bytes.utf8_chunks() {
+            length = length.saturating_add(chunk.valid().len());
+            if !chunk.invalid().is_empty() {
+                length = length.saturating_add('�'.len_utf8());
+            }
+            if length > threshold {
+                return true;
+            }
+        }
+        false
+    };
+    if let Some(compressed) = raw.strip_prefix(THOUGHT_GZIP_MAGIC) {
+        let (decoded, result) = read_thought_bytes(GzDecoder::new(compressed), threshold);
+        if decoded.len() > threshold {
+            return true;
+        }
+        if result.is_ok() {
+            return lossy_exceeds(&decoded);
+        }
+        // 预算内已经发生的解码错误沿用原始字节 fallback，不当作更长的有效 thought。
+    }
+    lossy_exceeds(raw.strip_prefix(THOUGHT_RAW_MAGIC).unwrap_or(raw))
+}
+
+fn latest_capture_is_stronger(
+    conn: &Connection,
+    session_key: &str,
+    fingerprint: &str,
+    thought: &str,
+    signature: Option<&str>,
+) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT fingerprint, thought, signature FROM thinking_records WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+        [session_key],
+        |row| {
+            use rusqlite::types::ValueRef;
+            let mut fields = [&[][..]; 3];
+            for (i, field) in fields.iter_mut().enumerate() {
+                *field = match row.get_ref(i)? {
+                    ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes,
+                    ValueRef::Null => &[],
+                    _ => return Ok(false),
+                };
+            }
+            let [old_fp, raw, old_signature] = fields;
+            if old_fp != fingerprint.as_bytes() {
+                return Ok(false);
+            }
+            // 与持久行读取时的签名自愈长度一致，不复制可能超大的签名字段。
+            let old_signature_len = match std::str::from_utf8(old_signature) {
+                Ok(sig) if !sig.is_empty() && sig != SENTINEL_SIGNATURE => {
+                    let length = if old_signature.first() == Some(&0x12) {
+                        old_signature.len().div_ceil(3).saturating_mul(4)
+                    } else {
+                        old_signature.len()
+                    };
+                    if length >= MIN_REAL_SIGNATURE { length } else { 0 }
+                }
+                _ => 0,
+            };
+            Ok(signature.map_or(0, str::len) <= old_signature_len
+                && thought_exceeds_capture_length(raw, thought.len()))
+        },
+    ).optional().map(|result| result.unwrap_or(false)).map_err(|e| e.to_string())
+}
+
+fn save_thinking_record_inner(
+    session_key: &str,
+    fingerprint: &str,
+    thought: &str,
+    signature: Option<&str>,
+    tool_ids: &[String],
+    visible: &str,
+    guard: ThinkingSaveGuard,
+) -> Result<Option<i64>, String> {
     if session_key.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     with_thinking_db(|conn| {
+        // 条件升级和弱 capture 判定均与保存共用事务，禁止用旧 RAM 快照证明当前 latest。
+        let transaction = if matches!(guard, ThinkingSaveGuard::None) {
+            None
+        } else {
+            Some(
+                rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(|e| e.to_string())?,
+            )
+        };
+        if let ThinkingSaveGuard::LatestId(expected) = guard {
+            let latest: Option<i64> = conn.query_row(
+                "SELECT id FROM thinking_records WHERE session_key = ?1 ORDER BY id DESC LIMIT 1",
+                [session_key], |row| row.get(0),
+            ).optional().map_err(|e| e.to_string())?;
+            if latest != Some(expected) {
+                return Ok(None);
+            }
+        }
+        if matches!(guard, ThinkingSaveGuard::PreserveStrongerLatest)
+            && latest_capture_is_stronger(conn, session_key, fingerprint, thought, signature)?
+        {
+            return Ok(None);
+        }
         let now = chrono::Utc::now().timestamp_millis();
         let normalized_tool_ids: Vec<String> = tool_ids
             .iter()
@@ -757,7 +974,7 @@ pub fn save_thinking_record(
             None => None,
         };
 
-        if let Some((id, old_thought_len, old_sig)) = existing_id {
+        let saved_id = if let Some((id, old_thought_len, old_sig)) = existing_id {
             // 已存在记录：检查是否需要更新（防止将已有实质思考覆盖为占位符，但允许补全更长思考或有效签名）
             let incoming_has_meaningful_thought =
                 !crate::proxy::thinking_store::is_placeholder_thought(thought)
@@ -801,6 +1018,7 @@ pub fn save_thinking_record(
                 stmt.execute(params![effective_sig, now, id])
                     .map_err(|e| e.to_string())?;
             }
+            id
         } else {
             // 全新轮次：插入新记录（同时写入 primary_tool_id 与 causal_tool_id 列）
             let mut stmt = conn
@@ -821,7 +1039,8 @@ pub fn save_thinking_record(
                 causal_tool_id,
             ])
             .map_err(|e| e.to_string())?;
-        }
+            conn.last_insert_rowid()
+        };
 
         #[cfg(test)]
         thinking_maintenance_tests::run_hook(&thinking_maintenance_tests::BEFORE_TOUCH);
@@ -835,349 +1054,371 @@ pub fn save_thinking_record(
             .execute(params![session_key, now])
             .map_err(|e| e.to_string())?;
 
-        Ok(())
+        if let Some(transaction) = transaction {
+            transaction.commit().map_err(|e| e.to_string())?;
+        }
+        Ok(Some(saved_id))
     })
 }
 
+/// 行字段在复制前借用检查；内容预算不包含容器、索引和分配器开销。
+fn read_thinking_row(
+    row: &rusqlite::Row<'_>,
+    budget: usize,
+) -> rusqlite::Result<Option<PersistedThinkingRecord>> {
+    use rusqlite::types::ValueRef;
+    let mut fields = [&[][..]; 6];
+    for (i, field) in fields.iter_mut().enumerate() {
+        *field = match row.get_ref(i + 1)? {
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes,
+            ValueRef::Null => &[],
+            _ => return Ok(None),
+        };
+    }
+    let [fp, raw, signature, ids, names, visible] = fields;
+    // 压缩输入及辅助元数据也设上限，禁止先复制大字段再拒收。
+    if raw.len() > budget.saturating_add(4)
+        || fp
+            .len()
+            .saturating_add(ids.len())
+            .saturating_add(names.len())
+            > budget
+        || signature.len().saturating_add(visible.len()) > budget
+    {
+        tracing::debug!("[ThinkingStore] Skipped oversized persisted fields");
+        return Ok(None);
+    }
+    let string = |bytes: &[u8]| std::str::from_utf8(bytes).map(str::to_owned);
+    let (Ok(fp), Ok(ids), Ok(names), Ok(visible), Ok(raw_signature)) = (
+        string(fp),
+        string(ids),
+        string(names),
+        string(visible),
+        string(signature),
+    ) else {
+        return Ok(None);
+    };
+    // 原始 protobuf 签名转 Base64 时会膨胀，转换前检查最终长度。
+    let signature_len = if raw_signature.as_bytes().first() == Some(&0x12) {
+        raw_signature.len().div_ceil(3).saturating_mul(4)
+    } else {
+        raw_signature.len()
+    };
+    if signature_len.saturating_add(visible.len()) > budget {
+        tracing::debug!("[ThinkingStore] Skipped oversized healed signature");
+        return Ok(None);
+    }
+    let signature = persist_signature(Some(&raw_signature));
+    let remaining = budget - visible.len() - signature.as_ref().map_or(0, String::len);
+    let Some(thought) = unpack_thought_bounded(raw, remaining) else {
+        tracing::debug!("[ThinkingStore] Skipped oversized persisted thought");
+        return Ok(None);
+    };
+    Ok(Some(PersistedThinkingRecord {
+        id: row.get(0)?,
+        fingerprint: fp,
+        thought,
+        signature,
+        tool_ids: serde_json::from_str(&ids).unwrap_or_default(),
+        tool_names: serde_json::from_str(&names).unwrap_or_default(),
+        visible,
+    }))
+}
+
 pub fn load_thinking_records(session_key: &str) -> Result<Vec<PersistedThinkingRecord>, String> {
-    if session_key.is_empty() {
-        return Ok(Vec::new());
+    load_thinking_records_bounded(
+        session_key,
+        crate::proxy::config::get_thinking_max_memory_turns(),
+        crate::proxy::thinking_store::MAX_BYTES_PER_SESSION,
+    )
+}
+
+pub(crate) fn load_thinking_records_bounded(
+    session_key: &str,
+    max_turns: usize,
+    max_bytes: usize,
+) -> Result<Vec<PersistedThinkingRecord>, String> {
+    load_thinking_history_bounded(session_key, max_turns, max_bytes).map(|history| history.records)
+}
+
+#[derive(Default)]
+pub(crate) struct ThinkingHistory {
+    pub records: Vec<PersistedThinkingRecord>,
+    /// 只有全部持久历史均已接纳时为 true，读取失败或预算拒收不能视为完整。
+    pub complete: bool,
+}
+
+pub(crate) fn load_thinking_history_bounded(
+    session_key: &str,
+    max_turns: usize,
+    max_bytes: usize,
+) -> Result<ThinkingHistory, String> {
+    if session_key.is_empty() || max_turns == 0 || max_bytes == 0 {
+        return Ok(ThinkingHistory::default());
     }
     with_thinking_db(|conn| {
         let mut stmt = conn
             .prepare_cached(
-                "SELECT fingerprint, thought, signature, tool_ids, tool_names, visible
-             FROM thinking_records
-             WHERE session_key = ?1
-             ORDER BY id ASC",
+                "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
+             FROM thinking_records WHERE session_key = ?1 ORDER BY id DESC LIMIT ?2",
             )
             .map_err(|e| e.to_string())?;
-
-        let rows = stmt
-            .query_map(params![session_key], |row| {
-                let fp: String = row.get(0)?;
-                let thought_raw: Vec<u8> = row.get(1)?;
-                let signature: Option<String> = row.get(2)?;
-                let tool_ids_str: String = row.get(3)?;
-                let tool_names_str: String = row.get(4)?;
-                let visible: String = row.get(5)?;
-                Ok((
-                    fp,
-                    thought_raw,
-                    signature,
-                    tool_ids_str,
-                    tool_names_str,
-                    visible,
-                ))
-            })
+        let mut rows = stmt
+            .query(params![
+                session_key,
+                i64::try_from(max_turns).unwrap_or(i64::MAX)
+            ])
             .map_err(|e| e.to_string())?;
-
-        let mut result = Vec::new();
-        for row in rows {
-            if let Ok((fp, thought_raw, signature, tool_ids_str, tool_names_str, visible)) = row {
-                let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-                let tool_names: Vec<String> =
-                    serde_json::from_str(&tool_names_str).unwrap_or_default();
-                result.push(PersistedThinkingRecord {
-                    fingerprint: fp,
-                    thought: unpack_thought(&thought_raw),
-                    signature: persist_signature(signature.as_deref()),
-                    tool_ids,
-                    tool_names,
-                    visible,
-                });
+        let mut result = ThinkingHistory {
+            records: Vec::new(),
+            complete: true,
+        };
+        let mut remaining = max_bytes;
+        let mut oldest_candidate = None;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            oldest_candidate = Some(row.get::<_, i64>(0).map_err(|e| e.to_string())?);
+            if let Some(rec) = read_thinking_row(row, remaining).map_err(|e| e.to_string())? {
+                remaining -= rec.thought.len()
+                    + rec.signature.as_ref().map_or(0, String::len)
+                    + rec.visible.len();
+                result.records.push(rec);
+            } else {
+                result.complete = false;
             }
         }
+        drop(rows);
+        if result.complete {
+            if let Some(oldest) = oldest_candidate {
+                // 同索引只检查窗口前是否有历史，不扫描或读取历史内容。
+                let has_older: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM thinking_records WHERE session_key = ?1 AND id < ?2 LIMIT 1)",
+                    params![session_key, oldest], |row| row.get(0)
+                ).map_err(|e| e.to_string())?;
+                result.complete = !has_older;
+            }
+        }
+        result.records.reverse();
         Ok(result)
     })
 }
 
-/// 根据 tool_id (因果伪哈希 ID 或原生 ID) 精准穿透点查历史思考
-/// 采用双轨索引极速点查 + 老数据自动静默自愈机制
+/// 身份点查只返回标量 id；已消费 id 保留同一请求内重复轮次的次数语义。
+pub(crate) fn find_thinking_record_id(
+    session_key: &str,
+    rec: &crate::proxy::thinking_store::ThinkingRecord,
+    used_ids: &std::collections::HashSet<i64>,
+) -> Result<Option<i64>, String> {
+    let used_json = serde_json::to_string(used_ids).map_err(|e| e.to_string())?;
+    let has_tools = !rec.tool_ids.is_empty() || !rec.tool_names.is_empty();
+    with_thinking_db(|conn| {
+        let find = |predicate: &str, value: &str| -> Result<Option<i64>, String> {
+            let sql = format!("SELECT id FROM thinking_records WHERE session_key = ?1 AND {predicate} AND id NOT IN (SELECT value FROM json_each(?3)) ORDER BY id ASC LIMIT 1");
+            conn.query_row(&sql, params![session_key, value, used_json], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())
+        };
+        let oldest =
+            |current: Option<i64>, found: Option<i64>| current.into_iter().chain(found).min();
+        if let Some(sig) = rec
+            .signature
+            .as_deref()
+            .filter(|sig| crate::proxy::thinking_store::is_real_signature(sig))
+        {
+            let mut candidates = vec![sig.to_string()];
+            if sig.as_bytes().first() == Some(&0x12) {
+                if let Some(healed) = normalize_and_heal_signature(sig) {
+                    candidates.push(healed);
+                }
+            }
+            if crate::proxy::thinking_store::is_claude_signature(sig) {
+                candidates.extend([
+                    crate::proxy::thinking_store::ensure_google_claude_thought_signature(sig),
+                    crate::proxy::thinking_store::ensure_raw_claude_thought_signature(sig),
+                ]);
+            }
+            candidates.sort_unstable();
+            candidates.dedup();
+            // 同一级的编码候选共享历史 ASC 优先级，候选枚举顺序不决定身份。
+            let mut earliest = None;
+            for candidate in candidates {
+                earliest = oldest(earliest, find("signature = ?2", &candidate)?);
+            }
+            if earliest.is_some() {
+                return Ok(earliest);
+            }
+        }
+        let mut candidates = Vec::new();
+        for tool_id in &rec.tool_ids {
+            candidates.push(crate::proxy::common::utils::normalize_tool_id(tool_id).into_owned());
+            candidates.push(tool_id.clone());
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut earliest = None;
+        for candidate in candidates {
+            for predicate in ["causal_tool_id = ?2", "primary_tool_id = ?2"] {
+                earliest = oldest(earliest, find(predicate, &candidate)?);
+            }
+            // secondary ID 按 JSON 字符串精确比较，避免 LIKE 通配符和转义造成错配。
+            earliest = oldest(
+                earliest,
+                find(
+                    "EXISTS (SELECT 1 FROM json_each(thinking_records.tool_ids) WHERE value = ?2)",
+                    &candidate,
+                )?,
+            );
+        }
+        if earliest.is_some() {
+            return Ok(earliest);
+        }
+        // 工具类型约束只属于 fingerprint fallback，与 RAM 匹配规则一致。
+        find(
+            if has_tools {
+                "fingerprint = ?2 AND (tool_ids != '[]' OR tool_names != '[]')"
+            } else {
+                "fingerprint = ?2 AND tool_ids = '[]' AND tool_names = '[]'"
+            },
+            &rec.fingerprint,
+        )
+    })
+}
+
+pub(crate) fn load_thinking_by_id_bounded(
+    session_key: &str,
+    id: i64,
+    budget: usize,
+) -> Result<Option<PersistedThinkingRecord>, String> {
+    with_thinking_db(|conn| {
+        query_thinking_record(conn,
+        "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible FROM thinking_records WHERE session_key = ?1 AND id = ?2 LIMIT 1",
+        session_key, &id.to_string(), budget, None)
+    })
+}
+
+/// 点查沿用既有索引与自愈语义，只对完整且可接纳的记录写回修复。
+fn query_thinking_record(
+    conn: &Connection,
+    sql: &str,
+    session_key: &str,
+    value: &str,
+    budget: usize,
+    heal_causal_id: Option<&str>,
+) -> Result<Option<PersistedThinkingRecord>, String> {
+    let mut stmt = conn.prepare_cached(sql).map_err(|e| e.to_string())?;
+    let mut rows = stmt
+        .query(params![session_key, value])
+        .map_err(|e| e.to_string())?;
+    let Some(row) = rows.next().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+    let Some(rec) = read_thinking_row(row, budget).map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let raw_signature = row.get_ref(3).map_err(|e| e.to_string())?;
+    if let Some(signature) = rec.signature.as_deref() {
+        if raw_signature.as_str().ok() != Some(signature) {
+            let _ = conn.execute(
+                "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                params![signature, id],
+            );
+        }
+    }
+    if let Some(causal_id) = heal_causal_id {
+        let _ = conn.execute("UPDATE thinking_records SET causal_tool_id = ?1 WHERE id = ?2 AND causal_tool_id IS NULL", params![causal_id, id]);
+    }
+    Ok(Some(rec))
+}
+
 pub fn load_thinking_by_tool_id(
     session_key: &str,
     tool_id: &str,
 ) -> Result<Option<PersistedThinkingRecord>, String> {
-    if session_key.is_empty() || tool_id.is_empty() {
+    load_thinking_by_tool_id_bounded(
+        session_key,
+        tool_id,
+        crate::proxy::thinking_store::MAX_BYTES_PER_SESSION,
+    )
+}
+
+pub(crate) fn load_thinking_by_tool_id_bounded(
+    session_key: &str,
+    tool_id: &str,
+    budget: usize,
+) -> Result<Option<PersistedThinkingRecord>, String> {
+    if session_key.is_empty() || tool_id.is_empty() || budget == 0 {
         return Ok(None);
     }
     let norm_id = crate::proxy::common::utils::normalize_tool_id(tool_id);
-    let mut candidate_ids = vec![norm_id.as_ref()];
+    let mut candidates = vec![norm_id.as_ref()];
     if norm_id.as_ref() != tool_id {
-        candidate_ids.push(tool_id);
+        candidates.push(tool_id);
     }
-
     with_thinking_db(|conn| {
-        for candidate in candidate_ids {
-            // 1. Track 1 (Fastest Path): 优先按因果伪哈希 ID 走 idx_thinking_rec_causal 专属局部索引 (0.02ms 纳秒级命中)
-            let mut causal_stmt = conn
-                .prepare_cached(
-                    "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
-                 FROM thinking_records
-                 WHERE session_key = ?1 AND causal_tool_id = ?2
-                 ORDER BY id DESC LIMIT 1",
-                )
-                .map_err(|e| e.to_string())?;
-
-            let mut causal_rows = causal_stmt
-                .query(params![session_key, candidate])
-                .map_err(|e| e.to_string())?;
-
-            if let Some(row) = causal_rows.next().map_err(|e| e.to_string())? {
-                let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-                let fp: String = row.get(1).map_err(|e| e.to_string())?;
-                let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-                let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-                let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-                let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-                let visible: String = row.get(6).map_err(|e| e.to_string())?;
-                let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-                let tool_names: Vec<String> =
-                    serde_json::from_str(&tool_names_str).unwrap_or_default();
-                let healed_sig = persist_signature(raw_signature.as_deref());
-
-                // 反向写回优化：若数据库中存储了损坏/非标准签名，命中后自愈并写回更新 SQLite
-                if let Some(ref h_sig) = healed_sig {
-                    if raw_signature.as_ref() != Some(h_sig) {
-                        let _ = conn.execute(
-                            "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                            params![h_sig, rec_id],
-                        );
-                    }
+        for candidate in candidates {
+            for column in ["causal_tool_id", "primary_tool_id", "tool_ids"] {
+                let (operator, value) = if column == "tool_ids" {
+                    ("LIKE", format!("%\"{}\"%", candidate))
+                } else {
+                    ("=", candidate.to_owned())
+                };
+                let sql = format!("SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible FROM thinking_records WHERE session_key = ?1 AND {column} {operator} ?2 ORDER BY id DESC LIMIT 1");
+                if let Some(rec) = query_thinking_record(
+                    conn,
+                    &sql,
+                    session_key,
+                    &value,
+                    budget,
+                    is_synthetic_tool_id(candidate).then_some(candidate),
+                )? {
+                    return Ok(Some(rec));
                 }
-
-                return Ok(Some(PersistedThinkingRecord {
-                    fingerprint: fp,
-                    thought: unpack_thought(&thought_raw),
-                    signature: healed_sig,
-                    tool_ids,
-                    tool_names,
-                    visible,
-                }));
-            }
-
-            // 2. Track 2 (Legacy Path): 兼容旧版 primary_tool_id (走 idx_thinking_rec_tool 索引点查)
-            let mut primary_stmt = conn
-                .prepare_cached(
-                    "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
-                 FROM thinking_records
-                 WHERE session_key = ?1 AND primary_tool_id = ?2
-                 ORDER BY id DESC LIMIT 1",
-                )
-                .map_err(|e| e.to_string())?;
-
-            let mut primary_rows = primary_stmt
-                .query(params![session_key, candidate])
-                .map_err(|e| e.to_string())?;
-
-            if let Some(row) = primary_rows.next().map_err(|e| e.to_string())? {
-                let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-                let fp: String = row.get(1).map_err(|e| e.to_string())?;
-                let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-                let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-                let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-                let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-                let visible: String = row.get(6).map_err(|e| e.to_string())?;
-                let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-                let tool_names: Vec<String> =
-                    serde_json::from_str(&tool_names_str).unwrap_or_default();
-                let healed_sig = persist_signature(raw_signature.as_deref());
-
-                // 3. Track 3 (In-Place Self-Healing): 若当前请求使用的是因果伪哈希 ID，顺手静默修复老数据
-                if is_synthetic_tool_id(candidate) {
-                    let _ = conn.execute(
-                    "UPDATE thinking_records SET causal_tool_id = ?1 WHERE id = ?2 AND causal_tool_id IS NULL",
-                    params![candidate, rec_id],
-                );
-                }
-                if let Some(ref h_sig) = healed_sig {
-                    if raw_signature.as_ref() != Some(h_sig) {
-                        let _ = conn.execute(
-                            "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                            params![h_sig, rec_id],
-                        );
-                    }
-                }
-
-                return Ok(Some(PersistedThinkingRecord {
-                    fingerprint: fp,
-                    thought: unpack_thought(&thought_raw),
-                    signature: healed_sig,
-                    tool_ids,
-                    tool_names,
-                    visible,
-                }));
-            }
-
-            // 4. Track 4 (Fallback Path): 极端情况兼容最古老旧记录 (tool_ids 列表内模糊包含)
-            let pattern = format!("%\"{}\"%", candidate);
-            let mut fallback_stmt = conn
-                .prepare_cached(
-                    "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
-                 FROM thinking_records
-                 WHERE session_key = ?1 AND tool_ids LIKE ?2
-                 ORDER BY id DESC LIMIT 1",
-                )
-                .map_err(|e| e.to_string())?;
-
-            let mut fallback_rows = fallback_stmt
-                .query(params![session_key, pattern])
-                .map_err(|e| e.to_string())?;
-
-            if let Some(row) = fallback_rows.next().map_err(|e| e.to_string())? {
-                let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-                let fp: String = row.get(1).map_err(|e| e.to_string())?;
-                let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-                let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-                let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-                let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-                let visible: String = row.get(6).map_err(|e| e.to_string())?;
-                let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-                let tool_names: Vec<String> =
-                    serde_json::from_str(&tool_names_str).unwrap_or_default();
-                let healed_sig = persist_signature(raw_signature.as_deref());
-
-                if is_synthetic_tool_id(candidate) {
-                    let _ = conn.execute(
-                    "UPDATE thinking_records SET causal_tool_id = ?1 WHERE id = ?2 AND causal_tool_id IS NULL",
-                    params![candidate, rec_id],
-                );
-                }
-                if let Some(ref h_sig) = healed_sig {
-                    if raw_signature.as_ref() != Some(h_sig) {
-                        let _ = conn.execute(
-                            "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                            params![h_sig, rec_id],
-                        );
-                    }
-                }
-
-                return Ok(Some(PersistedThinkingRecord {
-                    fingerprint: fp,
-                    thought: unpack_thought(&thought_raw),
-                    signature: healed_sig,
-                    tool_ids,
-                    tool_names,
-                    visible,
-                }));
             }
         }
-
         Ok(None)
     })
 }
 
-/// 根据 signature 精准穿透点查历史思考（利用 idx_thinking_rec_sig 索引）
-pub fn load_thinking_by_signature(
+pub(crate) fn load_thinking_by_signature_bounded(
     session_key: &str,
     signature: &str,
+    budget: usize,
 ) -> Result<Option<PersistedThinkingRecord>, String> {
-    if session_key.is_empty() || signature.is_empty() {
+    if session_key.is_empty() || signature.is_empty() || budget == 0 {
         return Ok(None);
     }
     with_thinking_db(|conn| {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
-             FROM thinking_records
-             WHERE session_key = ?1 AND signature = ?2
-             ORDER BY id DESC LIMIT 1",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let mut rows = stmt
-            .query(params![session_key, signature])
-            .map_err(|e| e.to_string())?;
-
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let fp: String = row.get(1).map_err(|e| e.to_string())?;
-            let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-            let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-            let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-            let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-            let visible: String = row.get(6).map_err(|e| e.to_string())?;
-            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
-            let healed_sig = persist_signature(raw_signature.as_deref());
-
-            if let Some(ref h_sig) = healed_sig {
-                if raw_signature.as_ref() != Some(h_sig) {
-                    let _ = conn.execute(
-                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                        params![h_sig, rec_id],
-                    );
-                }
-            }
-
-            Ok(Some(PersistedThinkingRecord {
-                fingerprint: fp,
-                thought: unpack_thought(&thought_raw),
-                signature: healed_sig,
-                tool_ids,
-                tool_names,
-                visible,
-            }))
-        } else {
-            Ok(None)
-        }
+        query_thinking_record(conn,
+        "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible FROM thinking_records WHERE session_key = ?1 AND signature = ?2 ORDER BY id DESC LIMIT 1",
+        session_key, signature, budget, None)
     })
 }
 
-/// 根据 fingerprint 精准穿透点查纯文本历史思考（利用 idx_thinking_rec_fp 索引）
 pub fn load_thinking_by_fingerprint(
     session_key: &str,
     fingerprint: &str,
 ) -> Result<Option<PersistedThinkingRecord>, String> {
-    if session_key.is_empty() || fingerprint.is_empty() {
+    load_thinking_by_fingerprint_bounded(
+        session_key,
+        fingerprint,
+        crate::proxy::thinking_store::MAX_BYTES_PER_SESSION,
+    )
+}
+
+pub(crate) fn load_thinking_by_fingerprint_bounded(
+    session_key: &str,
+    fingerprint: &str,
+    budget: usize,
+) -> Result<Option<PersistedThinkingRecord>, String> {
+    if session_key.is_empty() || fingerprint.is_empty() || budget == 0 {
         return Ok(None);
     }
     with_thinking_db(|conn| {
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible
-             FROM thinking_records
-             WHERE session_key = ?1 AND fingerprint = ?2
-             ORDER BY id DESC LIMIT 1",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let mut rows = stmt
-            .query(params![session_key, fingerprint])
-            .map_err(|e| e.to_string())?;
-
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let rec_id: i64 = row.get(0).map_err(|e| e.to_string())?;
-            let fp: String = row.get(1).map_err(|e| e.to_string())?;
-            let thought_raw: Vec<u8> = row.get(2).map_err(|e| e.to_string())?;
-            let raw_signature: Option<String> = row.get(3).map_err(|e| e.to_string())?;
-            let tool_ids_str: String = row.get(4).map_err(|e| e.to_string())?;
-            let tool_names_str: String = row.get(5).map_err(|e| e.to_string())?;
-            let visible: String = row.get(6).map_err(|e| e.to_string())?;
-            let tool_ids: Vec<String> = serde_json::from_str(&tool_ids_str).unwrap_or_default();
-            let tool_names: Vec<String> = serde_json::from_str(&tool_names_str).unwrap_or_default();
-            let healed_sig = persist_signature(raw_signature.as_deref());
-
-            if let Some(ref h_sig) = healed_sig {
-                if raw_signature.as_ref() != Some(h_sig) {
-                    let _ = conn.execute(
-                        "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
-                        params![h_sig, rec_id],
-                    );
-                }
-            }
-
-            Ok(Some(PersistedThinkingRecord {
-                fingerprint: fp,
-                thought: unpack_thought(&thought_raw),
-                signature: healed_sig,
-                tool_ids,
-                tool_names,
-                visible,
-            }))
-        } else {
-            Ok(None)
-        }
+        query_thinking_record(conn,
+        "SELECT id, fingerprint, thought, signature, tool_ids, tool_names, visible FROM thinking_records WHERE session_key = ?1 AND fingerprint = ?2 ORDER BY id DESC LIMIT 1",
+        session_key, fingerprint, budget, None)
     })
 }
 
@@ -1198,22 +1439,29 @@ pub fn touch_thinking_session(session_key: &str) -> Result<usize, String> {
     })
 }
 
-pub fn delete_thinking_records_except_fingerprints(
+/// 只允许未发生持久变更的完整快照驱动 prune；变化或连接重建时返回 None。
+pub(crate) fn prune_thinking_records_if_unchanged(
     session_key: &str,
     keep_fps: &[String],
-) -> Result<usize, String> {
+    snapshot: ThinkingDbSnapshot,
+) -> Result<Option<usize>, String> {
     if session_key.is_empty() || keep_fps.is_empty() {
-        return Ok(0);
+        return Ok(None);
     }
     with_thinking_db(|conn| {
-        let fps_json = serde_json::to_string(keep_fps).unwrap_or_else(|_| "[]".to_string());
-        conn.execute(
-            "DELETE FROM thinking_records
-         WHERE session_key = ?1
-         AND fingerprint NOT IN (SELECT value FROM json_each(?2))",
+        let transaction =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| e.to_string())?;
+        if thinking_db_snapshot_at(&transaction)? != snapshot {
+            return Ok(None);
+        }
+        let fps_json = serde_json::to_string(keep_fps).map_err(|e| e.to_string())?;
+        let deleted = transaction.execute(
+            "DELETE FROM thinking_records WHERE session_key = ?1 AND fingerprint NOT IN (SELECT value FROM json_each(?2))",
             params![session_key, fps_json],
-        )
-        .map_err(|e| e.to_string())
+        ).map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(Some(deleted))
     })
 }
 
@@ -1734,6 +1982,7 @@ fn try_cleanup_thinking_batch(
     if guard.as_ref().map(|(path, _)| path) != Some(&db_path) {
         // 首次 schema 初始化不受维护批次的短 deadline 限制。
         *guard = Some((db_path.clone(), open_thinking_db_at(&db_path)?));
+        THINKING_DB_GENERATION.fetch_add(1, Ordering::Relaxed);
     }
     let conn = &guard.as_ref().expect("thinking db connection").1;
     match cleanup_thinking_batch(conn, cutoff, kind, limits) {
@@ -2384,6 +2633,366 @@ mod tool_signature_tests {
 mod thinking_sqlite_tests {
     use super::*;
     use crate::proxy::monitor::prompt_log_tests::TestDataDir;
+
+    #[test]
+    fn cold_history_respects_configured_window() {
+        let _dir = TestDataDir::new();
+        let limit = crate::proxy::config::get_thinking_max_memory_turns();
+        with_thinking_db(|conn| {
+            for i in 0..limit + 2 {
+                conn.execute("INSERT INTO thinking_records (session_key, fingerprint, thought, tool_ids, tool_names, visible, created_at) VALUES ('bounded', ?1, X'5241573178', '[]', '[]', '', 0)", [i.to_string()]).unwrap();
+            }
+            Ok(())
+        }).unwrap();
+        let records = load_thinking_records("bounded").unwrap();
+        assert_eq!(records.len(), limit);
+        assert_eq!(records.first().unwrap().fingerprint, "2");
+        assert_eq!(records.last().unwrap().fingerprint, (limit + 1).to_string());
+        assert_eq!(get_thinking_records_count().unwrap(), (limit + 2));
+    }
+
+    fn insert_bounded_fixture(conn: &Connection, fp: &str, thought: &[u8]) {
+        conn.execute("INSERT INTO thinking_records (session_key, fingerprint, thought, signature, tool_ids, tool_names, visible, created_at, primary_tool_id) VALUES ('budget', ?1, ?2, ?3, ?4, '[]', '', 0, ?1)",
+            params![fp, thought, "s".repeat(32), format!("[\"{fp}\"]")]).unwrap();
+    }
+
+    #[test]
+    fn bounded_history_preserves_order_bytes_and_unloaded_rows() {
+        let _dir = TestDataDir::new();
+        with_thinking_db(|conn| {
+            for fp in ["0", "1", "2", "3", "4"] {
+                insert_bounded_fixture(conn, fp, b"RAW1abcdefgh");
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            load_thinking_history_bounded("empty", 5, 200)
+                .unwrap()
+                .complete
+        );
+        assert!(
+            load_thinking_history_bounded("budget", 5, 200)
+                .unwrap()
+                .complete
+        );
+        assert!(
+            !load_thinking_history_bounded("budget", 4, 200)
+                .unwrap()
+                .complete
+        );
+        assert!(
+            !load_thinking_history_bounded("budget", 5, 199)
+                .unwrap()
+                .complete
+        );
+        let records = load_thinking_records_bounded("budget", 3, 80).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.fingerprint.as_str())
+                .collect::<Vec<_>>(),
+            ["3", "4"]
+        );
+        assert_eq!(get_thinking_records_count().unwrap(), 5);
+        assert!(load_thinking_by_fingerprint_bounded("budget", "0", 40)
+            .unwrap()
+            .is_some());
+        assert!(load_thinking_by_tool_id_bounded("budget", "0", 40)
+            .unwrap()
+            .is_some());
+        assert!(
+            load_thinking_by_signature_bounded("budget", &"s".repeat(32), 40)
+                .unwrap()
+                .is_some()
+        );
+        for result in [
+            load_thinking_by_fingerprint_bounded("budget", "0", 39),
+            load_thinking_by_tool_id_bounded("budget", "0", 39),
+            load_thinking_by_signature_bounded("budget", &"s".repeat(32), 39),
+        ] {
+            assert!(result.unwrap().is_none());
+        }
+        with_thinking_db(|conn| {
+            insert_bounded_fixture(conn, "5", &pack_thought(&"z".repeat(20_000)));
+            insert_bounded_fixture(conn, "6", &pack_thought(&"z".repeat(20_000)));
+            Ok(())
+        })
+        .unwrap();
+        assert!(load_thinking_records_bounded("budget", 2, 256)
+            .unwrap()
+            .is_empty());
+        assert_eq!(get_thinking_records_count().unwrap(), 7);
+        assert_eq!(
+            load_thinking_by_fingerprint("budget", "5")
+                .unwrap()
+                .unwrap()
+                .thought
+                .len(),
+            20_000
+        );
+    }
+
+    fn identity_fixture(
+        fp: &str,
+        ids: &[&str],
+        signature: Option<&str>,
+    ) -> crate::proxy::thinking_store::ThinkingRecord {
+        crate::proxy::thinking_store::ThinkingRecord {
+            persisted_id: Arc::default(),
+            fingerprint: fp.into(),
+            thought: "reasoning".into(),
+            signature: signature.map(str::to_string),
+            tool_ids: ids.iter().map(|s| s.to_string()).collect(),
+            tool_names: vec![],
+            visible: fp.into(),
+        }
+    }
+
+    #[test]
+    fn bounded_identity_tool_level_uses_oldest_across_all_candidates() {
+        let _dir = TestDataDir::new();
+        for (key, old_ids, incoming_ids) in [
+            ("secondary", vec!["y", "x"], vec!["x"]),
+            ("multiple", vec!["y"], vec!["x", "y"]),
+        ] {
+            let first =
+                save_thinking_record_with_id(key, &identity_fixture("a", &old_ids, None), None)
+                    .unwrap()
+                    .unwrap();
+            let last =
+                save_thinking_record_with_id(key, &identity_fixture("b", &["x"], None), None)
+                    .unwrap()
+                    .unwrap();
+            let incoming = identity_fixture("unmatched", &incoming_ids, None);
+            assert_eq!(
+                find_thinking_record_id(key, &incoming, &Default::default()).unwrap(),
+                Some(first),
+                "{key}"
+            );
+            assert_eq!(
+                find_thinking_record_id(key, &incoming, &[first].into()).unwrap(),
+                Some(last),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_identity_tool_ids_are_exact_json_values() {
+        let _dir = TestDataDir::new();
+        for (key, candidate, actual) in [
+            ("percent", "call_%", "call_abc"),
+            ("underscore", "call_x", "callax"),
+            ("quoted", "call_\"quoted", "call_\"quoted"),
+            ("backslash", "call_\\path", "call_\\path"),
+        ] {
+            let saved = save_thinking_record_with_id(
+                key,
+                &identity_fixture("a", &["primary", actual], None),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+            let incoming = identity_fixture("unmatched", &[candidate], None);
+            assert_eq!(
+                find_thinking_record_id(key, &incoming, &Default::default()).unwrap(),
+                (candidate == actual).then_some(saved),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_identity_signature_level_uses_oldest_equivalent_encoding() {
+        use base64::Engine;
+        let _dir = TestDataDir::new();
+        let raw = base64::engine::general_purpose::STANDARD
+            .encode("claude-signature-with-enough-payload-for-tests");
+        let wrapped = crate::proxy::thinking_store::ensure_google_claude_thought_signature(&raw);
+        assert_ne!(raw, wrapped);
+        let proto = format!("\u{12}{}", "signature-payload".repeat(3));
+        let healed = normalize_and_heal_signature(&proto).unwrap();
+        for (key, old_sig, new_sig) in [
+            ("old-wrapped", &wrapped, &raw),
+            ("old-raw", &raw, &wrapped),
+            ("old-healed", &healed, &proto),
+        ] {
+            let first =
+                save_thinking_record_with_id(key, &identity_fixture("a", &[], Some(old_sig)), None)
+                    .unwrap()
+                    .unwrap();
+            let last =
+                save_thinking_record_with_id(key, &identity_fixture("b", &[], Some(new_sig)), None)
+                    .unwrap()
+                    .unwrap();
+            // legacy 原始 protobuf 行绕过保存时的自愈，验证等价候选之间的历史顺序。
+            with_thinking_db(|conn| {
+                conn.execute(
+                    "UPDATE thinking_records SET signature = ?1 WHERE id = ?2",
+                    params![new_sig, last],
+                )
+                .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .unwrap();
+            let incoming = identity_fixture("unmatched", &[], Some(new_sig));
+            assert_eq!(
+                find_thinking_record_id(key, &incoming, &Default::default()).unwrap(),
+                Some(first),
+                "{key}"
+            );
+            assert_eq!(
+                find_thinking_record_id(key, &incoming, &[first].into()).unwrap(),
+                Some(last),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_capture_length_comparison_preserves_decode_fallback_and_read_limit() {
+        for raw in [b"RAW1long thought".as_slice(), b"long thought".as_slice()] {
+            assert!(thought_exceeds_capture_length(raw, 4));
+            assert!(!thought_exceeds_capture_length(raw, "long thought".len()));
+        }
+        assert!(thought_exceeds_capture_length(b"RAW1\xff", 2));
+        assert!(!thought_exceeds_capture_length(b"RAW1\xff", 3));
+        let mut gzip = pack_thought(&"a".repeat(2_000));
+        assert!(gzip.starts_with(THOUGHT_GZIP_MAGIC));
+        assert!(thought_exceeds_capture_length(&gzip, 5));
+        assert!(!thought_exceeds_capture_length(&gzip, 2_000));
+        *gzip.last_mut().unwrap() ^= 1;
+        // 输出先超预算时保守保留，不为验证尾部继续读取。
+        assert!(thought_exceeds_capture_length(&gzip, 5));
+        // 预算内已观察到损坏时沿用原始字节 fallback，不能直接判为更长。
+        assert!(!thought_exceeds_capture_length(&gzip, 2_000));
+        assert!(!thought_exceeds_capture_length(b"AGZ1invalid gzip", 64));
+        assert!(thought_exceeds_capture_length(b"AGZ1invalid gzip", 3));
+    }
+
+    #[test]
+    fn bounded_prune_snapshot_rejects_external_updates_and_connection_rebuilds() {
+        let _dir = TestDataDir::new();
+        with_thinking_db(|conn| {
+            for fp in ["0", "1", "2"] {
+                insert_bounded_fixture(conn, fp, b"RAW1old");
+            }
+            Ok(())
+        })
+        .unwrap();
+        let token = thinking_db_snapshot().unwrap();
+        let external = Connection::open(get_thinking_db_path().unwrap()).unwrap();
+        external.execute("UPDATE thinking_records SET thought = X'524157316E6577' WHERE session_key = 'budget' AND fingerprint = '2'", []).unwrap();
+        let after_update = thinking_db_snapshot().unwrap();
+        assert_eq!(token.total_changes, after_update.total_changes);
+        assert_ne!(token.data_version, after_update.data_version);
+        assert!(
+            prune_thinking_records_if_unchanged("budget", &["1".into(), "2".into()], token)
+                .unwrap()
+                .is_none()
+        );
+        drop(external);
+        let before_rebuild = thinking_db_snapshot().unwrap();
+        {
+            let _other_dir = TestDataDir::new();
+            thinking_db_snapshot().unwrap();
+        }
+        let rebuilt = thinking_db_snapshot().unwrap();
+        assert_ne!(before_rebuild.generation, rebuilt.generation);
+        assert!(prune_thinking_records_if_unchanged(
+            "budget",
+            &["1".into(), "2".into()],
+            before_rebuild
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(get_thinking_records_count().unwrap(), 3);
+        let valid = thinking_db_snapshot().unwrap();
+        assert_eq!(
+            prune_thinking_records_if_unchanged("budget", &["1".into(), "2".into()], valid)
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn bounded_decoding_rejects_gzip_raw_legacy_and_lossy_expansion() {
+        let mut source = std::io::Cursor::new(vec![0u8; 50_000]);
+        let (decoded, result) = read_thought_bytes(&mut source, 64);
+        assert!(result.is_ok());
+        assert_eq!(source.position(), 65);
+        assert_eq!(decoded.len(), 65);
+        let compressed = pack_thought(&"a".repeat(50_000));
+        assert!(compressed.starts_with(THOUGHT_GZIP_MAGIC));
+        assert!(unpack_thought_bounded(&compressed, 64).is_none());
+        assert_eq!(
+            unpack_thought_bounded(&compressed, 50_000).unwrap().len(),
+            50_000
+        );
+        assert!(unpack_thought_bounded(b"RAW1abcde", 4).is_none());
+        assert!(unpack_thought_bounded(b"abcde", 4).is_none());
+        for bytes in [&b"RAW1\xff\xff"[..], &b"\xff\xff"[..]] {
+            assert!(unpack_thought_bounded(bytes, 5).is_none());
+            assert_eq!(unpack_thought_bounded(bytes, 6).unwrap(), "��");
+        }
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&[0xff; 30]).unwrap();
+        let mut invalid_utf8_gzip = THOUGHT_GZIP_MAGIC.to_vec();
+        invalid_utf8_gzip.extend(encoder.finish().unwrap());
+        assert!(unpack_thought_bounded(&invalid_utf8_gzip, 64).is_none());
+        assert_eq!(
+            unpack_thought_bounded(&invalid_utf8_gzip, 90)
+                .unwrap()
+                .len(),
+            90
+        );
+    }
+
+    #[test]
+    fn bounded_rows_reject_large_auxiliary_fields_without_deleting_history() {
+        let _dir = TestDataDir::new();
+        with_thinking_db(|conn| {
+            for (idx, column) in [
+                "fingerprint",
+                "signature",
+                "tool_ids",
+                "tool_names",
+                "visible",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let fp = idx.to_string();
+                insert_bounded_fixture(conn, &fp, b"RAW1x");
+                conn.execute(
+                    &format!(
+                        "UPDATE thinking_records SET {column} = ?1 WHERE primary_tool_id = ?2"
+                    ),
+                    params!["x".repeat(1024), fp],
+                )
+                .unwrap();
+            }
+            insert_bounded_fixture(conn, "legacy", b"x");
+            conn.execute(
+                "UPDATE thinking_records SET thought = ?1 WHERE primary_tool_id = 'legacy'",
+                ["x".repeat(1024)],
+            )
+            .unwrap();
+            insert_bounded_fixture(conn, "raw", &pack_thought(&"x".repeat(100)));
+            Ok(())
+        })
+        .unwrap();
+        assert!(load_thinking_records_bounded("budget", 7, 64)
+            .unwrap()
+            .is_empty());
+        for fp in ["0", "1", "2", "3", "4", "legacy", "raw"] {
+            assert!(load_thinking_by_tool_id_bounded("budget", fp, 64)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(get_thinking_records_count().unwrap(), 7);
+    }
 
     #[test]
     fn test_thinking_record_deduplication_and_penetration_lookup() {

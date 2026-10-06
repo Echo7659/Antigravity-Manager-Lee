@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const MIN_SIGNATURE_LENGTH: usize = 32;
@@ -25,7 +25,7 @@ const MAX_SESSIONS: usize = 2000;
 fn max_turns_per_session() -> usize {
     crate::proxy::config::get_thinking_max_memory_turns()
 }
-const MAX_BYTES_PER_SESSION: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_BYTES_PER_SESSION: usize = 64 * 1024 * 1024;
 /// Persist last_accessed at most this often. Fill/hydrate is memory-only between writes.
 const TOUCH_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -80,6 +80,8 @@ pub fn any_model_forces_server_thinking(models: &[&str]) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct ThinkingRecord {
+    /// 此不可变记录版本对应的持久行身份；尚未确认时为空，不参与内容匹配。
+    pub(crate) persisted_id: Arc<OnceLock<i64>>,
     pub fingerprint: String,
     pub thought: String,
     pub signature: Option<String>,
@@ -89,6 +91,32 @@ pub struct ThinkingRecord {
     pub visible: String,
 }
 
+impl PartialEq for ThinkingRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+            && self.thought == other.thought
+            && self.signature == other.signature
+            && self.tool_ids == other.tool_ids
+            && self.tool_names == other.tool_names
+            && self.visible == other.visible
+    }
+}
+impl Eq for ThinkingRecord {}
+
+impl ThinkingRecord {
+    fn from_persisted(rec: crate::modules::proxy_db::PersistedThinkingRecord) -> Self {
+        Self {
+            persisted_id: Arc::new(OnceLock::from(rec.id)),
+            fingerprint: rec.fingerprint,
+            thought: rec.thought,
+            signature: rec.signature,
+            tool_ids: rec.tool_ids,
+            tool_names: rec.tool_names,
+            visible: rec.visible,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct SessionEntry {
     turns: Vec<Arc<ThinkingRecord>>,
@@ -96,9 +124,48 @@ struct SessionEntry {
     last_persist_touch: Instant,
     bytes: usize,
     l2_loaded: bool,
+    /// 只有已证实完整且未因预算丢弃历史的缓存才能驱动数据库 prune。
+    history_complete: bool,
 }
 
 impl SessionEntry {
+    /// 内容预算只计算 thought、signature 和 visible，不表示进程 RSS 上限。
+    fn trim(&mut self, max_turns: usize, max_bytes: usize) {
+        let mut bytes = 0usize;
+        let mut kept = Vec::new();
+        let before = self.turns.len();
+        for rec in self.turns.drain(..).rev() {
+            let size = record_bytes(&rec);
+            if kept.len() < max_turns && size <= max_bytes.saturating_sub(bytes) {
+                bytes += size;
+                kept.push(rec);
+            }
+        }
+        kept.reverse();
+        self.turns = kept;
+        self.bytes = bytes;
+        if self.turns.len() < before {
+            self.history_complete = false;
+            tracing::debug!(
+                dropped = before - self.turns.len(),
+                "[ThinkingStore] Trimmed RAM records to session budget"
+            );
+        }
+    }
+
+    /// 快照索引可能漂移；内容相等的替代快照还必须绑定同一持久行。
+    fn upgrade(&mut self, expected: &Arc<ThinkingRecord>, rec: &ThinkingRecord) {
+        if let Some(current) = self.turns.iter_mut().find(|current| {
+            Arc::ptr_eq(current, expected)
+                || (current.as_ref() == expected.as_ref()
+                    && current.persisted_id.get() == expected.persisted_id.get())
+        }) {
+            if is_stronger_record(rec, current) {
+                *current = Arc::new(rec.clone());
+            }
+        }
+    }
+
     fn new() -> Self {
         Self {
             turns: Vec::new(),
@@ -106,18 +173,34 @@ impl SessionEntry {
             last_persist_touch: Instant::now(),
             bytes: 0,
             l2_loaded: false,
+            history_complete: false,
         }
     }
 }
 
 pub struct ThinkingStore {
     sessions: DashMap<String, SessionEntry>,
+    /// 只串行化 session 接纳与淘汰；持锁期间不得进行数据库访问。
+    admission: Mutex<()>,
+    #[cfg(test)]
+    test_limits: Option<(usize, usize, usize)>,
+    #[cfg(test)]
+    before_prune_delete: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_record_save: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl ThinkingStore {
     fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            admission: Mutex::new(()),
+            #[cfg(test)]
+            test_limits: None,
+            #[cfg(test)]
+            before_prune_delete: Mutex::new(None),
+            #[cfg(test)]
+            before_record_save: Mutex::new(None),
         }
     }
 
@@ -126,28 +209,44 @@ impl ThinkingStore {
         INSTANCE.get_or_init(ThinkingStore::new)
     }
 
-    fn maybe_evict(&self, keep_key: &str) {
-        if self.sessions.len() <= MAX_SESSIONS {
-            return;
+    fn limits(&self) -> (usize, usize, usize) {
+        #[cfg(test)]
+        if let Some(limits) = self.test_limits {
+            return limits;
         }
-        self.sessions
-            .retain(|_, e| e.last_access.elapsed() < idle_ttl());
-        if self.sessions.len() <= MAX_SESSIONS {
-            return;
-        }
-        if let Some(oldest_key) = self
-            .sessions
-            .iter()
-            .min_by_key(|e| e.last_access)
-            .map(|e| e.key().clone())
-        {
-            if oldest_key != keep_key {
-                self.sessions.remove(&oldest_key);
-            }
-        }
+        (max_turns_per_session(), MAX_BYTES_PER_SESSION, MAX_SESSIONS)
     }
 
-    pub fn record(&self, store_key: &str, rec: ThinkingRecord) {
+    /// 调用者进入前必须释放全部 DashMap guard，闭包只负责 RAM 修改。
+    fn with_session<R>(&self, store_key: &str, update: impl FnOnce(&mut SessionEntry) -> R) -> R {
+        let _admission = self.admission.lock().unwrap_or_else(|e| e.into_inner());
+        let (_, _, max_sessions) = self.limits();
+        if !self.sessions.contains_key(store_key) {
+            if self.sessions.len() >= max_sessions {
+                self.sessions
+                    .retain(|_, e| e.last_access.elapsed() < idle_ttl());
+            }
+            while self.sessions.len() >= max_sessions {
+                let oldest = self
+                    .sessions
+                    .iter()
+                    .min_by_key(|e| e.last_access)
+                    .map(|e| e.key().clone());
+                if let Some(key) = oldest {
+                    self.sessions.remove(&key);
+                } else {
+                    break;
+                }
+            }
+        }
+        let mut entry = self
+            .sessions
+            .entry(store_key.to_owned())
+            .or_insert_with(SessionEntry::new);
+        update(&mut entry)
+    }
+
+    pub fn record(&self, store_key: &str, mut rec: ThinkingRecord) {
         if !crate::proxy::config::is_thinking_store_enabled() {
             return;
         }
@@ -161,13 +260,9 @@ impl ThinkingStore {
             return;
         }
 
-        let rec_bytes = record_bytes(&rec);
-
-        self.maybe_evict(store_key);
-
-        // Always hydrate L2 before appending. Otherwise the first capture after a
-        // process start can mark l2_loaded=true with only the new turn and permanently
-        // shadow older SQLite history on subsequent hydrate/restore calls.
+        // 新 capture 必须使用独立身份槽，不能继承调用者克隆的旧版本槽。
+        rec.persisted_id = Arc::default();
+        // 新 capture 先恢复有界历史，防止覆盖冷 session 的可恢复窗口。
         let needs_l2 = self
             .sessions
             .get(store_key)
@@ -176,72 +271,62 @@ impl ThinkingStore {
         if needs_l2 {
             let _ = self.load_turns(store_key);
         }
-
-        let persist = {
-            let mut entry = self
-                .sessions
-                .entry(store_key.to_string())
-                .or_insert_with(SessionEntry::new);
+        let (max_turns, max_bytes, _) = self.limits();
+        let persist = self.with_session(store_key, |entry| {
             entry.last_access = Instant::now();
             entry.l2_loaded = true;
-
+            let rec = Arc::new(rec);
             let merge_last = entry
                 .turns
                 .last()
                 .is_some_and(|last| last.fingerprint == rec.fingerprint);
-
             if merge_last {
-                let (stronger, old_text_bytes) = {
-                    let last = entry.turns.last().expect("merge_last");
-                    (
-                        rec.thought.len() >= last.thought.len()
-                            || rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                                > last.signature.as_ref().map(|s| s.len()).unwrap_or(0),
-                        last.thought.len() + last.visible.len(),
-                    )
-                };
-                if stronger {
-                    entry.bytes = entry.bytes.saturating_sub(old_text_bytes);
-                    {
-                        let last_arc = entry.turns.last_mut().expect("merge_last");
-                        *Arc::make_mut(last_arc) = rec;
-                    }
-                    entry.bytes = entry.bytes.saturating_add(rec_bytes);
-                    entry.turns.last().cloned()
-                } else {
-                    None
+                let last = entry.turns.last().expect("merge_last");
+                if rec.thought.len() < last.thought.len() && !is_stronger_record(&rec, last) {
+                    let prior = last.clone();
+                    entry.trim(max_turns, max_bytes);
+                    return (rec, Some(prior));
                 }
+                *entry.turns.last_mut().expect("merge_last") = rec.clone();
             } else {
-                entry.turns.push(Arc::new(rec));
-                entry.bytes = entry.bytes.saturating_add(rec_bytes);
-                while entry.turns.len() > max_turns_per_session()
-                    || entry.bytes > MAX_BYTES_PER_SESSION
-                {
-                    if let Some(old) = entry.turns.first() {
-                        let old_bytes = old.thought.len()
-                            + old.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                            + old.visible.len();
-                        entry.bytes = entry.bytes.saturating_sub(old_bytes);
-                    }
-                    if entry.turns.is_empty() {
-                        break;
-                    }
-                    entry.turns.remove(0);
-                }
-                entry.turns.last().cloned()
+                entry.turns.push(rec.clone());
             }
-        };
+            entry.trim(max_turns, max_bytes);
+            // 保存本次记录，不从裁剪后的缓存反推需要持久化的记录。
+            (rec, None)
+        });
 
-        if let Some(saved) = persist {
-            let _ = crate::modules::proxy_db::save_thinking_record(
-                store_key,
-                &saved.fingerprint,
-                &saved.thought,
-                saved.signature.as_deref(),
-                &saved.tool_ids,
-                &saved.tool_names,
-                &saved.visible,
-            );
+        let (saved, weak_prior) = persist;
+        #[cfg(test)]
+        {
+            let hook = self.before_record_save.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let result = if weak_prior.is_some() {
+            crate::modules::proxy_db::save_thinking_capture_unless_weaker(store_key, &saved)
+        } else {
+            crate::modules::proxy_db::save_thinking_record_with_id(store_key, &saved, None)
+        };
+        if let Ok(Some(id)) = result {
+            let _ = saved.persisted_id.set(id);
+            if let Some(prior) = weak_prior {
+                // 条件保存成功后只更新原缓存版本，不能覆盖并发写入的新尾记录。
+                if let Some(mut entry) = self.sessions.get_mut(store_key) {
+                    let same_tail = entry
+                        .turns
+                        .last()
+                        .is_some_and(|last| Arc::ptr_eq(last, &prior));
+                    if same_tail {
+                        *entry.turns.last_mut().expect("matched prior") = saved;
+                        entry.trim(max_turns, max_bytes);
+                    }
+                    if !same_tail || prior.persisted_id.get() != Some(&id) {
+                        entry.history_complete = false;
+                    }
+                }
+            }
         }
     }
 
@@ -265,54 +350,75 @@ impl ThinkingStore {
     }
 
     fn load_turns(&self, store_key: &str) -> Vec<Arc<ThinkingRecord>> {
-        if let Some(e) = self.sessions.get(store_key) {
-            // Trust warm non-empty memory. An empty l2_loaded entry is treated as
-            // stale (e.g. first hydrate before any capture) and reloads from SQLite.
-            if e.l2_loaded && !e.turns.is_empty() {
-                let turns = e.turns.clone();
-                drop(e);
-                if let Some(mut entry) = self.sessions.get_mut(store_key) {
-                    entry.last_access = Instant::now();
+        let (max_turns, max_bytes, _) = self.limits();
+        if let Some(mut entry) = self.sessions.get_mut(store_key) {
+            // 空缓存允许重新加载，保证先 hydrate 后 capture 的记录可见。
+            if entry.l2_loaded && !entry.turns.is_empty() {
+                if entry.turns.len() > max_turns || entry.bytes > max_bytes {
+                    entry.trim(max_turns, max_bytes);
                 }
-                return turns;
+                entry.last_access = Instant::now();
+                return entry.turns.clone();
             }
         }
 
-        let persisted =
-            crate::modules::proxy_db::load_thinking_records(store_key).unwrap_or_default();
-        let loaded_len = persisted.len();
-        let mut entry = self
-            .sessions
-            .entry(store_key.to_string())
-            .or_insert_with(SessionEntry::new);
-        if entry.turns.is_empty() && !persisted.is_empty() {
-            for p in persisted {
-                let rec = ThinkingRecord {
-                    fingerprint: p.fingerprint,
-                    thought: p.thought,
-                    signature: p.signature,
-                    tool_ids: p.tool_ids,
-                    tool_names: p.tool_names,
-                    visible: p.visible,
-                };
-                entry.bytes += record_bytes(&rec);
-                entry.turns.push(Arc::new(rec));
+        let persisted = crate::modules::proxy_db::load_thinking_history_bounded(
+            store_key, max_turns, max_bytes,
+        )
+        .unwrap_or_default();
+        let loaded_len = persisted.records.len();
+        let turns = self.with_session(store_key, |entry| {
+            let hydrated = entry.turns.is_empty() && !persisted.records.is_empty();
+            if entry.turns.is_empty() {
+                entry.history_complete = persisted.complete;
+                entry.turns.extend(
+                    persisted
+                        .records
+                        .into_iter()
+                        .map(|p| Arc::new(ThinkingRecord::from_persisted(p))),
+                );
             }
-            tracing::info!(
-                "[ThinkingStore] Restored {} turns from SQLite L2 for session {}",
-                entry.turns.len(),
-                store_key
-            );
-        }
-        entry.l2_loaded = true;
-        entry.last_access = Instant::now();
-        entry.last_persist_touch = Instant::now();
-        let turns = entry.turns.clone();
-        drop(entry);
+            entry.trim(max_turns, max_bytes);
+            if hydrated {
+                tracing::info!(
+                    "[ThinkingStore] Restored {} turns from SQLite L2 for session {}",
+                    entry.turns.len(),
+                    store_key
+                );
+            }
+            entry.l2_loaded = true;
+            entry.last_access = Instant::now();
+            entry.last_persist_touch = Instant::now();
+            entry.turns.clone()
+        });
+
         if loaded_len > 0 {
             let _ = crate::modules::proxy_db::touch_thinking_session(store_key);
         }
         turns
+    }
+
+    fn apply_ingest_upgrade(
+        &self,
+        store_key: &str,
+        prior: &Arc<ThinkingRecord>,
+        mut rec: ThinkingRecord,
+        id: Option<i64>,
+    ) -> Option<i64> {
+        rec.persisted_id = Arc::default();
+        let (max_turns, max_bytes, _) = self.limits();
+        if let Some(mut entry) = self.sessions.get_mut(store_key) {
+            entry.upgrade(prior, &rec);
+            entry.trim(max_turns, max_bytes);
+        }
+        // 新版本使用独立身份槽；保存被拒绝时保留原行身份用于后续历史匹配。
+        let saved_id = crate::modules::proxy_db::save_thinking_record_with_id(store_key, &rec, id)
+            .ok()
+            .flatten();
+        if let Some(known_id) = saved_id.or(id) {
+            let _ = rec.persisted_id.set(known_id);
+        }
+        saved_id
     }
 
     /// Capture real thinking from the inbound request without re-appending
@@ -351,47 +457,75 @@ impl ThinkingStore {
         }
 
         let existing = self.load_turns(store_key);
+        let complete = self
+            .sessions
+            .get(store_key)
+            .is_some_and(|entry| entry.history_complete);
         let mut used = vec![false; existing.len()];
+        let mut used_ids = std::collections::HashSet::new();
         let mut to_append = Vec::new();
-        let mut to_upgrade: Vec<(usize, ThinkingRecord)> = Vec::new();
+        let (_, max_bytes, _) = self.limits();
 
         for rec in incoming {
-            if let Some(idx) = match_existing_record(&rec, &existing, &used) {
+            // 部分历史中的相同签名也可能属于多轮，只有完整快照可直接按 RAM 顺序匹配。
+            let ram_match = complete
+                .then(|| match_existing_record(&rec, &existing, &used))
+                .flatten();
+            if let Some(idx) = ram_match {
                 used[idx] = true;
-                if is_stronger_record(&rec, &existing[idx]) {
-                    to_upgrade.push((idx, rec));
+                let prior = existing[idx].clone();
+                let id = match prior.persisted_id.get().copied() {
+                    Some(id) => Some(id),
+                    None => match crate::modules::proxy_db::find_thinking_record_id(
+                        store_key, &prior, &used_ids,
+                    ) {
+                        Ok(id) => id,
+                        Err(_) => continue,
+                    },
+                };
+                if let Some(id) = id {
+                    used_ids.insert(id);
+                }
+                if is_stronger_record(&rec, &prior) {
+                    if let Some(saved_id) = self.apply_ingest_upgrade(store_key, &prior, rec, id) {
+                        used_ids.insert(saved_id);
+                    }
                 }
             } else {
-                to_append.push(rec);
-            }
-        }
-
-        if !to_upgrade.is_empty() {
-            if let Some(mut entry) = self.sessions.get_mut(store_key) {
-                for (idx, rec) in &to_upgrade {
-                    if *idx >= entry.turns.len() {
-                        continue;
+                // 缓存缺失不代表新轮次；先查询有界身份，避免重追加窗口外历史。
+                match crate::modules::proxy_db::find_thinking_record_id(store_key, &rec, &used_ids)
+                {
+                    Ok(Some(id)) => {
+                        used_ids.insert(id);
+                        let prior = if let Some(idx) =
+                            existing.iter().enumerate().find_map(|(idx, old)| {
+                                (!used[idx] && old.persisted_id.get() == Some(&id)).then_some(idx)
+                            }) {
+                            used[idx] = true;
+                            Some(existing[idx].clone())
+                        } else {
+                            crate::modules::proxy_db::load_thinking_by_id_bounded(
+                                store_key, id, max_bytes,
+                            )
+                            .ok()
+                            .flatten()
+                            .map(|prior| Arc::new(ThinkingRecord::from_persisted(prior)))
+                        };
+                        // 无法有界解码的既有历史不追加，也不凭压缩长度推断 stronger。
+                        if let Some(prior) = prior {
+                            if is_stronger_record(&rec, &prior) {
+                                if let Some(saved_id) =
+                                    self.apply_ingest_upgrade(store_key, &prior, rec, Some(id))
+                                {
+                                    used_ids.insert(saved_id);
+                                }
+                            }
+                        }
                     }
-                    let new_bytes = record_bytes(rec);
-                    let old_bytes = record_bytes(&entry.turns[*idx]);
-                    entry.bytes = entry
-                        .bytes
-                        .saturating_sub(old_bytes)
-                        .saturating_add(new_bytes);
-                    *Arc::make_mut(&mut entry.turns[*idx]) = rec.clone();
-                }
-            }
-            if let Some((idx, rec)) = to_upgrade.last() {
-                if *idx + 1 == existing.len() {
-                    let _ = crate::modules::proxy_db::save_thinking_record(
-                        store_key,
-                        &rec.fingerprint,
-                        &rec.thought,
-                        rec.signature.as_deref(),
-                        &rec.tool_ids,
-                        &rec.tool_names,
-                        &rec.visible,
-                    );
+                    Ok(None) => to_append.push(rec),
+                    Err(_) => tracing::debug!(
+                        "[ThinkingStore] Deferred ingest after identity lookup failure"
+                    ),
                 }
             }
         }
@@ -667,7 +801,15 @@ impl ThinkingStore {
 
         // Phase 3.5: L2 SQLite 精准穿透回捞 (针对超过内存容量淘汰或冷启动的历史轮次)
         // 核心原则：淘汰轮次绝不盲目降级占位符！优先通过 signature / tool_id / fingerprint 从 SQLite 索引中精准回捞
+        // 初始快照与点查补充各受单 session 预算限制；瞬时内容可接近两份预算。
+        let (max_turns, max_bytes, _) = self.limits();
+        let mut supplemental_turns = 0;
+        let mut supplemental_bytes = 0;
         for turn in model_turns.iter_mut() {
+            if supplemental_turns >= max_turns || supplemental_bytes >= max_bytes {
+                break;
+            }
+            let remaining = max_bytes - supplemental_bytes;
             if turn.already_complete || turn.matched_record_idx.is_some() {
                 continue;
             }
@@ -676,14 +818,16 @@ impl ThinkingStore {
 
             // 0. 优先按签名精准穿透
             if let Some(ref sig) = turn.existing_sig {
-                let mut found =
-                    crate::modules::proxy_db::load_thinking_by_signature(store_key, sig);
+                let mut found = crate::modules::proxy_db::load_thinking_by_signature_bounded(
+                    store_key, sig, remaining,
+                );
                 if found.as_ref().map(|o| o.is_none()).unwrap_or(true) && is_claude_signature(sig) {
                     let google_sig = ensure_google_claude_thought_signature(sig);
                     if google_sig != *sig {
-                        found = crate::modules::proxy_db::load_thinking_by_signature(
+                        found = crate::modules::proxy_db::load_thinking_by_signature_bounded(
                             store_key,
                             &google_sig,
+                            remaining,
                         );
                     }
                 }
@@ -692,14 +836,7 @@ impl ThinkingStore {
                     let rec_has_tools =
                         !persisted.tool_ids.is_empty() || !persisted.tool_names.is_empty();
                     if turn_has_tools == rec_has_tools {
-                        fetched_rec = Some(ThinkingRecord {
-                            fingerprint: persisted.fingerprint,
-                            thought: persisted.thought,
-                            signature: persisted.signature,
-                            tool_ids: persisted.tool_ids,
-                            tool_names: persisted.tool_names,
-                            visible: persisted.visible,
-                        });
+                        fetched_rec = Some(ThinkingRecord::from_persisted(persisted));
                     }
                 }
             }
@@ -708,7 +845,9 @@ impl ThinkingStore {
             if fetched_rec.is_none() && !turn.tool_ids.is_empty() {
                 for id in &turn.tool_ids {
                     if let Ok(Some(persisted)) =
-                        crate::modules::proxy_db::load_thinking_by_tool_id(store_key, id)
+                        crate::modules::proxy_db::load_thinking_by_tool_id_bounded(
+                            store_key, id, remaining,
+                        )
                     {
                         let tool_names_match =
                             if turn.tool_names.is_empty() || persisted.tool_names.is_empty() {
@@ -717,14 +856,7 @@ impl ThinkingStore {
                                 turn.tool_names == persisted.tool_names
                             };
                         if tool_names_match {
-                            fetched_rec = Some(ThinkingRecord {
-                                fingerprint: persisted.fingerprint,
-                                thought: persisted.thought,
-                                signature: persisted.signature,
-                                tool_ids: persisted.tool_ids,
-                                tool_names: persisted.tool_names,
-                                visible: persisted.visible,
-                            });
+                            fetched_rec = Some(ThinkingRecord::from_persisted(persisted));
                             break;
                         }
                     }
@@ -735,20 +867,17 @@ impl ThinkingStore {
                     turn.fp = fingerprint(&turn.visible, &turn.tool_ids, &turn.tool_names);
                 }
                 if let Ok(Some(persisted)) =
-                    crate::modules::proxy_db::load_thinking_by_fingerprint(store_key, &turn.fp)
+                    crate::modules::proxy_db::load_thinking_by_fingerprint_bounded(
+                        store_key, &turn.fp, remaining,
+                    )
                 {
-                    fetched_rec = Some(ThinkingRecord {
-                        fingerprint: persisted.fingerprint,
-                        thought: persisted.thought,
-                        signature: persisted.signature,
-                        tool_ids: persisted.tool_ids,
-                        tool_names: persisted.tool_names,
-                        visible: persisted.visible,
-                    });
+                    fetched_rec = Some(ThinkingRecord::from_persisted(persisted));
                 }
             }
 
             if let Some(rec) = fetched_rec {
+                supplemental_turns += 1;
+                supplemental_bytes += record_bytes(&rec);
                 let rec_arc = Arc::new(rec);
                 records.push(rec_arc.clone());
                 used.push(true);
@@ -756,8 +885,10 @@ impl ThinkingStore {
                 turn.matched_record_idx = Some(new_idx);
                 // 同步注册回内存会话实体，确保后续轮次无需重复点查
                 if let Some(mut entry) = self.sessions.get_mut(store_key) {
-                    entry.bytes = entry.bytes.saturating_add(record_bytes(&rec_arc));
-                    entry.turns.push(rec_arc);
+                    // 点查补充属于冷窗口之外的历史，不能挤掉较新的缓存记录。
+                    entry.history_complete = false;
+                    entry.turns.insert(0, rec_arc);
+                    entry.trim(max_turns, max_bytes);
                 }
             }
         }
@@ -995,6 +1126,13 @@ impl ThinkingStore {
                     if is_foreign {
                         purged_count += 1;
                         let mut cleaned = (**rec).clone();
+                        cleaned.persisted_id = Arc::new(
+                            rec.persisted_id
+                                .get()
+                                .copied()
+                                .map(OnceLock::from)
+                                .unwrap_or_default(),
+                        );
                         cleaned.signature = None;
                         new_turns.push(Arc::new(cleaned));
                         continue;
@@ -1003,6 +1141,8 @@ impl ThinkingStore {
                 new_turns.push(rec.clone());
             }
             entry.turns = new_turns;
+            let (max_turns, max_bytes, _) = self.limits();
+            entry.trim(max_turns, max_bytes);
         }
 
         // 2. 精准净化持久化数据库 (SQLite)
@@ -1080,6 +1220,15 @@ impl ThinkingStore {
             }
         }
 
+        let may_prune_db = self
+            .sessions
+            .get(store_key)
+            .is_some_and(|entry| entry.history_complete);
+        let db_snapshot = if may_prune_db {
+            crate::modules::proxy_db::thinking_db_snapshot().ok()
+        } else {
+            None
+        };
         let keep_fps = {
             let Some(mut entry) = self.sessions.get_mut(store_key) else {
                 return;
@@ -1096,6 +1245,7 @@ impl ThinkingStore {
             let total = entry.turns.len();
             let keep_tail_start = total.saturating_sub(2);
             let mut keep: Vec<Arc<ThinkingRecord>> = Vec::new();
+            let mut dropped_fps = std::collections::HashSet::new();
             for (i, rec) in entry.turns.iter().enumerate() {
                 let matched_sig = rec
                     .signature
@@ -1111,6 +1261,8 @@ impl ThinkingStore {
                 if matched_sig || matched_tool || matched_fp || matched_text || i >= keep_tail_start
                 {
                     keep.push(rec.clone());
+                } else {
+                    dropped_fps.insert(rec.fingerprint.clone());
                 }
             }
 
@@ -1121,19 +1273,42 @@ impl ThinkingStore {
             let dropped = entry.turns.len() - keep.len();
             entry.bytes = keep.iter().map(|r| record_bytes(r)).sum();
             let fps: Vec<String> = keep.iter().map(|r| r.fingerprint.clone()).collect();
+            let can_prune_db = entry.history_complete && db_snapshot.is_some();
+            // delete-except 会保留同指纹的旧行，RAM 不再包含这些行时失去完整性。
+            if fps.iter().any(|fp| dropped_fps.contains(fp)) {
+                entry.history_complete = false;
+            }
             entry.turns = keep;
             tracing::info!(
                 "[ThinkingStore] Pruned {} orphaned thinking record(s) after context compression for session {}",
                 dropped,
                 store_key
             );
-            fps
+            can_prune_db.then_some(fps)
         };
 
-        // Delete orphans by fingerprint. Never DELETE+re-INSERT the kept blobs.
-        let _ = crate::modules::proxy_db::delete_thinking_records_except_fingerprints(
-            store_key, &keep_fps,
-        );
+        // 部分缓存只裁剪 RAM，持久历史由既有 retention 或显式结束会话清理。
+        if let Some(keep_fps) = keep_fps {
+            #[cfg(test)]
+            {
+                let hook = self.before_prune_delete.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+            }
+            if !matches!(
+                crate::modules::proxy_db::prune_thinking_records_if_unchanged(
+                    store_key,
+                    &keep_fps,
+                    db_snapshot.expect("complete snapshot"),
+                ),
+                Ok(Some(_))
+            ) {
+                if let Some(mut entry) = self.sessions.get_mut(store_key) {
+                    entry.history_complete = false;
+                }
+            }
+        }
     }
 
     pub fn session_stats(&self, store_key: &str) -> Option<(usize, usize)> {
@@ -1336,6 +1511,7 @@ impl TurnAccumulator {
     fn into_record(self) -> ThinkingRecord {
         let fp = fingerprint(&self.visible, &self.tool_ids, &self.tool_names);
         ThinkingRecord {
+            persisted_id: Arc::default(),
             fingerprint: fp,
             thought: self.thought,
             signature: self.signature,
@@ -2899,6 +3075,7 @@ mod tests {
         let hash_hex = format!("{:x}", hasher.finalize());
         let sig = format!("sig_{:0>56}", &hash_hex[..40]);
         ThinkingRecord {
+            persisted_id: Arc::default(),
             fingerprint: fp,
             thought: thought.to_string(),
             signature: Some(sig),
@@ -2906,6 +3083,910 @@ mod tests {
             tool_names,
             visible: visible.to_string(),
         }
+    }
+
+    fn bounded_store(turns: usize, bytes: usize, sessions: usize) -> ThinkingStore {
+        let mut store = ThinkingStore::new();
+        store.test_limits = Some((turns, bytes, sessions));
+        store
+    }
+
+    fn assert_cache_budget(store: &ThinkingStore, key: &str) {
+        let entry = store.sessions.get(key).unwrap();
+        let (turns, bytes, _) = store.limits();
+        assert!(entry.turns.len() <= turns);
+        assert!(entry.bytes <= bytes);
+        assert_eq!(
+            entry.bytes,
+            entry.turns.iter().map(|r| record_bytes(r)).sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn bounded_capture_cold_skipped_latest_does_not_suppress_new_turn() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let writer = ThinkingStore::new();
+        let old = rec("reasoning A with older detail", "answer A", None);
+        let old_signature = old.signature.clone();
+        writer.record("capture-cold", old);
+        writer.record("capture-cold", rec(&"B".repeat(500), "answer B", None));
+        let reader = bounded_store(3, 128, 4);
+        let snapshot = reader.load_turns("capture-cold");
+        assert_eq!(snapshot.len(), 1);
+        assert!(
+            !reader
+                .sessions
+                .get("capture-cold")
+                .unwrap()
+                .history_complete
+        );
+        let new = rec("new A", "answer A", None);
+        let new_signature = new.signature.clone();
+        reader.record("capture-cold", new);
+        let rows = crate::modules::proxy_db::load_thinking_records("capture-cold").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].thought, "reasoning A with older detail");
+        assert_eq!(rows[0].signature, old_signature);
+        assert_eq!(rows[1].thought, "B".repeat(500));
+        assert_eq!(rows[2].thought, "new A");
+        assert_eq!(rows[2].signature, new_signature);
+        let latest = reader.load_turns("capture-cold").last().unwrap().clone();
+        assert_eq!(latest.persisted_id.get(), Some(&rows[2].id));
+        assert_eq!(snapshot[0].persisted_id.get(), Some(&rows[0].id));
+        assert!(!Arc::ptr_eq(
+            &snapshot[0].persisted_id,
+            &latest.persisted_id
+        ));
+    }
+
+    #[test]
+    fn bounded_capture_warm_trim_does_not_suppress_new_turn() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = bounded_store(3, 128, 4);
+        store.record(
+            "capture-warm",
+            rec("reasoning A with older detail", "answer A", None),
+        );
+        store.record("capture-warm", rec(&"B".repeat(500), "answer B", None));
+        assert_eq!(store.load_turns("capture-warm").len(), 1);
+        store.record("capture-warm", rec("new A", "answer A", None));
+        let rows = crate::modules::proxy_db::load_thinking_records("capture-warm").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].thought, "reasoning A with older detail");
+        assert_eq!(rows[1].thought, "B".repeat(500));
+        assert_eq!(rows[2].thought, "new A");
+        assert_eq!(
+            store.load_turns("capture-warm").last().unwrap().thought,
+            "new A"
+        );
+        assert_cache_budget(&store, "capture-warm");
+    }
+
+    #[test]
+    fn bounded_capture_actual_latest_weaker_duplicate_preserves_stronger_record() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = bounded_store(3, 128, 4);
+        let old = rec("reasoning A with older detail", "answer A", None);
+        let signature = old.signature.clone();
+        store.record("capture-latest", old);
+        let before = store.load_turns("capture-latest")[0].clone();
+        store.record("capture-latest", rec("new A", "answer A", None));
+        let rows = crate::modules::proxy_db::load_thinking_records("capture-latest").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].thought, "reasoning A with older detail");
+        assert_eq!(rows[0].signature, signature);
+        assert!(Arc::ptr_eq(&before, &store.load_turns("capture-latest")[0]));
+    }
+
+    #[test]
+    fn bounded_capture_weak_decision_rechecks_concurrent_persistent_changes() {
+        use std::sync::mpsc;
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        for case in [
+            "insert",
+            "shorter",
+            "stronger",
+            "weaker-signature",
+            "cache-change",
+        ] {
+            let store = Arc::new(bounded_store(3, 128, 4));
+            store.record(case, rec("reasoning A with older detail", "answer A", None));
+            let before = store.load_turns(case)[0].clone();
+            let old_id = *before.persisted_id.get().unwrap();
+            let (paused_tx, paused_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            *store.before_record_save.lock().unwrap() = Some(Box::new(move || {
+                paused_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+            let writer = store.clone();
+            let thread =
+                std::thread::spawn(move || writer.record(case, rec("new A", "answer A", None)));
+            paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let changed = match case {
+                "insert" => rec(&"B".repeat(500), "answer B", None),
+                "shorter" => rec("old", "answer A", None),
+                "stronger" => rec(&"A".repeat(500), "answer A", None),
+                "weaker-signature" => {
+                    let mut changed = rec("reasoning A with older detail", "answer A", None);
+                    changed.signature = Some("s".repeat(32));
+                    changed
+                }
+                "cache-change" => rec("C", "answer C", None),
+                _ => unreachable!(),
+            };
+            if case == "cache-change" {
+                store.record(case, changed);
+            } else {
+                crate::modules::proxy_db::save_thinking_record(
+                    case,
+                    &changed.fingerprint,
+                    &changed.thought,
+                    changed.signature.as_deref(),
+                    &changed.tool_ids,
+                    &changed.tool_names,
+                    &changed.visible,
+                )
+                .unwrap();
+            }
+            resume_tx.send(()).unwrap();
+            thread.join().unwrap();
+            let rows = crate::modules::proxy_db::load_thinking_records(case).unwrap();
+            let new_turn = matches!(case, "insert" | "cache-change");
+            assert_eq!(rows.len(), if new_turn { 3 } else { 1 }, "{case}");
+            assert_eq!(rows[0].id, old_id, "{case}");
+            assert_eq!(before.persisted_id.get(), Some(&old_id), "{case}");
+            assert_eq!(before.thought, "reasoning A with older detail", "{case}");
+            let latest = rows.last().unwrap();
+            assert_eq!(
+                latest.thought,
+                if case == "stronger" {
+                    "A".repeat(500)
+                } else {
+                    "new A".into()
+                },
+                "{case}"
+            );
+            if case == "cache-change" {
+                assert_eq!(store.load_turns(case).last().unwrap().visible, "answer C");
+                assert!(!store.sessions.get(case).unwrap().history_complete);
+            } else if case == "stronger" {
+                assert!(Arc::ptr_eq(&before, &store.load_turns(case)[0]));
+            } else {
+                let cached = store.load_turns(case).last().unwrap().clone();
+                assert_eq!(cached.persisted_id.get(), Some(&latest.id), "{case}");
+                assert!(
+                    !Arc::ptr_eq(&before.persisted_id, &cached.persisted_id),
+                    "{case}"
+                );
+            }
+            assert_cache_budget(&store, case);
+        }
+    }
+
+    #[test]
+    fn bounded_append_merge_purge_and_oversize_persistence() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = bounded_store(2, 180, 4);
+        for i in 0..5 {
+            store.record("bounds", rec("reasoning", &format!("visible{i}"), None));
+        }
+        assert_eq!(store.session_stats("bounds").unwrap().0, 2);
+        for _ in 0..4 {
+            store.record("bounds", rec("longer reasoning", "visible4", None));
+            assert_cache_budget(&store, "bounds");
+        }
+        assert!(store.purge_corrupted_signatures("bounds", "claude-opus-5-5") > 0);
+        assert_cache_budget(&store, "bounds");
+        let oversized = rec(&"Z".repeat(500), "oversized", None);
+        let fp = oversized.fingerprint.clone();
+        store.record("bounds", oversized);
+        assert_cache_budget(&store, "bounds");
+        assert!(store
+            .sessions
+            .get("bounds")
+            .unwrap()
+            .turns
+            .iter()
+            .all(|r| r.fingerprint != fp));
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_by_fingerprint("bounds", &fp)
+                .unwrap()
+                .unwrap()
+                .thought
+                .len(),
+            500
+        );
+    }
+
+    #[test]
+    fn bounded_upgrade_follows_identity_after_snapshot_indices_shift() {
+        let mut entry = SessionEntry::new();
+        let old = Arc::new(rec("old", "answer", None));
+        let unrelated = Arc::new(rec("unrelated", "other", None));
+        entry.turns = vec![unrelated.clone(), old.clone()];
+        entry.trim(1, 256);
+        entry.upgrade(&old, &rec("upgraded reasoning", "answer", None));
+        entry.trim(1, 256);
+        assert_eq!(entry.turns[0].thought, "upgraded reasoning");
+        entry.turns = vec![unrelated.clone()];
+        entry.upgrade(&old, &rec("another upgrade", "answer", None));
+        assert!(Arc::ptr_eq(&entry.turns[0], &unrelated));
+        let newer = Arc::new(rec("newer concurrent reasoning", "answer", None));
+        entry.turns = vec![newer.clone()];
+        entry.upgrade(&old, &rec("stale upgrade", "answer", None));
+        assert!(Arc::ptr_eq(&entry.turns[0], &newer));
+    }
+
+    fn inbound_thinking(visible: &str, thought: &str, signature: &str) -> Value {
+        json!({"role":"model", "parts":[
+            {"thought":true,"text":thought,"thoughtSignature":signature},
+            {"text":visible}
+        ]})
+    }
+
+    #[test]
+    fn bounded_ingest_skipped_latest_does_not_append_historical_upgrade() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let writer = ThinkingStore::new();
+        let a = rec("reasoning A", "answer A", None);
+        let signature = a.signature.clone().unwrap();
+        writer.record("skipped-latest", a);
+        writer.record("skipped-latest", rec(&"B".repeat(500), "answer B", None));
+        let reader = bounded_store(3, 128, 4);
+        reader.ingest_from_contents(
+            "skipped-latest",
+            &[inbound_thinking(
+                "answer A",
+                "reasoning A with more details",
+                &signature,
+            )],
+        );
+        let rows = crate::modules::proxy_db::load_thinking_records("skipped-latest").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].thought, "reasoning A");
+        assert_eq!(rows[1].thought, "B".repeat(500));
+    }
+
+    #[test]
+    fn bounded_ingest_outside_window_is_history_not_new_capture() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let writer = ThinkingStore::new();
+        let a = rec("reasoning A", "answer A", None);
+        let signature = a.signature.clone().unwrap();
+        writer.record("outside-ingest", a);
+        writer.record("outside-ingest", rec("reasoning B", "answer B", None));
+        writer.record("outside-ingest", rec("reasoning C", "answer C", None));
+        let reader = bounded_store(1, 128, 4);
+        reader.ingest_from_contents(
+            "outside-ingest",
+            &[inbound_thinking(
+                "answer A",
+                "reasoning A with more details",
+                &signature,
+            )],
+        );
+        let rows = crate::modules::proxy_db::load_thinking_records("outside-ingest").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].thought, "reasoning A");
+    }
+
+    #[test]
+    fn bounded_ingest_preserves_repeated_turn_occurrences_and_exact_old_identity() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let writer = ThinkingStore::new();
+        let a = rec("old reasoning A", "same answer", None);
+        let sig_a = a.signature.clone().unwrap();
+        let b = rec("old reasoning B", "answer B", None);
+        let sig_b = b.signature.clone().unwrap();
+        writer.record("repeat-ingest", a);
+        writer.record("repeat-ingest", b);
+        let reader = bounded_store(1, 256, 4);
+        reader.ingest_from_contents(
+            "repeat-ingest",
+            &[
+                inbound_thinking("same answer", "old reasoning A", &sig_a),
+                inbound_thinking("answer B", "old reasoning B", &sig_b),
+                inbound_thinking(
+                    "same answer",
+                    "a genuinely new A occurrence",
+                    &"q".repeat(60),
+                ),
+            ],
+        );
+        let rows = crate::modules::proxy_db::load_thinking_records("repeat-ingest").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].thought, "old reasoning A");
+        assert_eq!(rows[1].thought, "old reasoning B");
+        assert_eq!(rows[2].thought, "a genuinely new A occurrence");
+        reader.clear();
+        reader.ingest_from_contents(
+            "repeat-ingest",
+            &[inbound_thinking(
+                "same answer",
+                "old reasoning A with historical detail",
+                &sig_a,
+            )],
+        );
+        let after = crate::modules::proxy_db::load_thinking_records("repeat-ingest").unwrap();
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[2].thought, "a genuinely new A occurrence");
+        assert_eq!(after[0].thought, "old reasoning A");
+    }
+
+    #[test]
+    fn bounded_identity_upgrade_keeps_unpersisted_content_fallback() {
+        let mut entry = SessionEntry::new();
+        let expected = Arc::new(rec("old reasoning", "answer", None));
+        let current = Arc::new(rec("old reasoning", "answer", None));
+        assert!(!Arc::ptr_eq(&current, &expected));
+        assert!(current.persisted_id.get().is_none());
+        assert!(expected.persisted_id.get().is_none());
+        entry.turns.push(current);
+        entry.upgrade(
+            &expected,
+            &rec("new reasoning with more detail", "answer", None),
+        );
+        assert_eq!(entry.turns[0].thought, "new reasoning with more detail");
+    }
+
+    #[test]
+    fn bounded_identity_shared_signature_uses_oldest_unconsumed_turn() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let writer = ThinkingStore::new();
+        let a = rec("reasoning A", "answer A", None);
+        let sig_a = a.signature.clone().unwrap();
+        let b = rec("reasoning B", "answer B", None);
+        let sig_b = b.signature.clone().unwrap();
+        writer.record("shared-signature", a.clone());
+        writer.record("shared-signature", b);
+        writer.record("shared-signature", a);
+        let reader = bounded_store(1, 256, 4);
+        reader.ingest_from_contents(
+            "shared-signature",
+            &[inbound_thinking(
+                "answer A",
+                "historical A with more detail",
+                &sig_a,
+            )],
+        );
+        let rows = crate::modules::proxy_db::load_thinking_records("shared-signature").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].thought, "reasoning A");
+        assert_eq!(rows[2].thought, "reasoning A");
+        assert_eq!(
+            reader.load_turns("shared-signature")[0].thought,
+            "reasoning A"
+        );
+        reader.clear();
+        reader.ingest_from_contents(
+            "shared-signature",
+            &[
+                inbound_thinking("answer A", "historical A with more detail", &sig_a),
+                inbound_thinking("answer B", "reasoning B", &sig_b),
+                inbound_thinking("answer A", "latest A with legitimate extra detail", &sig_a),
+            ],
+        );
+        let rows = crate::modules::proxy_db::load_thinking_records("shared-signature").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].thought, "reasoning A");
+        assert_eq!(rows[2].thought, "latest A with legitimate extra detail");
+    }
+
+    #[test]
+    fn bounded_identity_tool_candidates_do_not_upgrade_newer_history() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        for (key, old_ids, incoming_ids) in [
+            ("secondary-first", vec!["y", "x"], vec!["x"]),
+            ("multi-tool-first", vec!["y"], vec!["x", "y"]),
+        ] {
+            let writer = ThinkingStore::new();
+            let mut a = rec("reasoning A", "answer A", Some(old_ids[0]));
+            a.tool_ids = old_ids.into_iter().map(str::to_string).collect();
+            a.fingerprint = fingerprint(&a.visible, &a.tool_ids, &a.tool_names);
+            a.signature = None;
+            writer.record(key, a);
+            let mut b = rec("reasoning B", "answer B", Some("x"));
+            b.signature = None;
+            writer.record(key, b);
+            let mut parts = vec![json!({"thought":true,"text":"historical A with more detail"})];
+            parts.extend(
+                incoming_ids
+                    .into_iter()
+                    .map(|id| json!({"functionCall":{"name":"shell","id":id,"args":{}}})),
+            );
+            let reader = bounded_store(1, 256, 4);
+            reader.ingest_from_contents(key, &[json!({"role":"model","parts":parts})]);
+            let rows = crate::modules::proxy_db::load_thinking_records(key).unwrap();
+            assert_eq!(rows.len(), 2, "{key}");
+            assert_eq!(rows[0].thought, "reasoning A", "{key}");
+            assert_eq!(rows[1].thought, "reasoning B", "{key}");
+        }
+    }
+
+    #[test]
+    fn bounded_ingest_oversize_history_is_not_recaptured_or_blindly_upgraded() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let writer = ThinkingStore::new();
+        let old = rec(&"old".repeat(200), "old answer", None);
+        let signature = old.signature.clone().unwrap();
+        writer.record("oversize-ingest", old);
+        let reader = bounded_store(2, 128, 4);
+        reader.ingest_from_contents(
+            "oversize-ingest",
+            &[inbound_thinking(
+                "old answer",
+                &"larger".repeat(300),
+                &signature,
+            )],
+        );
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records("oversize-ingest")
+                .unwrap()
+                .len(),
+            1
+        );
+        reader.record(
+            "oversize-ingest",
+            rec(&"new".repeat(300), "new answer", None),
+        );
+        let rows = crate::modules::proxy_db::load_thinking_records("oversize-ingest").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].thought, "old".repeat(200));
+        assert_eq!(rows[1].thought, "new".repeat(300));
+    }
+
+    #[test]
+    fn bounded_record_identity_slots_do_not_leak_across_versions() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = ThinkingStore::new();
+        store.record("version-slots", rec("old A", "answer A", None));
+        let first = store.load_turns("version-slots")[0].clone();
+        let first_id = *first.persisted_id.get().unwrap();
+        let mut metadata_only = (*first).clone();
+        metadata_only.persisted_id = Arc::new(OnceLock::from(999_999));
+        assert_eq!(metadata_only, *first);
+        store.record("version-slots", rec("B", "answer B", None));
+        let mut repeated = (*first).clone();
+        repeated.thought = "new A".into();
+        repeated.signature = Some("q".repeat(60));
+        store.record("version-slots", repeated);
+        let latest = store.load_turns("version-slots").last().unwrap().clone();
+        assert_ne!(latest.persisted_id.get(), Some(&first_id));
+        assert_eq!(first.persisted_id.get(), Some(&first_id));
+        assert!(!Arc::ptr_eq(&first.persisted_id, &latest.persisted_id));
+        let latest_id = *latest.persisted_id.get().unwrap();
+        store.ingest_from_contents(
+            "version-slots",
+            &[inbound_thinking(
+                "answer A",
+                "new A upgraded with detail",
+                &"q".repeat(60),
+            )],
+        );
+        let upgraded = store.load_turns("version-slots").last().unwrap().clone();
+        assert_eq!(upgraded.persisted_id.get(), Some(&latest_id));
+        assert!(!Arc::ptr_eq(&latest.persisted_id, &upgraded.persisted_id));
+        assert_eq!(latest.thought, "new A");
+    }
+
+    #[test]
+    fn bounded_identity_fallback_does_not_claim_an_inflight_capture_slot() {
+        use std::sync::mpsc;
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = Arc::new(ThinkingStore::new());
+        store.record("pending-id", rec("old A", "answer A", None));
+        store.record("pending-id", rec("B", "answer B", None));
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        *store.before_record_save.lock().unwrap() = Some(Box::new(move || {
+            paused_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+        let writer = store.clone();
+        let thread = std::thread::spawn(move || {
+            let mut new_a = rec("new A", "answer A", None);
+            new_a.signature = Some("q".repeat(60));
+            writer.record("pending-id", new_a);
+        });
+        paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let pending = store.load_turns("pending-id").last().unwrap().clone();
+        store.ingest_from_contents(
+            "pending-id",
+            &[inbound_thinking("answer A", "new A", &"q".repeat(60))],
+        );
+        let pending_id = pending.persisted_id.get().copied();
+        resume_tx.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(
+            pending_id.is_none(),
+            "identity lookup must not fill another writer's one-shot slot"
+        );
+        let rows = crate::modules::proxy_db::load_thinking_records("pending-id").unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(pending.persisted_id.get(), Some(&rows[2].id));
+        assert_ne!(pending.persisted_id.get(), Some(&rows[0].id));
+    }
+
+    #[test]
+    fn bounded_ingest_recovers_unfilled_identity_after_save_failure() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = ThinkingStore::new();
+        store.load_turns("failed-save");
+        {
+            let conn = crate::modules::proxy_db::hold_thinking_db_for_test();
+            conn.execute_batch("CREATE TRIGGER reject_capture BEFORE INSERT ON thinking_records BEGIN SELECT RAISE(ABORT, 'test rejection'); END;").unwrap();
+        }
+        let old = rec("old reasoning", "answer", None);
+        let signature = old.signature.clone().unwrap();
+        store.record("failed-save", old);
+        assert!(store.load_turns("failed-save")[0]
+            .persisted_id
+            .get()
+            .is_none());
+        {
+            let conn = crate::modules::proxy_db::hold_thinking_db_for_test();
+            conn.execute_batch("DROP TRIGGER reject_capture;").unwrap();
+        }
+        store.ingest_from_contents(
+            "failed-save",
+            &[inbound_thinking(
+                "answer",
+                "new reasoning with detail",
+                &signature,
+            )],
+        );
+        assert!(store.load_turns("failed-save")[0]
+            .persisted_id
+            .get()
+            .is_some());
+        let rows = crate::modules::proxy_db::load_thinking_records("failed-save").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].thought, "new reasoning with detail");
+    }
+
+    #[test]
+    fn bounded_prune_snapshot_does_not_delete_concurrent_oversize_capture() {
+        use std::sync::mpsc;
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        for update_latest in [false, true] {
+            let store = Arc::new(bounded_store(4, 300, 4));
+            let key = format!("prune-race-{update_latest}");
+            for visible in ["answer A", "answer B", "answer C"] {
+                store.record(&key, rec("reasoning", visible, None));
+            }
+            let (paused_tx, paused_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            *store.before_prune_delete.lock().unwrap() = Some(Box::new(move || {
+                paused_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            }));
+            let prune_store = store.clone();
+            let prune_key = key.clone();
+            let thread =
+                std::thread::spawn(move || prune_store.prune_orphaned_records(&prune_key, &[]));
+            paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let visible = if update_latest {
+                "answer C"
+            } else {
+                "answer D"
+            };
+            store.record(&key, rec(&"oversized".repeat(100), visible, None));
+            resume_tx.send(()).unwrap();
+            thread.join().unwrap();
+            let rows = crate::modules::proxy_db::load_thinking_records(&key).unwrap();
+            assert!(rows
+                .iter()
+                .any(|r| r.visible == visible && r.thought == "oversized".repeat(100)));
+            assert!(
+                rows.iter().any(|r| r.visible == "answer A"),
+                "changed snapshot must skip DB prune, including in-place updates"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_warm_snapshot_applies_current_limits_without_deleting_history() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let mut store = bounded_store(3, 1024, 4);
+        for i in 0..3 {
+            store.record("warm-bounds", rec("reasoning", &format!("answer{i}"), None));
+        }
+        store.test_limits = Some((1, 256, 4));
+        let snapshot = store.load_turns("warm-bounds");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].visible, "answer2");
+        assert_cache_budget(&store, "warm-bounds");
+        assert_eq!(
+            crate::modules::proxy_db::get_thinking_records_count().unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn bounded_ingest_upgrade_is_persisted_even_when_rejected_by_ram() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = bounded_store(3, 128, 4);
+        store.record("upgrade-bounds", rec("old reasoning", "answer", None));
+        let contents = vec![json!({"role":"model", "parts":[
+            {"thought":true,"text":"U".repeat(300),"thoughtSignature":"s".repeat(60)},
+            {"text":"answer"}
+        ]})];
+        store.ingest_from_contents("upgrade-bounds", &contents);
+        assert_cache_budget(&store, "upgrade-bounds");
+        assert_eq!(store.session_stats("upgrade-bounds").unwrap().0, 0);
+        let records = crate::modules::proxy_db::load_thinking_records("upgrade-bounds").unwrap();
+        assert!(records.iter().any(|r| r.thought.len() == 300));
+    }
+
+    #[test]
+    fn bounded_historical_upgrade_preserves_existing_persistence_order() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = ThinkingStore::new();
+        let mut a = rec("reasoning A", "", Some("call_A"));
+        a.signature = Some("s".repeat(60));
+        let mut b = rec("reasoning B", "", Some("call_B"));
+        b.signature = Some("t".repeat(60));
+        store.record("historical-upgrade", a);
+        store.record("historical-upgrade", b);
+        let upgraded_a = json!({"role":"model","parts":[
+            {"thought":true,"text":"reasoning A with complete detail","thoughtSignature":"s".repeat(60)},
+            {"functionCall":{"id":"call_A","name":"shell","args":{}}}
+        ]});
+        store.ingest_from_contents("historical-upgrade", &[upgraded_a.clone()]);
+        assert_eq!(
+            store.load_turns("historical-upgrade")[0].thought,
+            "reasoning A with complete detail"
+        );
+        let persisted =
+            crate::modules::proxy_db::load_thinking_records("historical-upgrade").unwrap();
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|r| r.thought.as_str())
+                .collect::<Vec<_>>(),
+            ["reasoning A", "reasoning B"]
+        );
+        store.clear();
+        let mut request = vec![
+            json!({"role":"model","parts":[{"functionCall":{"id":"call_A","name":"shell","args":{}}}]}),
+            json!({"role":"model","parts":[{"functionCall":{"id":"call_B","name":"shell","args":{}}}]}),
+        ];
+        assert_eq!(
+            store.restore_gemini_contents("historical-upgrade", &mut request),
+            2
+        );
+        assert_eq!(request[0]["parts"][0]["text"], "reasoning A");
+        assert_eq!(request[1]["parts"][0]["text"], "reasoning B");
+        assert_eq!(request[0]["parts"][1]["thoughtSignature"], "s".repeat(60));
+        assert_eq!(request[1]["parts"][1]["thoughtSignature"], "t".repeat(60));
+        let count = crate::modules::proxy_db::get_thinking_records_count().unwrap();
+        for _ in 0..3 {
+            store.clear();
+            store.ingest_from_contents("historical-upgrade", &[upgraded_a.clone()]);
+            assert_eq!(
+                crate::modules::proxy_db::get_thinking_records_count().unwrap(),
+                count
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_hydrate_and_prune_preserve_unloaded_history() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let writer = bounded_store(4, 2048, 4);
+        for i in 0..8 {
+            writer.record(
+                "prune-bounds",
+                rec("reasoning", &format!("answer{i}"), None),
+            );
+        }
+        let store = bounded_store(4, 2048, 4);
+        let records = store.load_turns("prune-bounds");
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.visible.as_str())
+                .collect::<Vec<_>>(),
+            ["answer4", "answer5", "answer6", "answer7"]
+        );
+        store.prune_orphaned_records("prune-bounds", &[]);
+        assert_cache_budget(&store, "prune-bounds");
+        let persisted = crate::modules::proxy_db::load_thinking_records("prune-bounds").unwrap();
+        assert_eq!(
+            persisted
+                .iter()
+                .map(|r| r.visible.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "answer0", "answer1", "answer2", "answer3", "answer4", "answer5", "answer6",
+                "answer7"
+            ]
+        );
+        store.clear();
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records("prune-bounds")
+                .unwrap()
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn bounded_partial_prune_preserves_unloaded_duplicate_fingerprints() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let writer = bounded_store(4, 2048, 4);
+        for visible in [
+            "duplicate",
+            "one",
+            "two",
+            "three",
+            "duplicate",
+            "orphan",
+            "six",
+            "seven",
+        ] {
+            writer.record("duplicate-bounds", rec("reasoning", visible, None));
+        }
+        let store = bounded_store(4, 2048, 4);
+        store.load_turns("duplicate-bounds");
+        assert!(
+            !store
+                .sessions
+                .get("duplicate-bounds")
+                .unwrap()
+                .history_complete
+        );
+        store.prune_orphaned_records("duplicate-bounds", &[]);
+        assert_eq!(store.session_stats("duplicate-bounds").unwrap().0, 2);
+        let rows = crate::modules::proxy_db::load_thinking_records("duplicate-bounds").unwrap();
+        assert_eq!(rows.len(), 8);
+        assert_eq!(rows.iter().filter(|r| r.visible == "duplicate").count(), 2);
+    }
+
+    #[test]
+    fn bounded_complete_cache_prunes_db_but_trim_disables_db_prune() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = bounded_store(8, 2048, 4);
+        for i in 0..6 {
+            store.record(
+                "complete-bounds",
+                rec("reasoning", &format!("answer{i}"), None),
+            );
+        }
+        assert!(
+            store
+                .sessions
+                .get("complete-bounds")
+                .unwrap()
+                .history_complete
+        );
+        store.prune_orphaned_records("complete-bounds", &[]);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records("complete-bounds")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            store
+                .sessions
+                .get("complete-bounds")
+                .unwrap()
+                .history_complete
+        );
+        let trimmed = bounded_store(3, 2048, 4);
+        for i in 0..6 {
+            trimmed.record(
+                "trimmed-bounds",
+                rec("reasoning", &format!("answer{i}"), None),
+            );
+        }
+        assert!(
+            !trimmed
+                .sessions
+                .get("trimmed-bounds")
+                .unwrap()
+                .history_complete
+        );
+        trimmed.prune_orphaned_records("trimmed-bounds", &[]);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records("trimmed-bounds")
+                .unwrap()
+                .len(),
+            6
+        );
+    }
+
+    #[test]
+    fn bounded_point_restore_has_independent_turn_and_byte_budgets() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let writer = ThinkingStore::new();
+        for i in 0..8 {
+            writer.record(
+                "point-bounds",
+                rec(
+                    &format!("reasoning{i}"),
+                    "",
+                    Some(&format!("call_bound_{i}")),
+                ),
+            );
+        }
+        for (turns, bytes, expected) in [(2, 1024, 2), (6, 150, 2)] {
+            let store = bounded_store(turns, bytes, 4);
+            let snapshot = store.load_turns("point-bounds");
+            let mut contents: Vec<Value> = (0..4)
+                .map(|i| {
+                    json!({"role":"model","parts":[
+                        {"functionCall":{"name":"shell","id":format!("call_bound_{i}"),"args":{}}}
+                    ]})
+                })
+                .collect();
+            assert_eq!(
+                store.restore_gemini_contents("point-bounds", &mut contents),
+                expected
+            );
+            assert_cache_budget(&store, "point-bounds");
+            assert!(snapshot.iter().all(|r| store
+                .sessions
+                .get("point-bounds")
+                .unwrap()
+                .turns
+                .iter()
+                .any(|current| Arc::ptr_eq(r, current))));
+            assert!(contents.iter().take(expected).all(|c| c["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p.get("thought").and_then(Value::as_bool) == Some(true))));
+        }
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records("point-bounds")
+                .unwrap()
+                .len(),
+            8
+        );
+    }
+
+    #[test]
+    fn bounded_restore_only_session_admission_is_strict_under_concurrency() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = Arc::new(bounded_store(2, 256, 3));
+        for i in 0..12 {
+            store.restore_gemini_contents(
+                &format!("empty{i}"),
+                &mut vec![json!({"role":"model","parts":[{"text":"answer"}]})],
+            );
+            assert!(store.sessions.len() <= 3);
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..16 {
+            let store = store.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                for j in 0..8 {
+                    store.restore_gemini_contents(
+                        &format!("parallel{i}-{j}"),
+                        &mut vec![json!({"role":"model","parts":[{"text":"answer"}]})],
+                    );
+                    let _admission = store.admission.lock().unwrap();
+                    assert!(store.sessions.len() <= 3);
+                }
+                tx.send(()).unwrap();
+            });
+        }
+        for _ in 0..16 {
+            rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        assert!(store.sessions.len() <= 3);
+        assert!(store.load_turns("capture-after-empty").is_empty());
+        store.record("capture-after-empty", rec("new reasoning", "answer", None));
+        let mut contents = vec![json!({"role":"model","parts":[{"text":"answer"}]})];
+        assert_eq!(
+            store.restore_gemini_contents("capture-after-empty", &mut contents),
+            1
+        );
+        assert_cache_budget(&store, "capture-after-empty");
     }
 
     #[test]
@@ -3111,6 +4192,7 @@ mod tests {
         store.record(
             "t:s2",
             ThinkingRecord {
+                persisted_id: Arc::default(),
                 fingerprint: fp,
                 thought: "Parallel execution planned".to_string(),
                 signature: Some(real_sig.clone()),
@@ -3168,6 +4250,7 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(raw)
         };
         let rec = ThinkingRecord {
+            persisted_id: Arc::default(),
             fingerprint: fp,
             thought: "Thought restored from SQLite".to_string(),
             signature: Some(real_sig.clone()),
@@ -3611,6 +4694,7 @@ mod tests {
         store.record(
             key,
             ThinkingRecord {
+                persisted_id: Arc::default(),
                 fingerprint: fingerprint("visible answer", &[], &[]),
                 thought: "...".to_string(),
                 signature: None,
@@ -3622,6 +4706,7 @@ mod tests {
         store.record(
             key,
             ThinkingRecord {
+                persisted_id: Arc::default(),
                 fingerprint: fingerprint("visible answer", &[], &[]),
                 thought: "...".to_string(),
                 signature: Some(SENTINEL_SIGNATURE.to_string()),
@@ -4347,6 +5432,7 @@ mod tests {
         store.record(
             key,
             ThinkingRecord {
+                persisted_id: Arc::default(),
                 fingerprint: "fp_test_cross".to_string(),
                 thought: "Thought generated by Gemini".to_string(),
                 signature: Some(gemini_sig.to_string()),
@@ -5108,6 +6194,7 @@ mod signature_placement_tests {
         store.record(
             session_key,
             ThinkingRecord {
+                persisted_id: Arc::default(),
                 fingerprint: "fp1".to_string(),
                 thought: "I need to read this file".to_string(),
                 signature: Some(sig.clone()),
